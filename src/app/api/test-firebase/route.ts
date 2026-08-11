@@ -1,11 +1,24 @@
 import { FieldValue } from "firebase-admin/firestore";
 
 import { firestore } from "@/infrastructure/db/firebase-admin";
+import { hasValidApiKey } from "@/lib/http/api-key";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
+  if (!hasValidApiKey(request)) {
+    return Response.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+      },
+      {
+        status: 401,
+      },
+    );
+  }
+
   try {
     const ref = firestore
       .collection("ai_system_tests")

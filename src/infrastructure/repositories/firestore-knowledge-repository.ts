@@ -71,13 +71,16 @@ export class FirestoreKnowledgeRepository
           id: doc.id,
           sourceId:
             String(data.sourceId),
+
           title:
             String(data.title),
+
           text:
             String(data.text),
 
           audience:
             data.audience,
+
           status:
             data.status,
 
@@ -106,5 +109,50 @@ export class FirestoreKnowledgeRepository
         (chunk) =>
           chunk.audience === audience,
       );
+  }
+
+  async deactivateSource(
+    sourceId: string,
+  ): Promise<number> {
+    const sourceRef = firestore
+      .collection("ai_knowledge_sources")
+      .doc(sourceId);
+
+    const chunksSnapshot = await firestore
+      .collection("ai_knowledge_chunks")
+      .where("sourceId", "==", sourceId)
+      .get();
+
+    const batch =
+      firestore.batch();
+
+    batch.set(
+      sourceRef,
+      {
+        status: "inactive",
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      },
+    );
+
+    for (
+      const doc of chunksSnapshot.docs
+    ) {
+      batch.update(
+        doc.ref,
+        {
+          status: "inactive",
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+      );
+    }
+
+    await batch.commit();
+
+    return chunksSnapshot.size;
   }
 }

@@ -22,4 +22,8 @@ export interface KnowledgeRepository {
   getActiveChunks(
     audience: "public" | "internal",
   ): Promise<KnowledgeChunk[]>;
+
+  deactivateSource(
+    sourceId: string,
+  ): Promise<number>;
 }

@@ -27,6 +27,19 @@ const schema = z.object({
   FIREBASE_SERVICE_ACCOUNT_B64: z
     .string()
     .optional(),
+
+  GEMINI_API_KEY: z.string().min(1),
+
+  EMBEDDING_MODEL: z
+    .string()
+    .default("gemini-embedding-001"),
+
+  EMBEDDING_DIMENSIONS: z.coerce
+    .number()
+    .int()
+    .min(128)
+    .max(2048)
+    .default(768),
 });
 
 const result = schema.safeParse({
@@ -55,6 +68,15 @@ const result = schema.safeParse({
 
   FIREBASE_SERVICE_ACCOUNT_B64:
     process.env.FIREBASE_SERVICE_ACCOUNT_B64,
+
+  GEMINI_API_KEY:
+  process.env.GEMINI_API_KEY,
+
+  EMBEDDING_MODEL:
+    process.env.EMBEDDING_MODEL,
+
+  EMBEDDING_DIMENSIONS:
+    process.env.EMBEDDING_DIMENSIONS,
 });
 
 if (!result.success) {
@@ -69,5 +91,7 @@ if (!result.success) {
     `Invalid server environment variables: ${issues}`,
   );
 }
+
+
 
 export const env = result.data;

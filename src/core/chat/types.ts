@@ -1,4 +1,9 @@
-export type ChatChannel = "test" | "web" | "line" | "facebook" | "teams";
+export type ChatChannel =
+  | "test"
+  | "web"
+  | "line"
+  | "facebook"
+  | "teams";
 
 export interface ChatInput {
   sessionId?: string;
@@ -13,11 +18,21 @@ export interface TokenUsage {
   totalTokens: number;
 }
 
+export interface ChatSource {
+  id: string;
+  sourceId: string;
+  title: string;
+  score: number;
+}
+
 export interface ChatOutput {
   sessionId: string;
   answer: string;
   provider: string;
   model: string;
   latencyMs: number;
+
+  sources: ChatSource[];
+
   usage?: TokenUsage;
 }

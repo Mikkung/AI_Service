@@ -1,4 +1,8 @@
-import type { ChatChannel, TokenUsage } from "@/core/chat/types";
+import type {
+  ChatChannel,
+  ChatSource,
+  TokenUsage,
+} from "@/core/chat/types";
 
 export interface EnsureSessionInput {
   sessionId: string;
@@ -13,6 +17,7 @@ export interface AddMessageInput {
   channel: ChatChannel;
   provider?: string;
   model?: string;
+  sources?: ChatSource[];
 }
 
 export interface AddModelRunInput {
@@ -26,7 +31,15 @@ export interface AddModelRunInput {
 }
 
 export interface ChatRepository {
-  ensureSession(input: EnsureSessionInput): Promise<void>;
-  addMessage(input: AddMessageInput): Promise<string>;
-  addModelRun(input: AddModelRunInput): Promise<string>;
+  ensureSession(
+    input: EnsureSessionInput,
+  ): Promise<void>;
+
+  addMessage(
+    input: AddMessageInput,
+  ): Promise<string>;
+
+  addModelRun(
+    input: AddModelRunInput,
+  ): Promise<string>;
 }

@@ -28,3 +28,13 @@ export interface RetrievedChunk {
   text: string;
   score: number;
 }
+
+export type RetrievalMode =
+  | "semantic"
+  | "source_expansion";
+
+export interface RetrieveForAnswerOutput {
+  mode: RetrievalMode;
+  chunks: RetrievedChunk[];
+  expandedSourceId?: string;
+}

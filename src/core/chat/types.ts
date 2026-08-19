@@ -1,3 +1,7 @@
+import type {
+  RetrievalMode,
+} from "@/core/knowledge/types";
+
 export type ChatChannel =
   | "test"
   | "web"
@@ -32,7 +36,13 @@ export interface ChatOutput {
   model: string;
   latencyMs: number;
 
+  finishReason?: string;
+
   sources: ChatSource[];
+  retrievalMode?: RetrievalMode;
+  expandedSourceId?: string;
+  answerRepairApplied?: boolean;
+  answerPolicyViolations?: string[];
 
   usage?: TokenUsage;
 }

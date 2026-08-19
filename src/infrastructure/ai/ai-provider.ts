@@ -11,6 +11,7 @@ export interface GenerateTextOutput {
   answer: string;
   provider: string;
   model: string;
+  finishReason?:string;
   usage?: TokenUsage;
 }
 

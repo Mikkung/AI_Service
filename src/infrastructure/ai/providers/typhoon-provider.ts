@@ -35,6 +35,11 @@ export class TyphoonProvider implements AIProvider {
       answer,
       provider: this.name,
       model: response.model || env.TYPHOON_MODEL,
+
+      finishReason:
+        response.choices[0]?.finish_reason ??
+        undefined,
+
       usage: response.usage
         ? {
             promptTokens: response.usage.prompt_tokens,

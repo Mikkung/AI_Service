@@ -21,7 +21,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:document-qa": "node scripts/run-document-qa-unit-tests.cjs",
+    "test:ai-platform": "node scripts/run-ai-platform-unit-tests.cjs",
+    "benchmark:document-qa": "node scripts/document-qa-benchmark.mjs",
+    "rag-v2:publish-admission": "node scripts/rag-v2-publish-admission.mjs",
+    "benchmark:rag-v2-admission": "node scripts/rag-v2-admission-benchmark.mjs",
+    "knowledge:publish-queue": "node scripts/knowledge-publish-queue.cjs"
   },
   "allowScripts": {
     "@firebase/util@1.15.1": true,

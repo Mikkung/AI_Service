@@ -6,3 +6,22 @@ node_modules/
 
 *-firebase-adminsdk-*.json
 serviceAccount*.json
+
+# AI platform runtime / benchmark artifacts
+.rag-v2/
+.tmp/
+rag-v2-admission-benchmark-*.csv
+rag-v2-admission-benchmark-*.json
+admission_document_qa_*.csv
+admission_document_qa_*.json
+admission_regression_AY2027_run*.csv
+admission_regression_AY2027_run*.json
+ielts_*.txt
+tsconfig.tsbuildinfo
+
+@"
+
+# Local knowledge/test artifacts
+admission_regression_AY2027.ps1
+src/app/api/admin/knowledge/ingest-docx/*.docx
+"@ | Add-Content .gitignore

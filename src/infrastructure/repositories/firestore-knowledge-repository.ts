@@ -1,5 +1,6 @@
 import {
   FieldValue,
+  QueryDocumentSnapshot,
 } from "firebase-admin/firestore";
 
 import type {
@@ -18,6 +19,50 @@ import {
 export class FirestoreKnowledgeRepository
   implements KnowledgeRepository
 {
+  private mapChunkDocument(
+    doc: QueryDocumentSnapshot,
+  ): KnowledgeChunk {
+    const data = doc.data();
+
+    return {
+      id: doc.id,
+      sourceId:
+        String(data.sourceId),
+
+      title:
+        String(data.title),
+
+      text:
+        String(data.text),
+
+      audience:
+        data.audience,
+
+      status:
+        data.status,
+
+      embedding:
+        Array.isArray(data.embedding)
+          ? data.embedding.map(Number)
+          : [],
+
+      embeddingProvider:
+        String(
+          data.embeddingProvider,
+        ),
+
+      embeddingModel:
+        String(
+          data.embeddingModel,
+        ),
+
+      embeddingDimensions:
+        Number(
+          data.embeddingDimensions,
+        ),
+    } as KnowledgeChunk;
+  }
+
   async saveSource(
     input: SaveKnowledgeSourceInput,
   ): Promise<void> {
@@ -64,50 +109,35 @@ export class FirestoreKnowledgeRepository
       .get();
 
     return snapshot.docs
-      .map((doc) => {
-        const data = doc.data();
-
-        return {
-          id: doc.id,
-          sourceId:
-            String(data.sourceId),
-
-          title:
-            String(data.title),
-
-          text:
-            String(data.text),
-
-          audience:
-            data.audience,
-
-          status:
-            data.status,
-
-          embedding:
-            Array.isArray(data.embedding)
-              ? data.embedding.map(Number)
-              : [],
-
-          embeddingProvider:
-            String(
-              data.embeddingProvider,
-            ),
-
-          embeddingModel:
-            String(
-              data.embeddingModel,
-            ),
-
-          embeddingDimensions:
-            Number(
-              data.embeddingDimensions,
-            ),
-        } as KnowledgeChunk;
-      })
+      .map((doc) =>
+        this.mapChunkDocument(doc),
+      )
       .filter(
         (chunk) =>
           chunk.audience === audience,
+      );
+  }
+
+  async getActiveChunksBySource(
+    sourceId: string,
+    audience: "public" | "internal",
+  ): Promise<KnowledgeChunk[]> {
+    const snapshot = await firestore
+      .collection("ai_knowledge_chunks")
+      .where("sourceId", "==", sourceId)
+      .get();
+
+    return snapshot.docs
+      .map((doc) =>
+        this.mapChunkDocument(doc),
+      )
+      .filter(
+        (chunk) =>
+          chunk.status === "active" &&
+          chunk.audience === audience,
+      )
+      .sort((a, b) =>
+        a.id.localeCompare(b.id),
       );
   }
 

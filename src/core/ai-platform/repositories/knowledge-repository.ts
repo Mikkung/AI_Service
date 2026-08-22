@@ -49,6 +49,17 @@ export interface UpdateKnowledgeDocumentInput {
   content?: string;
 }
 
+export interface TransitionKnowledgeDocumentStatusInput {
+  id: string;
+  expectedStatus: KnowledgeStatus;
+  status: KnowledgeStatus;
+  updatedAt: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  supersededByDocumentId?: string;
+  approval: KnowledgeApproval;
+}
+
 export interface ListKnowledgeDocumentsFilter {
   audience?: KnowledgeAudience;
   status?: KnowledgeStatus;
@@ -74,6 +85,10 @@ export interface KnowledgeRepository {
 
   updateDocument(
     input: UpdateKnowledgeDocumentInput,
+  ): Promise<KnowledgeDocument>;
+
+  transitionDocumentStatus(
+    input: TransitionKnowledgeDocumentStatusInput,
   ): Promise<KnowledgeDocument>;
 
   listDocuments(

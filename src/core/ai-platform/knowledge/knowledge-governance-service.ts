@@ -1,4 +1,8 @@
 import {
+  randomUUID,
+} from "node:crypto";
+
+import {
   computeContentHash,
 } from "@/core/ai-platform/knowledge/content-hash";
 
@@ -35,7 +39,7 @@ export interface GovernanceIdGenerator {
   nextId(prefix: string): string;
 }
 
-class SequentialGovernanceIdGenerator
+export class SequentialGovernanceIdGenerator
   implements GovernanceIdGenerator
 {
   private next = 1;
@@ -48,6 +52,14 @@ class SequentialGovernanceIdGenerator
       );
     this.next += 1;
     return `${prefix}-${id}`;
+  }
+}
+
+export class RandomUuidGovernanceIdGenerator
+  implements GovernanceIdGenerator
+{
+  nextId(prefix: string): string {
+    return `${prefix}-${randomUUID()}`;
   }
 }
 
@@ -344,9 +356,10 @@ export class KnowledgeGovernanceService {
     const updated =
       await this.dependencies
         .knowledgeRepository
-        .updateDocument({
-          id:
-            document.id,
+        .transitionDocumentStatus({
+          id: document.id,
+          expectedStatus:
+            document.status,
           status,
           updatedAt:
             timestamp,
@@ -356,28 +369,25 @@ export class KnowledgeGovernanceService {
             extra.approvedBy,
           supersededByDocumentId:
             extra.supersededByDocumentId,
+          approval: {
+            id:
+              this.idGenerator.nextId(
+                "approval",
+              ),
+            documentId:
+              document.id,
+            action:
+              approvalActionForTransition(
+                status,
+              ),
+            actorId:
+              input.actorId,
+            note:
+              input.note,
+            createdAt:
+              timestamp,
+          },
         });
-
-    await this.dependencies
-      .knowledgeRepository
-      .recordApproval({
-        id:
-          this.idGenerator.nextId(
-            "approval",
-          ),
-        documentId:
-          document.id,
-        action:
-          approvalActionForTransition(
-            status,
-          ),
-        actorId:
-          input.actorId,
-        note:
-          input.note,
-        createdAt:
-          timestamp,
-      });
 
     return updated;
   }

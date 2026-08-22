@@ -1,5 +1,6 @@
 import {
   KnowledgeGovernanceService,
+  RandomUuidGovernanceIdGenerator,
 } from "@/core/ai-platform/knowledge/knowledge-governance-service";
 
 import {
@@ -39,6 +40,8 @@ export function createDefaultPublishApprovedKnowledgeUseCase(): PublishApprovedK
     new KnowledgeGovernanceService({
       knowledgeRepository,
       publisher,
+      idGenerator:
+        new RandomUuidGovernanceIdGenerator(),
     });
 
   return new PublishApprovedKnowledge({

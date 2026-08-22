@@ -11,6 +11,7 @@ import type {
   FindCurrentApprovedDocumentsFilter,
   KnowledgeRepository,
   ListKnowledgeDocumentsFilter,
+  TransitionKnowledgeDocumentStatusInput,
   UpdateKnowledgeDocumentInput,
 } from "@/core/ai-platform/repositories/knowledge-repository";
 
@@ -143,6 +144,108 @@ export class FirestoreAIPlatformKnowledgeRepository
 
     return cloneDocument(
       firestoreDocument,
+    );
+  }
+
+  async transitionDocumentStatus(
+    input: TransitionKnowledgeDocumentStatusInput,
+  ): Promise<KnowledgeDocument> {
+    const documentRef =
+      firestore
+        .collection(DOCUMENTS_COLLECTION)
+        .doc(input.id);
+    const approvalRef =
+      firestore
+        .collection(APPROVALS_COLLECTION)
+        .doc(input.approval.id);
+
+    return firestore.runTransaction(
+      async (transaction) => {
+        const [
+          documentSnapshot,
+          approvalSnapshot,
+        ] = await Promise.all([
+          transaction.get(documentRef),
+          transaction.get(approvalRef),
+        ]);
+
+        if (!documentSnapshot.exists) {
+          throw new Error(
+            `Knowledge document not found: ${input.id}`,
+          );
+        }
+
+        if (approvalSnapshot.exists) {
+          throw new Error(
+            `Knowledge approval already exists: ${input.approval.id}`,
+          );
+        }
+
+        const existing =
+          cloneDocument({
+            id: documentSnapshot.id,
+            ...(documentSnapshot.data() as Omit<
+              KnowledgeDocument,
+              "id"
+            >),
+          });
+
+        if (
+          existing.status !==
+          input.expectedStatus
+        ) {
+          throw new Error(
+            `Knowledge document status changed before transition: ${input.id}`,
+          );
+        }
+
+        const updated =
+          removeUndefinedFirestoreValues({
+            ...existing,
+            status:
+              input.status,
+            updatedAt:
+              input.updatedAt,
+            ...(input.approvedAt !==
+            undefined
+              ? {
+                  approvedAt:
+                    input.approvedAt,
+                }
+              : {}),
+            ...(input.approvedBy !==
+            undefined
+              ? {
+                  approvedBy:
+                    input.approvedBy,
+                }
+              : {}),
+            ...(input.supersededByDocumentId !==
+            undefined
+              ? {
+                  supersededByDocumentId:
+                    input.supersededByDocumentId,
+                }
+              : {}),
+          });
+        const approval =
+          removeUndefinedFirestoreValues(
+            cloneApproval(
+              input.approval,
+            ),
+          );
+
+        transaction.set(
+          documentRef,
+          updated,
+        );
+        transaction.create(
+          approvalRef,
+          approval,
+        );
+
+        return cloneDocument(updated);
+      },
     );
   }
 

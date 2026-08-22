@@ -372,67 +372,39 @@ export class PublishApprovedKnowledge {
           desiredDocumentId,
         );
 
-    if (
-      exactDocument?.status ===
-        "approved" &&
-      exactDocument.contentHash ===
-        contentHash &&
-      exactDocument.metadata
-        ?.metadataFingerprint ===
-        metadataFingerprint
-    ) {
-      const publication =
-        await this.options
-          .governanceService.publish({
+    const approvedDocument =
+      exactDocument
+        ? await this.resumeExactDocument({
+            document:
+              exactDocument,
+            sourceIdentity,
+            sourceItemId:
+              input.sourceItemId,
+            audience:
+              input.audience,
+            contentHash,
+            metadataFingerprint,
+          })
+        : await this.createOrResumeApprovedDocument({
             documentId:
-              exactDocument.id,
-            targetProvider:
-              this.targetProvider,
-            targetEnvironment:
-              this.targetEnvironment,
-            now: timestamp,
+              desiredDocumentId,
+            input,
+            contentBase64:
+              contentBuffer.toString(
+                "base64",
+              ),
+            contentHash,
+            metadataFingerprint,
+            sourceIdentity,
+            effectiveFrom,
+            effectiveTo,
           });
-
-      return {
-        outcome:
-          publication.reason ===
-          "already_current"
-            ? "already_current"
-            : "published",
-        knowledgeDocumentId:
-          exactDocument.id,
-        publicationId:
-          publication.publication.id,
-        contentHash,
-        metadataFingerprint,
-        providerMetadata:
-          publication.providerMetadata ??
-          publication.publication
-            .providerMetadata,
-      };
-    }
-
-    const createdDocument =
-      await this.createApprovedDocument({
-        documentId:
-          desiredDocumentId,
-        input,
-        contentBase64:
-          contentBuffer.toString(
-            "base64",
-          ),
-        contentHash,
-        metadataFingerprint,
-        sourceIdentity,
-        effectiveFrom,
-        effectiveTo,
-      });
 
     const publication =
       await this.options
         .governanceService.publish({
           documentId:
-            createdDocument.id,
+            approvedDocument.id,
           targetProvider:
             this.targetProvider,
           targetEnvironment:
@@ -440,7 +412,11 @@ export class PublishApprovedKnowledge {
           now: timestamp,
         });
 
-    if (currentDocument) {
+    if (
+      currentDocument &&
+      currentDocument.id !==
+        approvedDocument.id
+    ) {
       await this.options
         .governanceService.unpublish({
           documentId:
@@ -456,7 +432,7 @@ export class PublishApprovedKnowledge {
           oldDocumentId:
             currentDocument.id,
           replacementDocumentId:
-            createdDocument.id,
+            approvedDocument.id,
           actorId:
             this.actorId,
           note:
@@ -471,7 +447,7 @@ export class PublishApprovedKnowledge {
           ? "already_current"
           : "published",
       knowledgeDocumentId:
-        createdDocument.id,
+        approvedDocument.id,
       supersededKnowledgeDocumentId:
         currentDocument?.id,
       publicationId:
@@ -640,5 +616,199 @@ export class PublishApprovedKnowledge {
         note:
           "Approved in SharePoint before ingestion",
       });
+  }
+
+  private async createOrResumeApprovedDocument(input: {
+    documentId: string;
+    input: ApprovedKnowledgePublicationInput;
+    contentBase64: string;
+    contentHash: string;
+    metadataFingerprint: string;
+    sourceIdentity: string;
+    effectiveFrom?: string;
+    effectiveTo?: string;
+  }): Promise<KnowledgeDocument> {
+    try {
+      return await this.createApprovedDocument(
+        input,
+      );
+    } catch (error) {
+      const existing =
+        await this.options
+          .knowledgeRepository
+          .getDocument(
+            input.documentId,
+          );
+
+      if (!existing) {
+        throw error;
+      }
+
+      return this.resumeExactDocument({
+        document:
+          existing,
+        sourceIdentity:
+          input.sourceIdentity,
+        sourceItemId:
+          input.input.sourceItemId,
+        audience:
+          input.input.audience,
+        contentHash:
+          input.contentHash,
+        metadataFingerprint:
+          input.metadataFingerprint,
+      });
+    }
+  }
+
+  private assertExactDocumentCompatible(input: {
+    document: KnowledgeDocument;
+    sourceIdentity: string;
+    sourceItemId: string;
+    audience: KnowledgeAudience;
+    contentHash: string;
+    metadataFingerprint: string;
+  }): void {
+    const document =
+      input.document;
+
+    if (
+      document.sourceSystem !==
+        "sharepoint" ||
+      document.audience !==
+        input.audience ||
+      !documentMatchesSourceIdentity(
+        document,
+        input.sourceIdentity,
+        input.sourceItemId,
+      ) ||
+      document.contentHash !==
+        input.contentHash ||
+      document.metadata
+        ?.metadataFingerprint !==
+        input.metadataFingerprint
+    ) {
+      throw new Error(
+        `Existing deterministic SharePoint knowledge document is incompatible: ${document.id}`,
+      );
+    }
+  }
+
+  private isRetryableTransitionRace(
+    error: unknown,
+  ): boolean {
+    const message =
+      error instanceof Error
+        ? error.message
+        : String(error);
+
+    return (
+      message.includes(
+        "Knowledge document status changed before transition",
+      ) ||
+      message.includes(
+        "Invalid knowledge status transition",
+      )
+    );
+  }
+
+  private async resumeExactDocument(input: {
+    document: KnowledgeDocument;
+    sourceIdentity: string;
+    sourceItemId: string;
+    audience: KnowledgeAudience;
+    contentHash: string;
+    metadataFingerprint: string;
+  }): Promise<KnowledgeDocument> {
+    this.assertExactDocumentCompatible(
+      input,
+    );
+
+    let document =
+      input.document;
+
+    for (
+      let attempt = 0;
+      attempt < 5;
+      attempt += 1
+    ) {
+      this.assertExactDocumentCompatible({
+        ...input,
+        document,
+      });
+
+      if (
+        document.status === "approved"
+      ) {
+        return document;
+      }
+
+      if (
+        document.status !== "draft" &&
+        document.status !== "review"
+      ) {
+        throw new Error(
+          `Cannot resume deterministic SharePoint knowledge document in status ${document.status}: ${document.id}`,
+        );
+      }
+
+      try {
+        if (
+          document.status === "draft"
+        ) {
+          document =
+            await this.options
+              .governanceService
+              .submitForReview({
+                documentId:
+                  document.id,
+                actorId:
+                  this.actorId,
+                note:
+                  "SharePoint content approval received",
+              });
+        }
+
+        if (
+          document.status === "review"
+        ) {
+          return await this.options
+            .governanceService
+            .approve({
+              documentId:
+                document.id,
+              actorId:
+                this.actorId,
+              note:
+                "Approved in SharePoint before ingestion",
+            });
+        }
+      } catch (error) {
+        if (
+          !this.isRetryableTransitionRace(
+            error,
+          )
+        ) {
+          throw error;
+        }
+      }
+
+      const reloaded =
+        await this.options
+          .knowledgeRepository
+          .getDocument(document.id);
+
+      if (!reloaded) {
+        throw new Error(
+          `Knowledge document not found: ${document.id}`,
+        );
+      }
+
+      document = reloaded;
+    }
+
+    throw new Error(
+      `Could not resume deterministic SharePoint knowledge document: ${input.document.id}`,
+    );
   }
 }

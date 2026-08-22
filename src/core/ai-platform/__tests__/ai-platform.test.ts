@@ -31,6 +31,7 @@ import {
 
 import {
   KnowledgeGovernanceService,
+  RandomUuidGovernanceIdGenerator,
   type GovernanceIdGenerator,
 } from "../knowledge/knowledge-governance-service";
 
@@ -86,6 +87,10 @@ import {
 import {
   InMemoryKnowledgeRepository,
 } from "../repositories/in-memory/in-memory-knowledge-repository";
+
+import type {
+  TransitionKnowledgeDocumentStatusInput,
+} from "../repositories/knowledge-repository";
 
 import {
   removeUndefinedFirestoreValues,
@@ -161,6 +166,48 @@ class TestGovernanceIdGenerator
       );
     this.next += 1;
     return `${prefix}-${id}`;
+  }
+}
+
+class ConstantGovernanceIdGenerator
+  implements GovernanceIdGenerator
+{
+  nextId(prefix: string): string {
+    return `${prefix}-fixed`;
+  }
+}
+
+class FailingTransitionKnowledgeRepository extends InMemoryKnowledgeRepository {
+  private transitionCount = 0;
+
+  constructor(
+    private failingTransitionNumbers: number[],
+  ) {
+    super();
+  }
+
+  clearFailures(): void {
+    this.failingTransitionNumbers = [];
+  }
+
+  override async transitionDocumentStatus(
+    input: TransitionKnowledgeDocumentStatusInput,
+  ) {
+    this.transitionCount += 1;
+
+    if (
+      this.failingTransitionNumbers.includes(
+        this.transitionCount,
+      )
+    ) {
+      throw new Error(
+        "Injected approval audit failure",
+      );
+    }
+
+    return super.transitionDocumentStatus(
+      input,
+    );
   }
 }
 
@@ -329,26 +376,40 @@ function createKnowledgeTestService() {
   };
 }
 
-function createSharePointPublicationTestEnvironment() {
+function createSharePointPublicationTestEnvironment(input: {
+  knowledgeRepository?: InMemoryKnowledgeRepository;
+  publicationRepository?: InMemoryKnowledgePublicationRepository;
+  publisher?: MockKnowledgePublisher;
+  idGenerator?: GovernanceIdGenerator;
+  now?: () => string;
+} = {}) {
   const knowledgeRepository =
+    input.knowledgeRepository ??
     new InMemoryKnowledgeRepository();
   const publicationRepository =
+    input.publicationRepository ??
     new InMemoryKnowledgePublicationRepository();
   const publisher =
+    input.publisher ??
     new MockKnowledgePublisher({
       publicationRepository,
       targetAudience: "public",
-      now: () =>
-        "2027-01-01T00:00:00.000Z",
+      now:
+        input.now ??
+        (() =>
+          "2027-01-01T00:00:00.000Z"),
     });
   const governanceService =
     new KnowledgeGovernanceService({
       knowledgeRepository,
       publisher,
       idGenerator:
+        input.idGenerator ??
         new TestGovernanceIdGenerator(),
-      now: () =>
-        "2027-01-01T00:00:00.000Z",
+      now:
+        input.now ??
+        (() =>
+          "2027-01-01T00:00:00.000Z"),
     });
   const useCase =
     new PublishApprovedKnowledge({
@@ -362,6 +423,8 @@ function createSharePointPublicationTestEnvironment() {
     useCase,
     knowledgeRepository,
     publicationRepository,
+    governanceService,
+    publisher,
   };
 }
 
@@ -1237,6 +1300,443 @@ async function testOpenAIPublisherVectorStoreReuse() {
       ],
     );
   }
+}
+
+async function testProductionSafeGovernanceIds() {
+  const firstGenerator =
+    new RandomUuidGovernanceIdGenerator();
+  const secondGenerator =
+    new RandomUuidGovernanceIdGenerator();
+  const firstId =
+    firstGenerator.nextId(
+      "approval",
+    );
+  const secondId =
+    secondGenerator.nextId(
+      "approval",
+    );
+
+  assert.match(
+    firstId,
+    /^approval-[0-9a-f-]{36}$/,
+  );
+  assert.match(
+    secondId,
+    /^approval-[0-9a-f-]{36}$/,
+  );
+  assert.notEqual(
+    firstId,
+    secondId,
+  );
+
+  const knowledgeRepository =
+    new InMemoryKnowledgeRepository();
+  const firstService =
+    new KnowledgeGovernanceService({
+      knowledgeRepository,
+      idGenerator:
+        new RandomUuidGovernanceIdGenerator(),
+      now: () =>
+        "2027-01-01T00:00:00.000Z",
+    });
+  const secondService =
+    new KnowledgeGovernanceService({
+      knowledgeRepository,
+      idGenerator:
+        new RandomUuidGovernanceIdGenerator(),
+      now: () =>
+        "2027-01-01T00:00:01.000Z",
+    });
+
+  await firstService.createDraft({
+    id: "doc-id-1",
+    title: "Doc 1",
+    sourceSystem: "manual",
+    audience: "public",
+    actorId: "tester",
+    content: "Document 1",
+  });
+  await secondService.createDraft({
+    id: "doc-id-2",
+    title: "Doc 2",
+    sourceSystem: "manual",
+    audience: "public",
+    actorId: "tester",
+    content: "Document 2",
+  });
+
+  await firstService.submitForReview({
+    documentId: "doc-id-1",
+    actorId: "tester",
+  });
+  await secondService.submitForReview({
+    documentId: "doc-id-2",
+    actorId: "tester",
+  });
+
+  const firstApproval =
+    (
+      await knowledgeRepository
+        .listApprovals("doc-id-1")
+    )[0];
+  const secondApproval =
+    (
+      await knowledgeRepository
+        .listApprovals("doc-id-2")
+    )[0];
+
+  assert.notEqual(
+    firstApproval.id,
+    secondApproval.id,
+  );
+}
+
+async function testGovernanceTransitionIsAtomicWhenAuditFails() {
+  const knowledgeRepository =
+    new InMemoryKnowledgeRepository();
+  const firstService =
+    new KnowledgeGovernanceService({
+      knowledgeRepository,
+      idGenerator:
+        new ConstantGovernanceIdGenerator(),
+      now: () =>
+        "2027-01-01T00:00:00.000Z",
+    });
+  const secondService =
+    new KnowledgeGovernanceService({
+      knowledgeRepository,
+      idGenerator:
+        new ConstantGovernanceIdGenerator(),
+      now: () =>
+        "2027-01-01T00:00:01.000Z",
+    });
+
+  await firstService.createDraft({
+    id: "atomic-doc-1",
+    title: "Atomic Doc 1",
+    sourceSystem: "manual",
+    audience: "public",
+    actorId: "tester",
+    content: "Document 1",
+  });
+  await secondService.createDraft({
+    id: "atomic-doc-2",
+    title: "Atomic Doc 2",
+    sourceSystem: "manual",
+    audience: "public",
+    actorId: "tester",
+    content: "Document 2",
+  });
+
+  await firstService.submitForReview({
+    documentId:
+      "atomic-doc-1",
+    actorId: "tester",
+  });
+
+  await assert.rejects(
+    () =>
+      secondService.submitForReview({
+        documentId:
+          "atomic-doc-2",
+        actorId:
+          "tester",
+      }),
+    /Knowledge approval already exists/,
+  );
+
+  assert.equal(
+    (
+      await knowledgeRepository
+        .getDocument(
+          "atomic-doc-2",
+        )
+    )?.status,
+    "draft",
+  );
+  assert.deepEqual(
+    await knowledgeRepository
+      .listApprovals(
+        "atomic-doc-2",
+      ),
+    [],
+  );
+}
+
+async function testSharePointDeterministicPartialStateRecovery() {
+  {
+    const knowledgeRepository =
+      new FailingTransitionKnowledgeRepository([
+        1, 2,
+      ]);
+    const environment =
+      createSharePointPublicationTestEnvironment({
+        knowledgeRepository,
+      });
+
+    await assert.rejects(
+      () =>
+        environment.useCase.execute(
+          approvedSharePointInput({
+            sourceItemId:
+              "draft-recovery",
+          }),
+        ),
+      /Injected approval audit failure/,
+    );
+
+    const partialDocument =
+      (
+        await knowledgeRepository
+          .listDocuments()
+      )[0];
+
+    assert.equal(
+      partialDocument.status,
+      "draft",
+    );
+
+    knowledgeRepository.clearFailures();
+
+    const recovered =
+      await environment.useCase.execute(
+        approvedSharePointInput({
+          sourceItemId:
+            "draft-recovery",
+        }),
+      );
+
+    assert.equal(
+      recovered.outcome,
+      "published",
+    );
+    assert.equal(
+      (
+        await knowledgeRepository
+          .getDocument(
+            partialDocument.id,
+          )
+      )?.status,
+      "approved",
+    );
+  }
+
+  {
+    const knowledgeRepository =
+      new FailingTransitionKnowledgeRepository([
+        2, 3,
+      ]);
+    const environment =
+      createSharePointPublicationTestEnvironment({
+        knowledgeRepository,
+      });
+
+    await assert.rejects(
+      () =>
+        environment.useCase.execute(
+          approvedSharePointInput({
+            sourceItemId:
+              "review-recovery",
+          }),
+        ),
+      /Injected approval audit failure/,
+    );
+
+    const partialDocument =
+      (
+        await knowledgeRepository
+          .listDocuments()
+      )[0];
+
+    assert.equal(
+      partialDocument.status,
+      "review",
+    );
+
+    knowledgeRepository.clearFailures();
+
+    const recovered =
+      await environment.useCase.execute(
+        approvedSharePointInput({
+          sourceItemId:
+            "review-recovery",
+        }),
+      );
+
+    assert.equal(
+      recovered.outcome,
+      "published",
+    );
+    assert.equal(
+      (
+        await knowledgeRepository
+          .getDocument(
+            partialDocument.id,
+          )
+      )?.status,
+      "approved",
+    );
+  }
+
+  {
+    const publicationRepository =
+      new InMemoryKnowledgePublicationRepository();
+    const publisher =
+      new MockKnowledgePublisher({
+        publicationRepository,
+        targetAudience: "public",
+        now: () =>
+          "2027-01-01T00:00:00.000Z",
+      });
+    publisher.setFailNextPublish();
+
+    const environment =
+      createSharePointPublicationTestEnvironment({
+        publicationRepository,
+        publisher,
+      });
+
+    await assert.rejects(
+      () =>
+        environment.useCase.execute(
+          approvedSharePointInput({
+            sourceItemId:
+              "approved-recovery",
+          }),
+        ),
+      /Mock publication failure/,
+    );
+
+    const approvedDocument =
+      (
+        await environment
+          .knowledgeRepository
+          .listDocuments()
+      )[0];
+
+    assert.equal(
+      approvedDocument.status,
+      "approved",
+    );
+
+    const recovered =
+      await environment.useCase.execute(
+        approvedSharePointInput({
+          sourceItemId:
+            "approved-recovery",
+        }),
+      );
+
+    assert.equal(
+      recovered.outcome,
+      "published",
+    );
+    assert.equal(
+      (
+        await publicationRepository
+          .listPublications({
+            documentId:
+              approvedDocument.id,
+          })
+      ).filter(
+        (publication) =>
+          publication
+            .publicationStatus ===
+          "published",
+      ).length,
+      1,
+    );
+  }
+}
+
+async function testSharePointRetryAndConcurrentSafety() {
+  const sequentialEnvironment =
+    createSharePointPublicationTestEnvironment();
+
+  const first =
+    await sequentialEnvironment.useCase
+      .execute(
+        approvedSharePointInput({
+          sourceItemId:
+            "sequential-retry",
+        }),
+      );
+  const second =
+    await sequentialEnvironment.useCase
+      .execute(
+        approvedSharePointInput({
+          sourceItemId:
+            "sequential-retry",
+        }),
+      );
+
+  assert.equal(
+    first.outcome,
+    "published",
+  );
+  assert.equal(
+    second.outcome,
+    "already_current",
+  );
+  assert.equal(
+    (
+      await sequentialEnvironment
+        .knowledgeRepository
+        .listDocuments()
+    ).length,
+    1,
+  );
+
+  const concurrentEnvironment =
+    createSharePointPublicationTestEnvironment({
+      idGenerator:
+        new RandomUuidGovernanceIdGenerator(),
+    });
+  const concurrentInput =
+    approvedSharePointInput({
+      sourceItemId:
+        "concurrent-retry",
+    });
+
+  const outcomes =
+    await Promise.all(
+      [
+        concurrentEnvironment
+          .useCase.execute(
+            concurrentInput,
+          ),
+        concurrentEnvironment
+          .useCase.execute(
+            concurrentInput,
+          ),
+      ],
+    );
+
+  assert.equal(
+    (
+      await concurrentEnvironment
+        .knowledgeRepository
+        .listDocuments()
+    ).length,
+    1,
+  );
+  assert.ok(
+    outcomes.every(
+      (outcome) =>
+        outcome.knowledgeDocumentId ===
+        outcomes[0]
+          .knowledgeDocumentId,
+    ),
+  );
+  assert.ok(
+    outcomes.every(
+      (outcome) =>
+        outcome.outcome ===
+          "published" ||
+        outcome.outcome ===
+          "already_current",
+    ),
+  );
 }
 
 async function testPublishApprovedKnowledgeUseCase() {
@@ -3328,6 +3828,10 @@ async function main() {
   testFirestoreSerializationRemovesUndefinedValues();
   await testOpenAIPublisherPolicyAndIdempotency();
   await testOpenAIPublisherVectorStoreReuse();
+  await testProductionSafeGovernanceIds();
+  await testGovernanceTransitionIsAtomicWhenAuditFails();
+  await testSharePointDeterministicPartialStateRecovery();
+  await testSharePointRetryAndConcurrentSafety();
   await testPublishApprovedKnowledgeUseCase();
   await testPowerAutomateHttpAdapter();
   await testPowerAutomateJsonAndRawParsing();

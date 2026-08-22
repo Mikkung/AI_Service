@@ -7,6 +7,7 @@ import type {
   FindCurrentApprovedDocumentsFilter,
   KnowledgeRepository,
   ListKnowledgeDocumentsFilter,
+  TransitionKnowledgeDocumentStatusInput,
   UpdateKnowledgeDocumentInput,
 } from "@/core/ai-platform/repositories/knowledge-repository";
 
@@ -35,6 +36,24 @@ function cloneApproval(
   return {
     ...approval,
   };
+}
+
+function hasApproval(
+  approvals: Map<
+    string,
+    KnowledgeApproval[]
+  >,
+  approvalId: string,
+): boolean {
+  return [
+    ...approvals.values(),
+  ].some((documentApprovals) =>
+    documentApprovals.some(
+      (approval) =>
+        approval.id ===
+        approvalId,
+    ),
+  );
 }
 
 export class InMemoryKnowledgeRepository
@@ -105,6 +124,90 @@ export class InMemoryKnowledgeRepository
     return cloneDocument(updated);
   }
 
+  async transitionDocumentStatus(
+    input: TransitionKnowledgeDocumentStatusInput,
+  ): Promise<KnowledgeDocument> {
+    const existing =
+      this.documents.get(input.id);
+
+    if (!existing) {
+      throw new Error(
+        `Knowledge document not found: ${input.id}`,
+      );
+    }
+
+    if (
+      existing.status !==
+      input.expectedStatus
+    ) {
+      throw new Error(
+        `Knowledge document status changed before transition: ${input.id}`,
+      );
+    }
+
+    const existingApprovals =
+      this.approvals.get(
+        input.approval.documentId,
+      ) ?? [];
+
+    if (
+      hasApproval(
+        this.approvals,
+        input.approval.id,
+      )
+    ) {
+      throw new Error(
+        `Knowledge approval already exists: ${input.approval.id}`,
+      );
+    }
+
+    const updated: KnowledgeDocument = {
+      ...existing,
+      status:
+        input.status,
+      updatedAt:
+        input.updatedAt,
+      ...(input.approvedAt !==
+      undefined
+        ? {
+            approvedAt:
+              input.approvedAt,
+          }
+        : {}),
+      ...(input.approvedBy !==
+      undefined
+        ? {
+            approvedBy:
+              input.approvedBy,
+          }
+        : {}),
+      ...(input.supersededByDocumentId !==
+      undefined
+        ? {
+            supersededByDocumentId:
+              input.supersededByDocumentId,
+          }
+        : {}),
+    };
+
+    this.documents.set(
+      input.id,
+      cloneDocument(updated),
+    );
+
+    this.approvals.set(
+      input.approval.documentId,
+      [
+        ...existingApprovals,
+        cloneApproval(
+          input.approval,
+        ),
+      ],
+    );
+
+    return cloneDocument(updated);
+  }
+
   async listDocuments(
     filters: ListKnowledgeDocumentsFilter = {},
   ): Promise<KnowledgeDocument[]> {
@@ -161,6 +264,17 @@ export class InMemoryKnowledgeRepository
   async recordApproval(
     approval: KnowledgeApproval,
   ): Promise<void> {
+    if (
+      hasApproval(
+        this.approvals,
+        approval.id,
+      )
+    ) {
+      throw new Error(
+        `Knowledge approval already exists: ${approval.id}`,
+      );
+    }
+
     const existing =
       this.approvals.get(
         approval.documentId,

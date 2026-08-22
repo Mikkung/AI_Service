@@ -405,7 +405,7 @@ function approvedSharePointInput(
 
 function rawSharePointRequest(input: {
   secret?: string;
-  body?: string;
+  body?: BodyInit;
   headers?: Record<string, string>;
 } = {}): Request {
   const requestBody =
@@ -1715,6 +1715,125 @@ async function testPowerAutomateJsonAndRawParsing() {
         rawParsed.input.content,
       ).toString("utf8"),
       "raw bytes",
+    );
+  }
+
+  const wrappedParsed =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body: JSON.stringify({
+          "$content-type":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          $content:
+            Buffer.from(
+              "wrapped docx bytes",
+              "utf8",
+            ).toString("base64"),
+        }),
+      }),
+    );
+
+  assert.equal(
+    wrappedParsed.ok,
+    true,
+  );
+  if (wrappedParsed.ok) {
+    assert.equal(
+      Buffer.from(
+        wrappedParsed.input.content,
+      ).toString("utf8"),
+      "wrapped docx bytes",
+    );
+  }
+
+  const malformedWrapper =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body:
+          '{"$content-type":"application/octet-stream","$content":',
+      }),
+    );
+
+  assert.equal(
+    malformedWrapper.ok,
+    false,
+  );
+  if (!malformedWrapper.ok) {
+    assert.equal(
+      malformedWrapper.status,
+      400,
+    );
+  }
+
+  const emptyWrapperContent =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body: JSON.stringify({
+          "$content-type":
+            "application/octet-stream",
+          $content: "",
+        }),
+      }),
+    );
+
+  assert.equal(
+    emptyWrapperContent.ok,
+    false,
+  );
+  if (!emptyWrapperContent.ok) {
+    assert.equal(
+      emptyWrapperContent.status,
+      400,
+    );
+  }
+
+  const invalidWrapperBase64 =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body: JSON.stringify({
+          "$content-type":
+            "application/octet-stream",
+          $content:
+            "not valid base64",
+        }),
+      }),
+    );
+
+  assert.equal(
+    invalidWrapperBase64.ok,
+    false,
+  );
+  if (!invalidWrapperBase64.ok) {
+    assert.equal(
+      invalidWrapperBase64.status,
+      400,
+    );
+  }
+
+  const oversizedWrapper =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body: JSON.stringify({
+          "$content-type":
+            "application/octet-stream",
+          $content:
+            Buffer.from(
+              "12345",
+              "utf8",
+            ).toString("base64"),
+        }),
+      }),
+      4,
+    );
+
+  assert.equal(
+    oversizedWrapper.ok,
+    false,
+  );
+  if (!oversizedWrapper.ok) {
+    assert.equal(
+      oversizedWrapper.status,
+      413,
     );
   }
 

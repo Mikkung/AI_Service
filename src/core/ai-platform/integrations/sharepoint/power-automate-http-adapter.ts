@@ -143,6 +143,18 @@ const rawHeaderSchema = z.object({
     .optional(),
 });
 
+const powerAutomateBinaryWrapperSchema =
+  z.object({
+    "$content-type": z
+      .string()
+      .trim()
+      .min(1)
+      .optional(),
+    $content: z
+      .string()
+      .min(1),
+  });
+
 function unauthorizedResponse(): Response {
   return Response.json(
     {
@@ -226,16 +238,34 @@ export function isAuthorizedSharePointPublicationRequest(input: {
 function decodeBase64Content(
   value: string,
 ): Buffer | null {
+  const normalized =
+    value.replace(/\s/g, "");
+
+  if (normalized.length === 0) {
+    return null;
+  }
+
   if (
+    normalized.length % 4 !== 0 ||
     !/^[A-Za-z0-9+/]+={0,2}$/.test(
-      value.replace(/\s/g, ""),
+      normalized,
     )
   ) {
     return null;
   }
 
   const buffer =
-    Buffer.from(value, "base64");
+    Buffer.from(
+      normalized,
+      "base64",
+    );
+
+  if (
+    buffer.toString("base64") !==
+    normalized
+  ) {
+    return null;
+  }
 
   return buffer.length > 0
     ? buffer
@@ -449,6 +479,142 @@ function isRawBinaryRequest(
   );
 }
 
+function isPowerAutomateBinaryWrapperCandidate(
+  body: Buffer,
+): boolean {
+  const text =
+    body.toString("utf8").trim();
+
+  return (
+    text.startsWith("{") &&
+    (text.includes('"$content"') ||
+      text.includes(
+        '"$content-type"',
+      ))
+  );
+}
+
+function decodeRawPublicationContent(
+  body: Buffer,
+  maxFileBytes: number,
+):
+  | {
+      ok: true;
+      content: Buffer;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      issues?: unknown;
+    } {
+  if (body.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "Raw publication body cannot be empty",
+    };
+  }
+
+  if (
+    !isPowerAutomateBinaryWrapperCandidate(
+      body,
+    )
+  ) {
+    if (body.length > maxFileBytes) {
+      return {
+        ok: false,
+        status: 413,
+        error:
+          "Publication file exceeds maximum allowed size",
+      };
+    }
+
+    return {
+      ok: true,
+      content: body,
+    };
+  }
+
+  let parsedBody: unknown;
+
+  try {
+    parsedBody = JSON.parse(
+      body.toString("utf8"),
+    ) as unknown;
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "Invalid Power Automate binary wrapper",
+    };
+  }
+
+  const parsedWrapper =
+    powerAutomateBinaryWrapperSchema.safeParse(
+      parsedBody,
+    );
+
+  if (!parsedWrapper.success) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "Invalid Power Automate binary wrapper",
+      issues:
+        parsedWrapper.error.flatten(),
+    };
+  }
+
+  const roughDecodedBytes =
+    Math.floor(
+      (parsedWrapper.data.$content
+        .replace(/\s/g, "")
+        .length *
+        3) /
+        4,
+    );
+
+  if (roughDecodedBytes > maxFileBytes) {
+    return {
+      ok: false,
+      status: 413,
+      error:
+        "Publication file exceeds maximum allowed size",
+    };
+  }
+
+  const content =
+    decodeBase64Content(
+      parsedWrapper.data.$content,
+    );
+
+  if (!content) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "$content must be valid base64 file content",
+    };
+  }
+
+  if (content.length > maxFileBytes) {
+    return {
+      ok: false,
+      status: 413,
+      error:
+        "Publication file exceeds maximum allowed size",
+    };
+  }
+
+  return {
+    ok: true,
+    content,
+  };
+}
+
 export async function parseRawPowerAutomatePublicationRequest(
   request: Request,
   maxFileBytes = MAX_SHAREPOINT_PUBLICATION_FILE_BYTES,
@@ -474,45 +640,19 @@ export async function parseRawPowerAutomatePublicationRequest(
     return metadata;
   }
 
-  const contentLength =
-    request.headers.get(
-      "content-length",
-    );
-
-  if (
-    contentLength &&
-    Number(contentLength) >
-      maxFileBytes
-  ) {
-    return {
-      ok: false,
-      status: 413,
-      error:
-        "Publication file exceeds maximum allowed size",
-    };
-  }
-
-  const content =
+  const body =
     Buffer.from(
       await request.arrayBuffer(),
     );
 
-  if (content.length === 0) {
-    return {
-      ok: false,
-      status: 400,
-      error:
-        "Raw publication body cannot be empty",
-    };
-  }
+  const decoded =
+    decodeRawPublicationContent(
+      body,
+      maxFileBytes,
+    );
 
-  if (content.length > maxFileBytes) {
-    return {
-      ok: false,
-      status: 413,
-      error:
-        "Publication file exceeds maximum allowed size",
-    };
+  if (!decoded.ok) {
+    return decoded;
   }
 
   return {
@@ -528,7 +668,8 @@ export async function parseRawPowerAutomatePublicationRequest(
       sourceModifiedAt:
         metadata.metadata
           .sourceModifiedAt ?? null,
-      content,
+      content:
+        decoded.content,
     },
   };
 }

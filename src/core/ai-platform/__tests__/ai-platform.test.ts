@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -56,6 +57,8 @@ import {
 
 import {
   handleSharePointPublicationRequest,
+  parsePowerAutomatePublicationPayload,
+  parseRawPowerAutomatePublicationRequest,
 } from "../integrations/sharepoint/power-automate-http-adapter";
 
 import {
@@ -83,6 +86,10 @@ import {
 import {
   InMemoryKnowledgeRepository,
 } from "../repositories/in-memory/in-memory-knowledge-repository";
+
+import {
+  removeUndefinedFirestoreValues,
+} from "../repositories/firestore/firestore-serialization";
 
 import {
   MockKnowledgePublisher,
@@ -185,6 +192,8 @@ class MockOpenAIKnowledgePublisherClient
 
   vectorStoreFileCreateCalls = 0;
 
+  attachedVectorStoreIds: string[] = [];
+
   readonly files = {
     create: async (
       _body: Record<string, unknown>,
@@ -211,10 +220,13 @@ class MockOpenAIKnowledgePublisherClient
     },
     files: {
       create: async (
-        _vectorStoreId: string,
+        vectorStoreId: string,
         _body: Record<string, unknown>,
       ) => {
         this.vectorStoreFileCreateCalls += 1;
+        this.attachedVectorStoreIds.push(
+          vectorStoreId,
+        );
 
         return {
           id: `vsfile-${this.vectorStoreFileCreateCalls}`,
@@ -389,6 +401,44 @@ function approvedSharePointInput(
       "2027-01-01T00:00:00.000Z",
     ...overrides,
   };
+}
+
+function rawSharePointRequest(input: {
+  secret?: string;
+  body?: string;
+  headers?: Record<string, string>;
+} = {}): Request {
+  const requestBody =
+    input.body ?? "raw bytes";
+
+  return new Request(
+    "http://localhost/api/integrations/sharepoint/publication",
+    {
+      method: "POST",
+      headers: {
+        authorization:
+          `Bearer ${input.secret ?? "test-secret"}`,
+        "content-type":
+          "application/octet-stream",
+        "x-ise-source-system":
+          "sharepoint",
+        "x-ise-source-item-id":
+          "raw-item-1",
+        "x-ise-file-name":
+          "admission.docx",
+        "x-ise-audience":
+          "public",
+        "x-ise-approval-status":
+          "Approved",
+        "x-ise-knowledge-category":
+          "Admission",
+        "x-ise-knowledge-version":
+          "AY2027",
+        ...input.headers,
+      },
+      body: requestBody,
+    },
+  );
 }
 
 function testGroundingGate() {
@@ -765,6 +815,213 @@ async function testOpenAIGroundedQAProviderUsesFileSearch() {
   );
 }
 
+function hasOwn(
+  value: Record<string, unknown>,
+  key: string,
+): boolean {
+  return Object.prototype
+    .hasOwnProperty.call(
+      value,
+      key,
+    );
+}
+
+function testFirestoreSerializationRemovesUndefinedValues() {
+  const date =
+    new Date(
+      "2027-01-01T00:00:00.000Z",
+    );
+  const buffer =
+    Buffer.from(
+      "approved public knowledge",
+      "utf8",
+    );
+
+  const document =
+    removeUndefinedFirestoreValues({
+      id: "knowledge-1",
+      title:
+        "Admission Criteria",
+      sourceSystem:
+        "sharepoint",
+      sourceReference:
+        undefined,
+      audience: "public",
+      status: "approved",
+      category: "",
+      owner: undefined,
+      version: "AY2027",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+      metadata: {
+        missing:
+          undefined,
+        keepNull: null,
+        keepFalse: false,
+        keepZero: 0,
+        keepEmpty: "",
+        nested: {
+          missing:
+            undefined,
+          value: "kept",
+        },
+        values: [
+          "first",
+          undefined,
+          {
+            missing:
+              undefined,
+            value: "second",
+          },
+          null,
+        ],
+        date,
+        buffer,
+      },
+      content: "content",
+    });
+
+  assert.equal(
+    hasOwn(
+      document,
+      "sourceReference",
+    ),
+    false,
+  );
+  assert.equal(
+    hasOwn(document, "owner"),
+    false,
+  );
+  assert.equal(
+    document.category,
+    "",
+  );
+
+  const metadata =
+    document.metadata as Record<
+      string,
+      unknown
+    >;
+
+  assert.equal(
+    hasOwn(metadata, "missing"),
+    false,
+  );
+  assert.equal(
+    metadata.keepNull,
+    null,
+  );
+  assert.equal(
+    metadata.keepFalse,
+    false,
+  );
+  assert.equal(
+    metadata.keepZero,
+    0,
+  );
+  assert.equal(
+    metadata.keepEmpty,
+    "",
+  );
+  assert.deepEqual(
+    metadata.nested,
+    {
+      value: "kept",
+    },
+  );
+  assert.deepEqual(
+    metadata.values,
+    [
+      "first",
+      {
+        value: "second",
+      },
+      null,
+    ],
+  );
+  assert.equal(
+    metadata.date,
+    date,
+  );
+  assert.equal(
+    metadata.buffer,
+    buffer,
+  );
+
+  const publication =
+    removeUndefinedFirestoreValues({
+      id: "publication-1",
+      documentId:
+        "knowledge-1",
+      targetProvider:
+        "openai",
+      targetEnvironment:
+        "development",
+      publicationStatus:
+        "published",
+      externalResourceId:
+        undefined,
+      contentHash:
+        "hash",
+      providerMetadata: {
+        vectorStoreId:
+          "vs-public",
+        missing:
+          undefined,
+        nested: {
+          missing:
+            undefined,
+          fileId: "file-1",
+        },
+      },
+    });
+
+  assert.equal(
+    hasOwn(
+      publication,
+      "externalResourceId",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    publication.providerMetadata,
+    {
+      vectorStoreId:
+        "vs-public",
+      nested: {
+        fileId: "file-1",
+      },
+    },
+  );
+
+  const vectorStoreConfig =
+    removeUndefinedFirestoreValues({
+      audience: "public",
+      environment:
+        "development",
+      vectorStoreId:
+        "vs-public",
+      name:
+        "ISE Public Knowledge",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+      optional:
+        undefined,
+    });
+
+  assert.equal(
+    hasOwn(
+      vectorStoreConfig,
+      "optional",
+    ),
+    false,
+  );
+}
+
 async function testOpenAIPublisherPolicyAndIdempotency() {
   const client =
     new MockOpenAIKnowledgePublisherClient();
@@ -873,6 +1130,113 @@ async function testOpenAIPublisherPolicyAndIdempotency() {
       }),
     /Cannot publish internal knowledge to public target/,
   );
+}
+
+async function testOpenAIPublisherVectorStoreReuse() {
+  {
+    const client =
+      new MockOpenAIKnowledgePublisherClient();
+    const publicationRepository =
+      new InMemoryKnowledgePublicationRepository();
+    const publisher =
+      new OpenAIKnowledgePublisher({
+        client,
+        publicationRepository,
+        vectorStoreConfigRepository:
+          new InMemoryOpenAIVectorStoreConfigRepository(),
+        publicVectorStoreId:
+          "vs_env_public",
+        now: () =>
+          "2027-01-01T00:00:00.000Z",
+      });
+
+    await publisher.publish({
+      document:
+        createApprovedPublicKnowledgeDocument(),
+      targetProvider:
+        "openai",
+      targetEnvironment:
+        "development",
+    });
+
+    assert.equal(
+      client.vectorStoreCreateCalls,
+      0,
+    );
+    assert.deepEqual(
+      client.attachedVectorStoreIds,
+      [
+        "vs_env_public",
+      ],
+    );
+  }
+
+  {
+    const client =
+      new MockOpenAIKnowledgePublisherClient();
+    const vectorStoreConfigRepository =
+      new InMemoryOpenAIVectorStoreConfigRepository();
+
+    const firstPublisher =
+      new OpenAIKnowledgePublisher({
+        client,
+        publicationRepository:
+          new InMemoryKnowledgePublicationRepository(),
+        vectorStoreConfigRepository,
+        now: () =>
+          "2027-01-01T00:00:00.000Z",
+      });
+
+    await firstPublisher.publish({
+      document:
+        createApprovedPublicKnowledgeDocument({
+          id: "doc-one",
+        }),
+      targetProvider:
+        "openai",
+      targetEnvironment:
+        "development",
+    });
+
+    const secondPublisher =
+      new OpenAIKnowledgePublisher({
+        client,
+        publicationRepository:
+          new InMemoryKnowledgePublicationRepository(),
+        vectorStoreConfigRepository,
+        now: () =>
+          "2027-01-01T00:01:00.000Z",
+      });
+
+    await secondPublisher.publish({
+      document:
+        createApprovedPublicKnowledgeDocument({
+          id: "doc-two",
+          content:
+            "Second document content",
+          contentHash:
+            computeContentHash(
+              "Second document content",
+            ),
+        }),
+      targetProvider:
+        "openai",
+      targetEnvironment:
+        "development",
+    });
+
+    assert.equal(
+      client.vectorStoreCreateCalls,
+      1,
+    );
+    assert.deepEqual(
+      client.attachedVectorStoreIds,
+      [
+        "vs-1",
+        "vs-1",
+      ],
+    );
+  }
 }
 
 async function testPublishApprovedKnowledgeUseCase() {
@@ -1052,6 +1416,141 @@ async function testPublishApprovedKnowledgeUseCase() {
       ],
     );
   }
+
+  {
+    const shared =
+      createSharePointPublicationTestEnvironment();
+    const firstService =
+      new PublishApprovedKnowledge({
+        knowledgeRepository:
+          shared.knowledgeRepository,
+        governanceService:
+          new KnowledgeGovernanceService({
+            knowledgeRepository:
+              shared.knowledgeRepository,
+            publisher:
+              new MockKnowledgePublisher({
+                publicationRepository:
+                  shared.publicationRepository,
+                targetAudience:
+                  "public",
+                now: () =>
+                  "2027-01-01T00:00:00.000Z",
+              }),
+            idGenerator:
+              new TestGovernanceIdGenerator(),
+            now: () =>
+              "2027-01-01T00:00:00.000Z",
+          }),
+        now: () =>
+          "2027-01-01T00:00:00.000Z",
+      });
+    const secondService =
+      new PublishApprovedKnowledge({
+        knowledgeRepository:
+          shared.knowledgeRepository,
+        governanceService:
+          new KnowledgeGovernanceService({
+            knowledgeRepository:
+              shared.knowledgeRepository,
+            publisher:
+              new MockKnowledgePublisher({
+                publicationRepository:
+                  shared.publicationRepository,
+                targetAudience:
+                  "public",
+                now: () =>
+                  "2027-01-01T00:01:00.000Z",
+              }),
+            idGenerator:
+              new TestGovernanceIdGenerator(),
+            now: () =>
+              "2027-01-01T00:01:00.000Z",
+          }),
+        now: () =>
+          "2027-01-01T00:01:00.000Z",
+      });
+
+    assert.equal(
+      (
+        await firstService.execute(
+          approvedSharePointInput({
+            sourceItemId:
+              "persistent-item-1",
+          }),
+        )
+      ).outcome,
+      "published",
+    );
+    assert.equal(
+      (
+        await secondService.execute(
+          approvedSharePointInput({
+            sourceItemId:
+              "persistent-item-1",
+          }),
+        )
+      ).outcome,
+      "already_current",
+    );
+    assert.equal(
+      (
+        await shared
+          .knowledgeRepository
+          .listDocuments()
+      ).length,
+      1,
+    );
+  }
+
+  {
+    const environment =
+      createSharePointPublicationTestEnvironment();
+
+    await environment.useCase.execute(
+      approvedSharePointInput({
+        sourceItemId:
+          "metadata-item-1",
+        knowledgeVersion: "AY2027",
+      }),
+    );
+    const metadataChanged =
+      await environment.useCase.execute(
+        approvedSharePointInput({
+          sourceItemId:
+            "metadata-item-1",
+          knowledgeVersion:
+            "AY2027-revised",
+        }),
+      );
+
+    assert.equal(
+      metadataChanged.outcome,
+      "published",
+    );
+    assert.equal(
+      (
+        await environment
+          .knowledgeRepository
+          .listDocuments()
+      ).length,
+      2,
+    );
+    assert.notEqual(
+      (
+        await environment
+          .knowledgeRepository
+          .listDocuments()
+      )[0].metadata
+        ?.metadataFingerprint,
+      (
+        await environment
+          .knowledgeRepository
+          .listDocuments()
+      )[1].metadata
+        ?.metadataFingerprint,
+    );
+  }
 }
 
 async function testPowerAutomateHttpAdapter() {
@@ -1172,6 +1671,222 @@ async function testPowerAutomateHttpAdapter() {
   assert.equal(
     unconfigured.status,
     403,
+  );
+}
+
+async function testPowerAutomateJsonAndRawParsing() {
+  const jsonParsed =
+    parsePowerAutomatePublicationPayload({
+      sourceSystem: "sharepoint",
+      sourceItemId: "json-item-1",
+      fileName: "admission.txt",
+      contentBase64:
+        Buffer.from(
+          "json content",
+          "utf8",
+        ).toString("base64"),
+      audience: "public",
+      approvalStatus: "Approved",
+    });
+
+  assert.equal(jsonParsed.ok, true);
+  if (jsonParsed.ok) {
+    assert.equal(
+      Buffer.from(
+        jsonParsed.input.content,
+      ).toString("utf8"),
+      "json content",
+    );
+  }
+
+  const rawParsed =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest(),
+    );
+
+  assert.equal(rawParsed.ok, true);
+  if (rawParsed.ok) {
+    assert.equal(
+      rawParsed.input.sourceItemId,
+      "raw-item-1",
+    );
+    assert.equal(
+      Buffer.from(
+        rawParsed.input.content,
+      ).toString("utf8"),
+      "raw bytes",
+    );
+  }
+
+  const emptyRaw =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body: "",
+      }),
+    );
+
+  assert.equal(emptyRaw.ok, false);
+  if (!emptyRaw.ok) {
+    assert.equal(
+      emptyRaw.status,
+      400,
+    );
+  }
+
+  const oversizedRaw =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        body: "12345",
+      }),
+      4,
+    );
+
+  assert.equal(oversizedRaw.ok, false);
+  if (!oversizedRaw.ok) {
+    assert.equal(
+      oversizedRaw.status,
+      413,
+    );
+  }
+
+  const missingMetadata =
+    await parseRawPowerAutomatePublicationRequest(
+      rawSharePointRequest({
+        headers: {
+          "x-ise-source-item-id":
+            "",
+        },
+      }),
+    );
+
+  assert.equal(
+    missingMetadata.ok,
+    false,
+  );
+  if (!missingMetadata.ok) {
+    assert.equal(
+      missingMetadata.status,
+      400,
+    );
+  }
+}
+
+async function testRawRequestPolicyAndSharedUseCase() {
+  const environment =
+    createSharePointPublicationTestEnvironment();
+
+  const draft =
+    await handleSharePointPublicationRequest(
+      rawSharePointRequest({
+        headers: {
+          "x-ise-approval-status":
+            "Draft",
+        },
+      }),
+      {
+        secret: "test-secret",
+        useCase:
+          environment.useCase,
+      },
+    );
+
+  assert.equal(draft.status, 200);
+  assert.equal(
+    (
+      await draft.json()
+    ).outcome,
+    "rejected_not_approved",
+  );
+
+  const internal =
+    await handleSharePointPublicationRequest(
+      rawSharePointRequest({
+        headers: {
+          "x-ise-audience":
+            "internal",
+        },
+      }),
+      {
+        secret: "test-secret",
+        useCase:
+          environment.useCase,
+      },
+    );
+
+  assert.equal(
+    (
+      await internal.json()
+    ).outcome,
+    "rejected_wrong_audience",
+  );
+
+  let called = false;
+  const approved =
+    await handleSharePointPublicationRequest(
+      rawSharePointRequest(),
+      {
+        secret: "test-secret",
+        useCase: {
+          async execute(input) {
+            called = true;
+            assert.equal(
+              input.sourceSystem,
+              "sharepoint",
+            );
+            assert.equal(
+              input.fileName,
+              "admission.docx",
+            );
+
+            return {
+              outcome:
+                "published",
+            };
+          },
+        },
+      },
+    );
+
+  assert.equal(approved.status, 200);
+  assert.equal(called, true);
+}
+
+async function testProductionDefaultAvoidsLocalVectorStoreFiles() {
+  const source =
+    await readFile(
+      path.join(
+        process.cwd(),
+        "src",
+        "core",
+        "ai-platform",
+        "integrations",
+        "sharepoint",
+        "default-publish-approved-knowledge.ts",
+      ),
+      "utf8",
+    );
+
+  assert.equal(
+    source.includes(".rag-v2"),
+    false,
+  );
+  assert.equal(
+    source.includes(
+      "FileOpenAIVectorStoreConfigRepository",
+    ),
+    false,
+  );
+  assert.equal(
+    source.includes(
+      "InMemoryKnowledgeRepository",
+    ),
+    false,
+  );
+  assert.equal(
+    source.includes(
+      "InMemoryKnowledgePublicationRepository",
+    ),
+    false,
   );
 }
 
@@ -2491,9 +3206,14 @@ async function main() {
   testOpenAIResponseMapping();
   testOpenAIUnsupportedMapping();
   await testOpenAIGroundedQAProviderUsesFileSearch();
+  testFirestoreSerializationRemovesUndefinedValues();
   await testOpenAIPublisherPolicyAndIdempotency();
+  await testOpenAIPublisherVectorStoreReuse();
   await testPublishApprovedKnowledgeUseCase();
   await testPowerAutomateHttpAdapter();
+  await testPowerAutomateJsonAndRawParsing();
+  await testRawRequestPolicyAndSharedUseCase();
+  await testProductionDefaultAvoidsLocalVectorStoreFiles();
   await testOneDriveQueueAdapter();
   testAudiencePolicy();
   testConversationTransitions();

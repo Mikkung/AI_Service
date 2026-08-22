@@ -1,6 +1,5 @@
 import {
   KnowledgeGovernanceService,
-  type GovernanceIdGenerator,
 } from "@/core/ai-platform/knowledge/knowledge-governance-service";
 
 import {
@@ -12,42 +11,27 @@ import {
 } from "@/core/ai-platform/providers/openai/openai-knowledge-publisher";
 
 import {
-  InMemoryKnowledgePublicationRepository,
-} from "@/core/ai-platform/repositories/in-memory/in-memory-knowledge-publication-repository";
+  FirestoreOpenAIVectorStoreConfigRepository,
+} from "@/core/ai-platform/providers/openai/firestore-openai-vector-store-config-repository";
 
 import {
-  InMemoryKnowledgeRepository,
-} from "@/core/ai-platform/repositories/in-memory/in-memory-knowledge-repository";
+  FirestoreAIPlatformKnowledgePublicationRepository,
+} from "@/core/ai-platform/repositories/firestore/firestore-ai-platform-knowledge-publication-repository";
 
-class SharedPublicationIdGenerator
-  implements GovernanceIdGenerator
-{
-  private next = 1;
-
-  nextId(prefix: string): string {
-    const id =
-      String(this.next).padStart(
-        6,
-        "0",
-      );
-    this.next += 1;
-    return `${prefix}-${id}`;
-  }
-}
-
-const knowledgeRepository =
-  new InMemoryKnowledgeRepository();
-
-const publicationRepository =
-  new InMemoryKnowledgePublicationRepository();
-
-const idGenerator =
-  new SharedPublicationIdGenerator();
+import {
+  FirestoreAIPlatformKnowledgeRepository,
+} from "@/core/ai-platform/repositories/firestore/firestore-ai-platform-knowledge-repository";
 
 export function createDefaultPublishApprovedKnowledgeUseCase(): PublishApprovedKnowledge {
+  const knowledgeRepository =
+    new FirestoreAIPlatformKnowledgeRepository();
+  const publicationRepository =
+    new FirestoreAIPlatformKnowledgePublicationRepository();
   const publisher =
     new OpenAIKnowledgePublisher({
       publicationRepository,
+      vectorStoreConfigRepository:
+        new FirestoreOpenAIVectorStoreConfigRepository(),
       targetAudience: "public",
     });
 
@@ -55,7 +39,6 @@ export function createDefaultPublishApprovedKnowledgeUseCase(): PublishApprovedK
     new KnowledgeGovernanceService({
       knowledgeRepository,
       publisher,
-      idGenerator,
     });
 
   return new PublishApprovedKnowledge({

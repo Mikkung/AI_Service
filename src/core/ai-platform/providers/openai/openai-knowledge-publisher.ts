@@ -91,6 +91,7 @@ export interface OpenAIKnowledgePublisherClient {
 export interface OpenAIKnowledgePublisherOptions {
   client?: OpenAIKnowledgePublisherClient;
   apiKey?: string;
+  publicVectorStoreId?: string;
   publicationRepository?: KnowledgePublicationRepository;
   vectorStoreConfigRepository?: OpenAIVectorStoreConfigRepository;
   targetAudience?: KnowledgePublicationTarget;
@@ -163,6 +164,8 @@ export class OpenAIKnowledgePublisher
 
   private readonly apiKey?: string;
 
+  private readonly publicVectorStoreId?: string;
+
   private readonly publicationRepository: KnowledgePublicationRepository;
 
   private readonly vectorStoreConfigRepository: OpenAIVectorStoreConfigRepository;
@@ -179,6 +182,10 @@ export class OpenAIKnowledgePublisher
     this.apiKey =
       options.apiKey ??
       process.env.OPENAI_API_KEY;
+    this.publicVectorStoreId =
+      options.publicVectorStoreId ??
+      process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID;
     this.publicationRepository =
       options.publicationRepository ??
       new InMemoryKnowledgePublicationRepository();
@@ -461,6 +468,10 @@ export class OpenAIKnowledgePublisher
   private async ensurePublicDevelopmentVectorStore(
     timestamp: string,
   ): Promise<string> {
+    if (this.publicVectorStoreId) {
+      return this.publicVectorStoreId;
+    }
+
     const target = {
       audience: "public" as const,
       environment:

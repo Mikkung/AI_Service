@@ -59,6 +59,7 @@ export interface KnowledgeGovernanceServiceDependencies {
 }
 
 export interface CreateDraftInput {
+  id?: string;
   title: string;
   sourceSystem: KnowledgeSourceSystem;
   sourceReference?: string;
@@ -137,9 +138,8 @@ export class KnowledgeGovernanceService {
       .knowledgeRepository
       .createDocument({
         id:
-          this.idGenerator.nextId(
-            "knowledge",
-          ),
+          input.id ??
+          this.idGenerator.nextId("knowledge"),
         title:
           input.title,
         sourceSystem:

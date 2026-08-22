@@ -52,6 +52,7 @@ export interface ApprovedKnowledgePublicationResult {
   supersededKnowledgeDocumentId?: string;
   publicationId?: string;
   contentHash?: string;
+  metadataFingerprint?: string;
   providerMetadata?: Record<string, unknown>;
 }
 
@@ -83,6 +84,73 @@ function sourceIdentityForInput(
     input.sourceItemId,
     input.audience,
   ].join(":");
+}
+
+function stableIdPart(
+  value: string,
+): string {
+  return value
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 80);
+}
+
+function stableJson(
+  value: Record<string, unknown>,
+): string {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(value).sort(
+        ([left], [right]) =>
+          left.localeCompare(right),
+      ),
+    ),
+  );
+}
+
+function metadataForFingerprint(input: {
+  input: ApprovedKnowledgePublicationInput;
+  effectiveFrom?: string;
+  effectiveTo?: string;
+}): Record<string, string | undefined> {
+  return {
+    fileName:
+      input.input.fileName,
+    knowledgeCategory:
+      input.input.knowledgeCategory,
+    knowledgeOwner:
+      input.input.knowledgeOwner,
+    knowledgeVersion:
+      input.input.knowledgeVersion,
+    effectiveFrom:
+      input.effectiveFrom,
+    effectiveTo:
+      input.effectiveTo,
+  };
+}
+
+function metadataFingerprintForInput(input: {
+  input: ApprovedKnowledgePublicationInput;
+  effectiveFrom?: string;
+  effectiveTo?: string;
+}): string {
+  return computeContentHash(
+    stableJson(
+      metadataForFingerprint(input),
+    ),
+  );
+}
+
+function documentIdForVersion(input: {
+  sourceIdentity: string;
+  contentHash: string;
+  metadataFingerprint: string;
+}): string {
+  return [
+    "knowledge",
+    stableIdPart(input.sourceIdentity),
+    input.contentHash.slice(0, 16),
+    input.metadataFingerprint.slice(0, 16),
+  ].join("-");
 }
 
 function isApproved(
@@ -209,6 +277,12 @@ export class PublishApprovedKnowledge {
       );
     const sourceIdentity =
       sourceIdentityForInput(input);
+    const metadataFingerprint =
+      metadataFingerprintForInput({
+        input,
+        effectiveFrom,
+        effectiveTo,
+      });
 
     if (
       !this.isInputCurrentlyEffective({
@@ -223,6 +297,7 @@ export class PublishApprovedKnowledge {
         outcome:
           "rejected_not_effective",
         contentHash,
+        metadataFingerprint,
       };
     }
 
@@ -248,7 +323,10 @@ export class PublishApprovedKnowledge {
 
     if (
       currentDocument?.contentHash ===
-      contentHash
+        contentHash &&
+      currentDocument.metadata
+        ?.metadataFingerprint ===
+        metadataFingerprint
     ) {
       const publication =
         await this.options
@@ -273,6 +351,60 @@ export class PublishApprovedKnowledge {
         publicationId:
           publication.publication.id,
         contentHash,
+        metadataFingerprint,
+        providerMetadata:
+          publication.providerMetadata ??
+          publication.publication
+            .providerMetadata,
+      };
+    }
+
+    const desiredDocumentId =
+      documentIdForVersion({
+        sourceIdentity,
+        contentHash,
+        metadataFingerprint,
+      });
+
+    const exactDocument =
+      await this.options
+        .knowledgeRepository.getDocument(
+          desiredDocumentId,
+        );
+
+    if (
+      exactDocument?.status ===
+        "approved" &&
+      exactDocument.contentHash ===
+        contentHash &&
+      exactDocument.metadata
+        ?.metadataFingerprint ===
+        metadataFingerprint
+    ) {
+      const publication =
+        await this.options
+          .governanceService.publish({
+            documentId:
+              exactDocument.id,
+            targetProvider:
+              this.targetProvider,
+            targetEnvironment:
+              this.targetEnvironment,
+            now: timestamp,
+          });
+
+      return {
+        outcome:
+          publication.reason ===
+          "already_current"
+            ? "already_current"
+            : "published",
+        knowledgeDocumentId:
+          exactDocument.id,
+        publicationId:
+          publication.publication.id,
+        contentHash,
+        metadataFingerprint,
         providerMetadata:
           publication.providerMetadata ??
           publication.publication
@@ -282,12 +414,15 @@ export class PublishApprovedKnowledge {
 
     const createdDocument =
       await this.createApprovedDocument({
+        documentId:
+          desiredDocumentId,
         input,
         contentBase64:
           contentBuffer.toString(
             "base64",
           ),
         contentHash,
+        metadataFingerprint,
         sourceIdentity,
         effectiveFrom,
         effectiveTo,
@@ -342,6 +477,7 @@ export class PublishApprovedKnowledge {
       publicationId:
         publication.publication.id,
       contentHash,
+      metadataFingerprint,
       providerMetadata:
         publication.providerMetadata ??
         publication.publication
@@ -419,9 +555,11 @@ export class PublishApprovedKnowledge {
   }
 
   private async createApprovedDocument(input: {
+    documentId: string;
     input: ApprovedKnowledgePublicationInput;
     contentBase64: string;
     contentHash: string;
+    metadataFingerprint: string;
     sourceIdentity: string;
     effectiveFrom?: string;
     effectiveTo?: string;
@@ -429,6 +567,8 @@ export class PublishApprovedKnowledge {
     const draft =
       await this.options
         .governanceService.createDraft({
+          id:
+            input.documentId,
           title:
             input.input.fileName,
           sourceSystem:
@@ -471,6 +611,8 @@ export class PublishApprovedKnowledge {
               input.input
                 .sourceModifiedAt ??
               undefined,
+            metadataFingerprint:
+              input.metadataFingerprint,
             rawContentEncoding:
               "base64",
           },

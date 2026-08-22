@@ -332,13 +332,15 @@ Operator scripts:
 
 ## 12. Phase E2 SharePoint Publication Transports
 
-Phase E2 adds two ingestion transports for approved public SharePoint knowledge while preserving one shared publication use case:
+Phase E2 adds two ingestion transports for approved public SharePoint knowledge while preserving one shared publication use case. Phase E2.1 makes the primary transport raw binary and adds Firestore-backed serverless persistence:
 
-- Primary: SharePoint Approved -> Power Automate HTTP -> `/api/integrations/sharepoint/publication` -> `PublishApprovedKnowledge` -> OpenAI Managed RAG
+- Primary: SharePoint Approved -> Power Automate Get file content -> HTTP raw binary body -> `/api/integrations/sharepoint/publication` -> `PublishApprovedKnowledge` -> OpenAI Managed RAG
 - Fallback: SharePoint Approved -> Power Automate Standard Connectors -> OneDrive Publish Queue -> `npm run knowledge:publish-queue` -> `PublishApprovedKnowledge` -> OpenAI Managed RAG
 
 The fallback exists in case Power Automate HTTP Premium becomes unavailable, tenant licensing changes, or the HTTP connector is disabled by policy.
 
 The public integration endpoint uses `Authorization: Bearer <SHAREPOINT_PUBLISHER_SECRET>`, not `APP_API_KEY`. It independently enforces `approvalStatus = "Approved"` and `audience = "public"` before public publication.
+
+Production publication state is stored in Firestore collections for AI-platform governance documents, publications, and OpenAI vector-store config. `OPENAI_PUBLIC_VECTOR_STORE_ID` can override vector-store creation and force reuse of a pre-created public vector store.
 
 External AI remains PUBLIC only. Internal AI later may use PUBLIC + INTERNAL knowledge, but Phase E2 does not implement Teams or internal RAG.

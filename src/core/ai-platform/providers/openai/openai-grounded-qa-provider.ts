@@ -98,7 +98,9 @@ export class OpenAIGroundedQAProvider
       process.env.RAG_V2_MODEL ??
       DEFAULT_RAG_V2_MODEL;
     this.vectorStoreId =
-      options.vectorStoreId;
+      options.vectorStoreId ??
+      process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID;
     this.vectorStoreConfigRepository =
       options.vectorStoreConfigRepository ??
       new FileOpenAIVectorStoreConfigRepository();

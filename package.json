@@ -27,7 +27,8 @@
     "benchmark:document-qa": "node scripts/document-qa-benchmark.mjs",
     "rag-v2:publish-admission": "node scripts/rag-v2-publish-admission.mjs",
     "benchmark:rag-v2-admission": "node scripts/rag-v2-admission-benchmark.mjs",
-    "knowledge:publish-queue": "node scripts/knowledge-publish-queue.cjs"
+    "knowledge:publish-queue": "node scripts/knowledge-publish-queue.cjs",
+    "knowledge:unpublish": "node scripts/knowledge-unpublish.mjs"
   },
   "allowScripts": {
     "@firebase/util@1.15.1": true,

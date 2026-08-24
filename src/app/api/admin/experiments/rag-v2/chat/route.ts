@@ -9,6 +9,10 @@ import {
 } from "@/core/ai-platform/providers/openai/openai-grounded-qa-provider";
 
 import {
+  FirestoreOpenAIVectorStoreConfigRepository,
+} from "@/core/ai-platform/providers/openai/firestore-openai-vector-store-config-repository";
+
+import {
   jsonError,
   requireExperimentApiKey,
 } from "../../knowledge/route-utils";
@@ -39,6 +43,25 @@ const schema = z.object({
     .max(10)
     .optional(),
 });
+
+function safeProviderError(
+  value: unknown,
+): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  return value
+    .replace(
+      /sk-[A-Za-z0-9_-]+/g,
+      "sk-REDACTED",
+    )
+    .replace(
+      /Bearer\s+[A-Za-z0-9._-]+/gi,
+      "Bearer REDACTED",
+    )
+    .slice(0, 500);
+}
 
 export async function POST(
   request: Request,
@@ -71,7 +94,10 @@ export async function POST(
 
   try {
     const provider =
-      new OpenAIGroundedQAProvider();
+      new OpenAIGroundedQAProvider({
+        vectorStoreConfigRepository:
+          new FirestoreOpenAIVectorStoreConfigRepository(),
+      });
     const service =
       new AnswerService(provider);
     const result =
@@ -83,6 +109,15 @@ export async function POST(
           parsed.data
             .conversationContext,
       });
+
+    const providerError =
+      result.groundingReason ===
+      "provider_error"
+        ? safeProviderError(
+            result.providerMetadata
+              ?.providerError,
+          )
+        : undefined;
 
     return Response.json({
       ok: true,
@@ -107,6 +142,7 @@ export async function POST(
       retrieval:
         result.providerMetadata
           ?.retrieval,
+      providerError,
       latencyMs:
         result.latencyMs,
       usage:

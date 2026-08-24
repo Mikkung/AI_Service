@@ -14,6 +14,10 @@ import {
 } from "../answering/answer-service";
 
 import {
+  unpublishKnowledgePublication,
+} from "../admin/knowledge-unpublish";
+
+import {
   evaluateGroundingResult,
 } from "../answering/grounding-gate";
 
@@ -107,6 +111,12 @@ import {
 import {
   InMemoryOpenAIVectorStoreConfigRepository,
 } from "../providers/openai/in-memory-openai-vector-store-config-repository";
+
+import type {
+  OpenAIVectorStoreConfig,
+  OpenAIVectorStoreConfigRepository,
+  OpenAIVectorStoreTarget,
+} from "../providers/openai/openai-rag-types";
 
 import {
   OpenAIGroundedQAProvider,
@@ -283,6 +293,36 @@ class MockOpenAIKnowledgePublisherClient
       },
     },
   };
+}
+
+class TrackingVectorStoreConfigRepository
+  implements OpenAIVectorStoreConfigRepository
+{
+  getCalls = 0;
+
+  saveCalls = 0;
+
+  constructor(
+    private readonly config: OpenAIVectorStoreConfig | null,
+  ) {}
+
+  async getVectorStoreConfig(
+    _target: OpenAIVectorStoreTarget,
+  ): Promise<OpenAIVectorStoreConfig | null> {
+    this.getCalls += 1;
+
+    return this.config
+      ? {
+          ...this.config,
+        }
+      : null;
+  }
+
+  async saveVectorStoreConfig(
+    _config: OpenAIVectorStoreConfig,
+  ): Promise<void> {
+    this.saveCalls += 1;
+  }
 }
 
 function createApprovedPublicKnowledgeDocument(
@@ -502,6 +542,128 @@ function rawSharePointRequest(input: {
       body: requestBody,
     },
   );
+}
+
+async function createKnowledgeUnpublishTestEnvironment(input: {
+  documentId?: string;
+  sourceReference?: string;
+  sourceItemId?: string;
+  sourceSystem?: "sharepoint" | "manual";
+  audience?: "public" | "internal";
+  publicationStatus?:
+    | "published"
+    | "unpublished"
+    | "failed"
+    | "pending";
+} = {}) {
+  const documentId =
+    input.documentId ??
+    "knowledge-sharepoint_local-admission-test";
+  const knowledgeRepository =
+    new InMemoryKnowledgeRepository();
+  const publicationRepository =
+    new InMemoryKnowledgePublicationRepository();
+  const publisher = {
+    calls: 0,
+    async unpublish(
+      targetDocumentId: string,
+      targetProvider: string,
+      targetEnvironment:
+        | "development"
+        | "production" =
+        "development",
+    ) {
+      this.calls += 1;
+      const publication =
+        await publicationRepository
+          .findLatestPublication(
+            targetDocumentId,
+            targetProvider,
+            targetEnvironment,
+          );
+
+      if (publication) {
+        await publicationRepository
+          .updatePublication({
+            id:
+              publication.id,
+            publicationStatus:
+              "unpublished",
+            unpublishedAt:
+              "2027-01-01T00:01:00.000Z",
+          });
+      }
+    },
+  };
+
+  await knowledgeRepository
+    .createDocument({
+      id: documentId,
+      title:
+        "Admission Local Test",
+      sourceSystem:
+        input.sourceSystem ??
+        "sharepoint",
+      sourceReference:
+        input.sourceReference ??
+        "sharepoint:local-admission:public",
+      audience:
+        input.audience ?? "public",
+      status: "approved",
+      content:
+        "Local test admission content",
+      contentHash:
+        computeContentHash(
+          "Local test admission content",
+        ),
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+      metadata: {
+        sourceIdentity:
+          input.sourceReference ??
+          "sharepoint:local-admission:public",
+        sourceItemId:
+          input.sourceItemId ??
+          "local-admission",
+      },
+    });
+
+  await publicationRepository
+    .createPublication({
+      id:
+        "openai-publication-local-test",
+      documentId,
+      targetProvider: "openai",
+      targetEnvironment:
+        "development",
+      publicationStatus:
+        input.publicationStatus ??
+        "published",
+      externalResourceId:
+        "file-local-test",
+      contentHash:
+        "hash-local-test",
+      publishedAt:
+        "2027-01-01T00:00:00.000Z",
+      providerMetadata: {
+        provider: "openai",
+        vectorStoreId:
+          "vs-public-dev",
+        fileId:
+          "file-local-test",
+        vectorStoreFileId:
+          "vsfile-local-test",
+      },
+    });
+
+  return {
+    documentId,
+    knowledgeRepository,
+    publicationRepository,
+    publisher,
+  };
 }
 
 function testGroundingGate() {
@@ -875,6 +1037,348 @@ async function testOpenAIGroundedQAProviderUsesFileSearch() {
   assert.equal(
     requestBody?.store,
     false,
+  );
+}
+
+async function testOpenAIGroundedQAProviderVectorStoreResolution() {
+  const originalPublicVectorStoreId =
+    process.env
+      .OPENAI_PUBLIC_VECTOR_STORE_ID;
+
+  try {
+    const answerWithProvider =
+      async (provider: OpenAIGroundedQAProvider) =>
+        provider.answer({
+          question:
+            "test question",
+          audience: "public",
+        });
+
+    const response = {
+      output_text: "Answer",
+      output: [
+        {
+          type: "message",
+          content: [
+            {
+              text: "Answer",
+              annotations: [
+                {
+                  type: "file_citation",
+                  file_id: "file-1",
+                  filename: "doc.txt",
+                  index: 0,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    {
+      process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID =
+        "vs_env_should_not_win";
+      let requestBody:
+        | Record<string, unknown>
+        | undefined;
+      const repository =
+        new TrackingVectorStoreConfigRepository(
+          {
+            audience: "public",
+            environment:
+              "development",
+            vectorStoreId:
+              "vs_repo_should_not_win",
+            name: "Repo Store",
+            createdAt:
+              "2027-01-01T00:00:00.000Z",
+            updatedAt:
+              "2027-01-01T00:00:00.000Z",
+          },
+        );
+      const provider =
+        new OpenAIGroundedQAProvider({
+          vectorStoreId:
+            "vs_constructor",
+          vectorStoreConfigRepository:
+            repository,
+          client: {
+            responses: {
+              create: async (
+                body: Record<
+                  string,
+                  unknown
+                >,
+              ) => {
+                requestBody =
+                  body;
+                return response;
+              },
+            },
+          },
+        });
+
+      await answerWithProvider(provider);
+
+      assert.deepEqual(
+        requestBody?.tools,
+        [
+          {
+            type: "file_search",
+            vector_store_ids: [
+              "vs_constructor",
+            ],
+          },
+        ],
+      );
+      assert.equal(
+        repository.getCalls,
+        0,
+      );
+      assert.equal(
+        repository.saveCalls,
+        0,
+      );
+    }
+
+    {
+      process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID =
+        "vs_env_public";
+      let requestBody:
+        | Record<string, unknown>
+        | undefined;
+      const repository =
+        new TrackingVectorStoreConfigRepository(
+          {
+            audience: "public",
+            environment:
+              "development",
+            vectorStoreId:
+              "vs_repo_should_not_win",
+            name: "Repo Store",
+            createdAt:
+              "2027-01-01T00:00:00.000Z",
+            updatedAt:
+              "2027-01-01T00:00:00.000Z",
+          },
+        );
+      const provider =
+        new OpenAIGroundedQAProvider({
+          vectorStoreConfigRepository:
+            repository,
+          client: {
+            responses: {
+              create: async (
+                body: Record<
+                  string,
+                  unknown
+                >,
+              ) => {
+                requestBody =
+                  body;
+                return response;
+              },
+            },
+          },
+        });
+
+      await answerWithProvider(provider);
+
+      assert.deepEqual(
+        requestBody?.tools,
+        [
+          {
+            type: "file_search",
+            vector_store_ids: [
+              "vs_env_public",
+            ],
+          },
+        ],
+      );
+      assert.equal(
+        repository.getCalls,
+        0,
+      );
+      assert.equal(
+        repository.saveCalls,
+        0,
+      );
+    }
+
+    {
+      delete process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID;
+      let requestBody:
+        | Record<string, unknown>
+        | undefined;
+      const repository =
+        new TrackingVectorStoreConfigRepository(
+          {
+            audience: "public",
+            environment:
+              "development",
+            vectorStoreId:
+              "vs_firestore_style",
+            name: "Firestore Store",
+            createdAt:
+              "2027-01-01T00:00:00.000Z",
+            updatedAt:
+              "2027-01-01T00:00:00.000Z",
+          },
+        );
+      const provider =
+        new OpenAIGroundedQAProvider({
+          vectorStoreConfigRepository:
+            repository,
+          client: {
+            responses: {
+              create: async (
+                body: Record<
+                  string,
+                  unknown
+                >,
+              ) => {
+                requestBody =
+                  body;
+                return response;
+              },
+            },
+          },
+        });
+
+      const result =
+        await answerWithProvider(
+          provider,
+        );
+
+      assert.equal(
+        result.answerable,
+        true,
+      );
+      assert.deepEqual(
+        requestBody?.tools,
+        [
+          {
+            type: "file_search",
+            vector_store_ids: [
+              "vs_firestore_style",
+            ],
+          },
+        ],
+      );
+      assert.equal(
+        repository.getCalls,
+        1,
+      );
+      assert.equal(
+        repository.saveCalls,
+        0,
+      );
+    }
+
+    {
+      delete process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID;
+      const repository =
+        new TrackingVectorStoreConfigRepository(
+          null,
+        );
+      const provider =
+        new OpenAIGroundedQAProvider({
+          vectorStoreConfigRepository:
+            repository,
+          client: {
+            responses: {
+              create: async () => {
+                throw new Error(
+                  "Responses API should not be called without vector store config",
+                );
+              },
+            },
+          },
+        });
+      const service =
+        new AnswerService(provider);
+
+      const result =
+        await service.answer({
+          question:
+            "test question",
+          audience: "public",
+        });
+
+      assert.equal(
+        result.groundingReason,
+        "provider_error",
+      );
+      assert.match(
+        String(
+          result.providerMetadata
+            ?.providerError,
+        ),
+        /vector store is not configured/,
+      );
+      assert.equal(
+        repository.getCalls,
+        1,
+      );
+      assert.equal(
+        repository.saveCalls,
+        0,
+      );
+    }
+  } finally {
+    if (
+      originalPublicVectorStoreId ===
+      undefined
+    ) {
+      delete process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID;
+    } else {
+      process.env
+        .OPENAI_PUBLIC_VECTOR_STORE_ID =
+        originalPublicVectorStoreId;
+    }
+  }
+}
+
+async function testRagV2AdminRouteUsesFirestoreVectorStoreConfig() {
+  const routeSource =
+    await readFile(
+      path.join(
+        process.cwd(),
+        "src",
+        "app",
+        "api",
+        "admin",
+        "experiments",
+        "rag-v2",
+        "chat",
+        "route.ts",
+      ),
+      "utf8",
+    );
+
+  assert.equal(
+    routeSource.includes(
+      "FirestoreOpenAIVectorStoreConfigRepository",
+    ),
+    true,
+  );
+  assert.equal(
+    routeSource.includes(
+      "new OpenAIGroundedQAProvider({",
+    ),
+    true,
+  );
+  assert.equal(
+    routeSource.includes(
+      "providerError",
+    ),
+    true,
   );
 }
 
@@ -1298,6 +1802,173 @@ async function testOpenAIPublisherVectorStoreReuse() {
         "vs-1",
         "vs-1",
       ],
+    );
+  }
+}
+
+async function testKnowledgeUnpublishAdmin() {
+  {
+    const environment =
+      await createKnowledgeUnpublishTestEnvironment();
+
+    const report =
+      await unpublishKnowledgePublication(
+        environment,
+        {
+          documentId:
+            environment.documentId,
+        },
+      );
+
+    assert.equal(report.dryRun, true);
+    assert.equal(
+      report.executed,
+      false,
+    );
+    assert.equal(
+      report.wouldChange,
+      true,
+    );
+    assert.equal(
+      report.vectorStoreId,
+      "vs-public-dev",
+    );
+    assert.equal(
+      report.fileId,
+      "file-local-test",
+    );
+    assert.equal(
+      environment.publisher.calls,
+      0,
+    );
+    assert.equal(
+      (
+        await environment
+          .publicationRepository
+          .getPublication(
+            "openai-publication-local-test",
+          )
+      )?.publicationStatus,
+      "published",
+    );
+  }
+
+  {
+    const environment =
+      await createKnowledgeUnpublishTestEnvironment();
+
+    const report =
+      await unpublishKnowledgePublication(
+        environment,
+        {
+          documentId:
+            environment.documentId,
+          execute: true,
+        },
+      );
+
+    assert.equal(report.dryRun, false);
+    assert.equal(
+      report.executed,
+      true,
+    );
+    assert.equal(
+      report.publicationStatus,
+      "unpublished",
+    );
+    assert.equal(
+      environment.publisher.calls,
+      1,
+    );
+    assert.equal(
+      (
+        await environment
+          .publicationRepository
+          .getPublication(
+            "openai-publication-local-test",
+          )
+      )?.publicationStatus,
+      "unpublished",
+    );
+  }
+
+  {
+    const environment =
+      await createKnowledgeUnpublishTestEnvironment({
+        documentId:
+          "knowledge-sharepoint_83-public",
+        sourceReference:
+          "sharepoint:83:public",
+        sourceItemId: "83",
+      });
+
+    await assert.rejects(
+      () =>
+        unpublishKnowledgePublication(
+          environment,
+          {
+            documentId:
+              environment.documentId,
+            execute: true,
+          },
+        ),
+      /Refusing to unpublish canonical SharePoint Item 83/,
+    );
+    assert.equal(
+      environment.publisher.calls,
+      0,
+    );
+  }
+
+  {
+    const environment =
+      await createKnowledgeUnpublishTestEnvironment({
+        publicationStatus:
+          "unpublished",
+      });
+
+    const report =
+      await unpublishKnowledgePublication(
+        environment,
+        {
+          documentId:
+            environment.documentId,
+          execute: true,
+        },
+      );
+
+    assert.equal(
+      report.executed,
+      false,
+    );
+    assert.equal(
+      report.wouldChange,
+      false,
+    );
+    assert.match(
+      report.action,
+      /already unpublished/,
+    );
+    assert.equal(
+      environment.publisher.calls,
+      0,
+    );
+  }
+
+  {
+    const environment =
+      await createKnowledgeUnpublishTestEnvironment();
+
+    await assert.rejects(
+      () =>
+        unpublishKnowledgePublication(
+          environment,
+          {
+            documentId:
+              "missing-document",
+          },
+        ),
+      /Knowledge document not found: missing-document/,
     );
   }
 }
@@ -3825,9 +4496,12 @@ async function main() {
   testOpenAIResponseMapping();
   testOpenAIUnsupportedMapping();
   await testOpenAIGroundedQAProviderUsesFileSearch();
+  await testOpenAIGroundedQAProviderVectorStoreResolution();
+  await testRagV2AdminRouteUsesFirestoreVectorStoreConfig();
   testFirestoreSerializationRemovesUndefinedValues();
   await testOpenAIPublisherPolicyAndIdempotency();
   await testOpenAIPublisherVectorStoreReuse();
+  await testKnowledgeUnpublishAdmin();
   await testProductionSafeGovernanceIds();
   await testGovernanceTransitionIsAtomicWhenAuditFails();
   await testSharePointDeterministicPartialStateRecovery();

@@ -1,4 +1,8 @@
 import {
+  randomUUID,
+} from "node:crypto";
+
+import {
   AnswerService,
 } from "@/core/ai-platform/answering/answer-service";
 
@@ -21,6 +25,10 @@ import type {
 import type {
   ConversationRepository,
 } from "@/core/ai-platform/repositories/conversation-repository";
+
+import type {
+  ConversationWorkflowRepository,
+} from "@/core/ai-platform/repositories/conversation-workflow-repository";
 
 import type {
   HandoffRepository,
@@ -46,6 +54,7 @@ export interface ConversationServiceDependencies {
   conversationRepository: ConversationRepository;
   handoffRepository: HandoffRepository;
   answerService: AnswerService;
+  conversationWorkflowRepository?: ConversationWorkflowRepository;
   idGenerator?: IdGenerator;
   now?: () => string;
 }
@@ -108,7 +117,7 @@ export interface ConversationServiceResult {
   events: ConversationDomainEvent[];
 }
 
-class SequentialIdGenerator
+export class SequentialIdGenerator
   implements IdGenerator
 {
   private next = 1;
@@ -121,6 +130,14 @@ class SequentialIdGenerator
       );
     this.next += 1;
     return `${prefix}-${value}`;
+  }
+}
+
+export class RandomUuidIdGenerator
+  implements IdGenerator
+{
+  nextId(prefix: string): string {
+    return `${prefix}-${randomUUID()}`;
   }
 }
 
@@ -156,7 +173,7 @@ export class ConversationService {
   ) {
     this.idGenerator =
       dependencies.idGenerator ??
-      new SequentialIdGenerator();
+      new RandomUuidIdGenerator();
     this.now =
       dependencies.now ?? defaultNow;
   }
@@ -216,24 +233,22 @@ export class ConversationService {
   async receiveUserMessage(
     input: ReceiveUserMessageInput,
   ): Promise<ConversationServiceResult> {
-    const conversation =
+    const timestamp =
+      this.now();
+    const initialConversation =
       await this.requireConversation(
         input.conversationId,
       );
-
-    const timestamp =
-      this.now();
-
-    await this.appendMessage({
+    const userMessage: ConversationMessage = {
       id:
         this.idGenerator.nextId(
           "message",
         ),
       conversationId:
-        conversation.id,
+        initialConversation.id,
       senderType: "user",
       senderId:
-        conversation.channelUserId,
+        initialConversation.channelUserId,
       text:
         input.text,
       createdAt:
@@ -242,30 +257,30 @@ export class ConversationService {
         input.channelMessageId,
       metadata:
         input.metadata,
-    });
+    };
 
-    await this.dependencies
-      .conversationRepository
-      .updateConversation({
-        id:
-          conversation.id,
-        updatedAt:
-          timestamp,
-        lastMessageAt:
-          timestamp,
-      });
+    const conversation =
+      this.dependencies
+        .conversationWorkflowRepository
+        ? await this.dependencies
+            .conversationWorkflowRepository
+            .appendUserMessage({
+              conversationId:
+                initialConversation.id,
+              message:
+                userMessage,
+              updatedAt:
+                timestamp,
+            })
+        : await this.appendUserMessageWithoutWorkflow(
+            userMessage,
+            timestamp,
+          );
 
-    if (
-      conversation.mode !== "ai_active"
-    ) {
-      const latest =
-        await this.requireConversation(
-          conversation.id,
-        );
-
+    if (conversation.mode !== "ai_active") {
       return {
         conversation:
-          latest,
+          conversation,
         events: [],
       };
     }
@@ -273,6 +288,11 @@ export class ConversationService {
     const policy =
       getChannelPolicy(
         conversation.channel,
+      );
+    const conversationContext =
+      await this.buildConversationContext(
+        conversation.id,
+        userMessage.id,
       );
 
     const answer =
@@ -283,6 +303,7 @@ export class ConversationService {
             input.text,
           audience:
             policy.allowedKnowledgeAudience,
+          conversationContext,
         });
 
     if (answer.safeToSend) {
@@ -308,25 +329,38 @@ export class ConversationService {
         },
       };
 
-      await this.appendMessage(
-        aiMessage,
-      );
+      const result =
+        this.dependencies
+          .conversationWorkflowRepository
+          ? await this.dependencies
+              .conversationWorkflowRepository
+              .persistAiMessageIfActive({
+                conversationId:
+                  conversation.id,
+                message:
+                  aiMessage,
+                updatedAt:
+                  aiMessage.createdAt,
+              })
+          : {
+              conversation:
+                await this.persistAiMessageWithoutWorkflow(
+                  aiMessage,
+                ),
+              persisted: true,
+            };
 
-      const updated =
-        await this.dependencies
-          .conversationRepository
-          .updateConversation({
-            id:
-              conversation.id,
-            updatedAt:
-              aiMessage.createdAt,
-            lastMessageAt:
-              aiMessage.createdAt,
-          });
+      if (!result.persisted) {
+        return {
+          conversation:
+            result.conversation,
+          events: [],
+        };
+      }
 
       return {
         conversation:
-          updated,
+          result.conversation,
         outboundMessage: {
           text:
             aiMessage.text,
@@ -356,6 +390,100 @@ export class ConversationService {
   async requestHumanHandoff(
     input: RequestHumanHandoffInput,
   ): Promise<ConversationServiceResult> {
+    if (
+      this.dependencies
+        .conversationWorkflowRepository
+    ) {
+      const existingConversation =
+        await this.requireConversation(
+          input.conversationId,
+        );
+      const timestamp =
+        this.now();
+      const handoff: HumanHandoff = {
+        id:
+          this.idGenerator.nextId(
+            "handoff",
+          ),
+        conversationId:
+          existingConversation.id,
+        reason:
+          input.reason,
+        status: "waiting",
+        requestedAt:
+          timestamp,
+        requestedBy:
+          input.requestedBy,
+        metadata:
+          input.metadata,
+      };
+      const systemMessage: ConversationMessage =
+        {
+          id:
+            this.idGenerator.nextId(
+              "message",
+            ),
+          conversationId:
+            existingConversation.id,
+          senderType: "system",
+          text:
+            "Human handoff requested.",
+          createdAt:
+            timestamp,
+          metadata: {
+            handoffId:
+              handoff.id,
+            reason:
+              handoff.reason,
+          },
+        };
+      const result =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .requestHumanHandoff({
+            conversationId:
+              existingConversation.id,
+            handoff,
+            systemMessage,
+            updatedAt:
+              timestamp,
+          });
+
+      return {
+        conversation:
+          result.conversation,
+        handoff:
+          result.handoff,
+        outboundMessage:
+          result.created
+            ? {
+                text:
+                  systemMessage.text,
+                senderType: "system",
+              }
+            : undefined,
+        events:
+          result.created
+            ? [
+                {
+                  type:
+                    "conversation.handoff_requested",
+                  conversationId:
+                    result.conversation
+                      .id,
+                  handoffId:
+                    result.handoff.id,
+                  reason:
+                    result.handoff
+                      .reason,
+                  occurredAt:
+                    timestamp,
+                },
+              ]
+            : [],
+      };
+    }
+
     const conversation =
       await this.requireConversation(
         input.conversationId,
@@ -471,6 +599,46 @@ export class ConversationService {
   async takeOverConversation(
     input: TakeOverConversationInput,
   ): Promise<ConversationServiceResult> {
+    if (
+      this.dependencies
+        .conversationWorkflowRepository
+    ) {
+      const timestamp =
+        this.now();
+      const result =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .takeOverConversation({
+            conversationId:
+              input.conversationId,
+            agentId:
+              input.agentId,
+            takenAt:
+              timestamp,
+          });
+
+      return {
+        conversation:
+          result.conversation,
+        handoff:
+          result.handoff,
+        events: [
+          {
+            type:
+              "conversation.taken_over",
+            conversationId:
+              result.conversation.id,
+            handoffId:
+              result.handoff.id,
+            agentId:
+              input.agentId,
+            occurredAt:
+              timestamp,
+          },
+        ],
+      };
+    }
+
     const conversation =
       await this.requireConversation(
         input.conversationId,
@@ -559,6 +727,53 @@ export class ConversationService {
   async sendHumanReply(
     input: SendHumanReplyInput,
   ): Promise<ConversationServiceResult> {
+    if (
+      this.dependencies
+        .conversationWorkflowRepository
+    ) {
+      const timestamp =
+        this.now();
+      const message: ConversationMessage = {
+        id:
+          this.idGenerator.nextId(
+            "message",
+          ),
+        conversationId:
+          input.conversationId,
+        senderType: "human",
+        senderId:
+          input.agentId,
+        text:
+          input.text,
+        createdAt:
+          timestamp,
+        metadata:
+          input.metadata,
+      };
+      const conversation =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .persistHumanMessageIfOwned({
+            conversationId:
+              input.conversationId,
+            agentId:
+              input.agentId,
+            message,
+            updatedAt:
+              timestamp,
+          });
+
+      return {
+        conversation,
+        outboundMessage: {
+          text:
+            message.text,
+          senderType: "human",
+        },
+        events: [],
+      };
+    }
+
     const conversation =
       await this.requireConversation(
         input.conversationId,
@@ -632,6 +847,46 @@ export class ConversationService {
   async resolveConversation(
     input: ResolveConversationInput,
   ): Promise<ConversationServiceResult> {
+    if (
+      this.dependencies
+        .conversationWorkflowRepository
+    ) {
+      const timestamp =
+        this.now();
+      const result =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .resolveConversation({
+            conversationId:
+              input.conversationId,
+            resolvedAt:
+              timestamp,
+            resolutionNote:
+              input.resolutionNote,
+          });
+
+      return {
+        conversation:
+          result.conversation,
+        handoff:
+          result.handoff,
+        events: [
+          {
+            type:
+              "conversation.resolved",
+            conversationId:
+              result.conversation.id,
+            handoffId:
+              result.handoff.id,
+            resolvedBy:
+              input.resolvedBy,
+            occurredAt:
+              timestamp,
+          },
+        ],
+      };
+    }
+
     const conversation =
       await this.requireConversation(
         input.conversationId,
@@ -717,6 +972,27 @@ export class ConversationService {
   async returnConversationToAI(
     input: ReturnConversationToAIInput,
   ): Promise<ConversationServiceResult> {
+    if (
+      this.dependencies
+        .conversationWorkflowRepository
+    ) {
+      const updated =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .returnConversationToAI({
+            conversationId:
+              input.conversationId,
+            updatedAt:
+              this.now(),
+          });
+
+      return {
+        conversation:
+          updated,
+        events: [],
+      };
+    }
+
     const conversation =
       await this.requireConversation(
         input.conversationId,
@@ -787,6 +1063,73 @@ export class ConversationService {
     }
 
     return handoff;
+  }
+
+  private async appendUserMessageWithoutWorkflow(
+    message: ConversationMessage,
+    timestamp: string,
+  ): Promise<Conversation> {
+    await this.appendMessage(message);
+
+    return this.dependencies
+      .conversationRepository
+      .updateConversation({
+        id:
+          message.conversationId,
+        updatedAt:
+          timestamp,
+        lastMessageAt:
+          timestamp,
+      });
+  }
+
+  private async persistAiMessageWithoutWorkflow(
+    message: ConversationMessage,
+  ): Promise<Conversation> {
+    await this.appendMessage(message);
+
+    return this.dependencies
+      .conversationRepository
+      .updateConversation({
+        id:
+          message.conversationId,
+        updatedAt:
+          message.createdAt,
+        lastMessageAt:
+          message.createdAt,
+      });
+  }
+
+  private async buildConversationContext(
+    conversationId: string,
+    currentUserMessageId: string,
+  ) {
+    const messages =
+      await this.dependencies
+        .conversationRepository
+        .listMessages(conversationId);
+
+    return messages
+      .filter(
+        (message) =>
+          message.id !==
+            currentUserMessageId &&
+          message.senderType !==
+            "system",
+      )
+      .map((message) => ({
+        role:
+          message.senderType === "user"
+            ? ("user" as const)
+            : ("assistant" as const),
+        text:
+          message.text,
+      }))
+      .filter(
+        (message) =>
+          message.text.trim().length > 0,
+      )
+      .slice(-10);
   }
 
   private async appendMessage(

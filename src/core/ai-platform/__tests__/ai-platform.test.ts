@@ -18,6 +18,10 @@ import {
 } from "../admin/knowledge-unpublish";
 
 import {
+  runVectorStoreOrphanCleanup,
+} from "../admin/vector-store-orphan-cleanup";
+
+import {
   evaluateGroundingResult,
 } from "../answering/grounding-gate";
 
@@ -73,8 +77,27 @@ import {
 
 import {
   ConversationService,
+  RandomUuidIdGenerator,
+  type ConversationServiceResult,
   type IdGenerator,
 } from "../conversations/conversation-service";
+
+import {
+  FirestoreAIPlatformConversationRepository,
+} from "../repositories/firestore/firestore-ai-platform-conversation-repository";
+
+import {
+  ConversationConflictError,
+  ConversationInvariantError,
+} from "../repositories/conversation-workflow-repository";
+
+import {
+  FirestoreAIPlatformConversationWorkflowRepository,
+} from "../repositories/firestore/firestore-ai-platform-conversation-workflow-repository";
+
+import {
+  FirestoreAIPlatformHandoffRepository,
+} from "../repositories/firestore/firestore-ai-platform-handoff-repository";
 
 import {
   InMemoryConversationRepository,
@@ -187,6 +210,524 @@ class ConstantGovernanceIdGenerator
   }
 }
 
+type FakeFirestoreData =
+  Record<string, unknown>;
+
+function cloneFakeFirestoreValue(
+  value: unknown,
+): unknown {
+  if (Array.isArray(value)) {
+    return value.map(
+      cloneFakeFirestoreValue,
+    );
+  }
+
+  if (
+    value &&
+    typeof value === "object" &&
+    Object.getPrototypeOf(value) ===
+      Object.prototype
+  ) {
+    return Object.fromEntries(
+      Object.entries(
+        value as Record<
+          string,
+          unknown
+        >,
+      ).map(([key, nested]) => [
+        key,
+        cloneFakeFirestoreValue(
+          nested,
+        ),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function cloneFakeFirestoreData(
+  data: FakeFirestoreData,
+): FakeFirestoreData {
+  return cloneFakeFirestoreValue(
+    data,
+  ) as FakeFirestoreData;
+}
+
+class FakeFirestoreDocumentSnapshot {
+  readonly exists: boolean;
+
+  constructor(
+    readonly id: string,
+    private readonly value:
+      | FakeFirestoreData
+      | undefined,
+  ) {
+    this.exists =
+      value !== undefined;
+  }
+
+  data(): FakeFirestoreData | undefined {
+    return this.value
+      ? cloneFakeFirestoreData(
+          this.value,
+        )
+      : undefined;
+  }
+}
+
+class FakeFirestoreDocumentReference {
+  constructor(
+    private readonly documents: Map<
+      string,
+      FakeFirestoreData
+    >,
+    readonly collectionName: string,
+    readonly id: string,
+  ) {}
+
+  async create(
+    data: FakeFirestoreData,
+  ): Promise<void> {
+    if (this.documents.has(this.id)) {
+      throw new Error(
+        `Document already exists: ${this.id}`,
+      );
+    }
+
+    this.documents.set(
+      this.id,
+      cloneFakeFirestoreData(data),
+    );
+  }
+
+  async get(): Promise<FakeFirestoreDocumentSnapshot> {
+    return new FakeFirestoreDocumentSnapshot(
+      this.id,
+      this.documents.get(this.id),
+    );
+  }
+
+  async set(
+    data: FakeFirestoreData,
+  ): Promise<void> {
+    this.documents.set(
+      this.id,
+      cloneFakeFirestoreData(data),
+    );
+  }
+}
+
+class FakeFirestoreCollectionReference {
+  constructor(
+    private readonly documents: Map<
+      string,
+      FakeFirestoreData
+    >,
+    readonly collectionName: string,
+    readonly filters: Array<{
+      field: string;
+      value: unknown;
+    }> = [],
+  ) {}
+
+  doc(
+    id: string,
+  ): FakeFirestoreDocumentReference {
+    return new FakeFirestoreDocumentReference(
+      this.documents,
+      this.collectionName,
+      id,
+    );
+  }
+
+  where(
+    field: string,
+    operator: "==",
+    value: unknown,
+  ): FakeFirestoreCollectionReference {
+    assert.equal(operator, "==");
+
+    return new FakeFirestoreCollectionReference(
+      this.documents,
+      this.collectionName,
+      [
+        ...this.filters,
+        {
+          field,
+          value,
+        },
+      ],
+    );
+  }
+
+  async get(): Promise<{
+    docs: FakeFirestoreDocumentSnapshot[];
+  }> {
+    return {
+      docs: [
+        ...this.documents.entries(),
+      ]
+        .filter(([, data]) =>
+          this.matchesFilters(data),
+        )
+        .map(
+        ([id, data]) =>
+          new FakeFirestoreDocumentSnapshot(
+            id,
+            data,
+          ),
+      ),
+    };
+  }
+
+  private matchesFilters(
+    data: FakeFirestoreData,
+  ): boolean {
+    return this.filters.every(
+      (filter) =>
+        data[filter.field] ===
+        filter.value,
+    );
+  }
+}
+
+class FakeFirestore {
+  private collections =
+    new Map<
+      string,
+      Map<string, FakeFirestoreData>
+    >();
+
+  private versions =
+    new Map<string, number>();
+
+  collection(
+    name: string,
+  ): FakeFirestoreCollectionReference {
+    let collection =
+      this.collections.get(name);
+
+    if (!collection) {
+      collection =
+        new Map<
+          string,
+          FakeFirestoreData
+        >();
+      this.collections.set(
+        name,
+        collection,
+      );
+    }
+
+    return new FakeFirestoreCollectionReference(
+      collection,
+      name,
+    );
+  }
+
+  async runTransaction<T>(
+    updateFunction: (
+      transaction: FakeFirestoreTransaction,
+    ) => Promise<T>,
+  ): Promise<T> {
+    for (
+      let attempt = 0;
+      attempt < 2;
+      attempt += 1
+    ) {
+      const staged =
+        cloneFakeCollections(
+          this.collections,
+        );
+      const transaction =
+        new FakeFirestoreTransaction(
+          staged,
+          new Map(this.versions),
+        );
+      const result =
+        await updateFunction(transaction);
+      const conflict =
+        this.getTransactionConflict(
+          transaction,
+        );
+
+      if (conflict) {
+        if (attempt === 0) {
+          continue;
+        }
+
+        throw new Error(conflict);
+      }
+
+      this.collections = staged;
+
+      for (const key of transaction.writeModes.keys()) {
+        this.versions.set(
+          key,
+          (this.versions.get(key) ?? 0) +
+            1,
+        );
+      }
+
+      return result;
+    }
+
+    throw new Error(
+      "Transaction failed after retry",
+    );
+  }
+
+  getStoredDocument(
+    collectionName: string,
+    documentId: string,
+  ): FakeFirestoreData | undefined {
+    const document =
+      this.collections
+        .get(collectionName)
+        ?.get(documentId);
+
+    return document
+      ? cloneFakeFirestoreData(
+          document,
+        )
+      : undefined;
+  }
+
+  private getTransactionConflict(
+    transaction: FakeFirestoreTransaction,
+  ): string | null {
+    for (const [
+      key,
+      version,
+    ] of transaction.readVersions) {
+      if (
+        (this.versions.get(key) ?? 0) !==
+        version
+      ) {
+        return `Transaction conflict: ${key}`;
+      }
+    }
+
+    for (const [
+      key,
+      mode,
+    ] of transaction.writeModes) {
+      if (
+        mode === "create" &&
+        (this.versions.get(key) ?? 0) > 0
+      ) {
+        return `Document already exists: ${key}`;
+      }
+    }
+
+    return null;
+  }
+}
+
+function cloneFakeCollections(
+  collections: Map<
+    string,
+    Map<string, FakeFirestoreData>
+  >,
+): Map<
+  string,
+  Map<string, FakeFirestoreData>
+> {
+  return new Map(
+    [...collections.entries()].map(
+      ([collectionName, documents]) => [
+        collectionName,
+        new Map(
+          [...documents.entries()].map(
+            ([documentId, data]) => [
+              documentId,
+              cloneFakeFirestoreData(
+                data,
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class FakeFirestoreTransaction {
+  readonly readVersions =
+    new Map<string, number>();
+
+  readonly writeModes =
+    new Map<
+      string,
+      "create" | "set"
+    >();
+
+  constructor(
+    private readonly collections: Map<
+      string,
+      Map<string, FakeFirestoreData>
+    >,
+    private readonly versions: Map<
+      string,
+      number
+    >,
+  ) {}
+
+  async get(
+    ref:
+      | FakeFirestoreDocumentReference
+      | FakeFirestoreCollectionReference,
+  ): Promise<
+    | FakeFirestoreDocumentSnapshot
+    | {
+        docs: FakeFirestoreDocumentSnapshot[];
+      }
+  > {
+    if (
+      ref instanceof
+      FakeFirestoreDocumentReference
+    ) {
+      const document =
+        this.collections
+          .get(ref.collectionName)
+          ?.get(ref.id);
+      this.readVersions.set(
+        this.documentKey(
+          ref.collectionName,
+          ref.id,
+        ),
+        this.versions.get(
+          this.documentKey(
+            ref.collectionName,
+            ref.id,
+          ),
+        ) ?? 0,
+      );
+
+      return new FakeFirestoreDocumentSnapshot(
+        ref.id,
+        document,
+      );
+    }
+
+    const collection =
+      this.collections.get(
+        ref.collectionName,
+      ) ?? new Map();
+
+    const docs = [...collection.entries()]
+        .filter(([, data]) =>
+          ref.filters.every(
+            (filter) =>
+              data[filter.field] ===
+              filter.value,
+          ),
+        )
+    for (const [id] of docs) {
+      this.readVersions.set(
+        this.documentKey(
+          ref.collectionName,
+          id,
+        ),
+        this.versions.get(
+          this.documentKey(
+            ref.collectionName,
+            id,
+          ),
+        ) ?? 0,
+      );
+    }
+
+    return {
+      docs: docs.map(
+        ([id, data]) =>
+          new FakeFirestoreDocumentSnapshot(
+            id,
+            data,
+          ),
+      ),
+    };
+  }
+
+  create(
+    ref: FakeFirestoreDocumentReference,
+    data: FakeFirestoreData,
+  ): void {
+    const collection =
+      this.getCollection(
+        ref.collectionName,
+      );
+
+    if (collection.has(ref.id)) {
+      throw new Error(
+        `Document already exists: ${ref.id}`,
+      );
+    }
+
+    collection.set(
+      ref.id,
+      cloneFakeFirestoreData(data),
+    );
+    this.writeModes.set(
+      this.documentKey(
+        ref.collectionName,
+        ref.id,
+      ),
+      "create",
+    );
+  }
+
+  set(
+    ref: FakeFirestoreDocumentReference,
+    data: FakeFirestoreData,
+  ): void {
+    this.getCollection(
+      ref.collectionName,
+    ).set(
+      ref.id,
+      cloneFakeFirestoreData(data),
+    );
+    this.writeModes.set(
+      this.documentKey(
+        ref.collectionName,
+        ref.id,
+      ),
+      "set",
+    );
+  }
+
+  private getCollection(
+    collectionName: string,
+  ): Map<string, FakeFirestoreData> {
+    let collection =
+      this.collections.get(
+        collectionName,
+      );
+
+    if (!collection) {
+      collection =
+        new Map<
+          string,
+          FakeFirestoreData
+        >();
+      this.collections.set(
+        collectionName,
+        collection,
+      );
+    }
+
+    return collection;
+  }
+
+  private documentKey(
+    collectionName: string,
+    documentId: string,
+  ): string {
+    return `${collectionName}/${documentId}`;
+  }
+}
+
 class FailingTransitionKnowledgeRepository extends InMemoryKnowledgeRepository {
   private transitionCount = 0;
 
@@ -228,15 +769,59 @@ class CountingProvider
 
   calls = 0;
 
+  readonly requests: GroundedQARequest[] =
+    [];
+
   constructor(
     private readonly result: GroundedQAResult,
   ) {}
 
   async answer(
+    request: GroundedQARequest,
+  ): Promise<GroundedQAResult> {
+    this.calls += 1;
+    this.requests.push(request);
+    return this.result;
+  }
+}
+
+class DeferredProvider
+  implements GroundedQAProvider
+{
+  readonly name = "deferred";
+
+  calls = 0;
+
+  private resolveResult:
+    | ((
+        result: GroundedQAResult,
+      ) => void)
+    | undefined;
+
+  readonly pending =
+    new Promise<GroundedQAResult>(
+      (resolve) => {
+        this.resolveResult = resolve;
+      },
+    );
+
+  async answer(
     _request: GroundedQARequest,
   ): Promise<GroundedQAResult> {
     this.calls += 1;
-    return this.result;
+    return this.pending;
+  }
+
+  resolve(
+    result: GroundedQAResult,
+  ): void {
+    if (!this.resolveResult) {
+      throw new Error(
+        "Deferred provider was not initialized",
+      );
+    }
+
+    this.resolveResult(result);
   }
 }
 
@@ -325,6 +910,81 @@ class TrackingVectorStoreConfigRepository
   }
 }
 
+class FakeVectorStoreCleanupClient {
+  vectorStoreFileDeleteCalls: Array<{
+    fileId: string;
+    vectorStoreId: string;
+  }> = [];
+
+  baseFileDeleteCalls: string[] = [];
+
+  constructor(
+    private readonly attachments: Array<{
+      id: string;
+      status?: string;
+      created_at?: number;
+      vector_store_id?: string;
+    }>,
+    private readonly filesById: Record<
+      string,
+      {
+        id: string;
+        filename: string;
+        created_at?: number;
+      }
+    >,
+  ) {}
+
+  readonly files = {
+    retrieve: async (fileId: string) =>
+      this.filesById[fileId] ?? {
+        id: fileId,
+        filename: "",
+      },
+    delete: async (fileId: string) => {
+      this.baseFileDeleteCalls.push(
+        fileId,
+      );
+      return {
+        id: fileId,
+        deleted: true,
+      };
+    },
+  };
+
+  readonly vectorStores = {
+    files: {
+      list: async (
+        _vectorStoreId: string,
+      ) => ({
+        data:
+          this.attachments.map(
+            (attachment) => ({
+              ...attachment,
+            }),
+          ),
+      }),
+      delete: async (
+        fileId: string,
+        params: {
+          vector_store_id: string;
+        },
+      ) => {
+        this.vectorStoreFileDeleteCalls
+          .push({
+            fileId,
+            vectorStoreId:
+              params.vector_store_id,
+          });
+        return {
+          id: fileId,
+          deleted: true,
+        };
+      },
+    },
+  };
+}
+
 function createApprovedPublicKnowledgeDocument(
   overrides: Partial<KnowledgeDocument> = {},
 ): KnowledgeDocument {
@@ -382,6 +1042,48 @@ function createTestService(
     service,
     conversationRepository,
     handoffRepository,
+    provider,
+  };
+}
+
+function createAtomicTestService(
+  provider:
+    | CountingProvider
+    | DeferredProvider,
+) {
+  const db =
+    new FakeFirestore();
+  const conversationRepository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+  const handoffRepository =
+    new FirestoreAIPlatformHandoffRepository(
+      db,
+    );
+  const conversationWorkflowRepository =
+    new FirestoreAIPlatformConversationWorkflowRepository(
+      db,
+    );
+  const service =
+    new ConversationService({
+      conversationRepository,
+      handoffRepository,
+      conversationWorkflowRepository,
+      answerService:
+        new AnswerService(provider),
+      idGenerator:
+        new TestIdGenerator(),
+      now: () =>
+        `2027-01-01T00:00:${String(provider.calls).padStart(2, "0")}.000Z`,
+    });
+
+  return {
+    db,
+    service,
+    conversationRepository,
+    handoffRepository,
+    conversationWorkflowRepository,
     provider,
   };
 }
@@ -663,6 +1365,116 @@ async function createKnowledgeUnpublishTestEnvironment(input: {
     knowledgeRepository,
     publicationRepository,
     publisher,
+  };
+}
+
+async function createVectorStoreCleanupTestEnvironment(input: {
+  referencedFileId?: string;
+  referencedPublicationStatus?:
+    | "published"
+    | "unpublished";
+} = {}) {
+  const vectorStoreConfigRepository =
+    new InMemoryOpenAIVectorStoreConfigRepository();
+  const publicationRepository =
+    new InMemoryKnowledgePublicationRepository();
+  const vectorStoreId =
+    "vs-public-development";
+  const canonicalFileId =
+    "file-NG32bTBK6jEH7Sgd4bL4zk";
+  const orphanFileId =
+    "file-Qt36UTLZREr7L5f7sMSiyg";
+  const referencedFileId =
+    input.referencedFileId ??
+    canonicalFileId;
+
+  await vectorStoreConfigRepository
+    .saveVectorStoreConfig({
+      audience: "public",
+      environment:
+        "development",
+      vectorStoreId,
+      name:
+        "ISE Public Knowledge - Development",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  await publicationRepository
+    .createPublication({
+      id:
+        "openai-publication-canonical",
+      documentId:
+        "knowledge-sharepoint-83",
+      targetProvider: "openai",
+      targetEnvironment:
+        "development",
+      publicationStatus:
+        input.referencedPublicationStatus ??
+        "published",
+      externalResourceId:
+        referencedFileId,
+      contentHash:
+        "canonical-hash",
+      publishedAt:
+        "2027-01-01T00:00:00.000Z",
+      providerMetadata: {
+        provider: "openai",
+        vectorStoreId,
+        fileId:
+          referencedFileId,
+      },
+    });
+
+  const client =
+    new FakeVectorStoreCleanupClient(
+      [
+        {
+          id: canonicalFileId,
+          status:
+            "completed",
+          created_at:
+            1800000000,
+          vector_store_id:
+            vectorStoreId,
+        },
+        {
+          id: orphanFileId,
+          status:
+            "completed",
+          created_at:
+            1800000100,
+          vector_store_id:
+            vectorStoreId,
+        },
+      ],
+      {
+        [canonicalFileId]: {
+          id: canonicalFileId,
+          filename:
+            "ISE_Admission_AY2027_Public_Clean_RAG_Master_v2.docx",
+          created_at:
+            1800000000,
+        },
+        [orphanFileId]: {
+          id: orphanFileId,
+          filename:
+            "ISE_Admission_AY2027_Public_Clean_RAG_Master_v2.docx",
+          created_at:
+            1800000100,
+        },
+      },
+    );
+
+  return {
+    vectorStoreId,
+    canonicalFileId,
+    orphanFileId,
+    vectorStoreConfigRepository,
+    publicationRepository,
+    client,
   };
 }
 
@@ -1969,6 +2781,173 @@ async function testKnowledgeUnpublishAdmin() {
           },
         ),
       /Knowledge document not found: missing-document/,
+    );
+  }
+}
+
+async function testVectorStoreOrphanCleanupAdmin() {
+  {
+    const environment =
+      await createVectorStoreCleanupTestEnvironment();
+
+    const report =
+      await runVectorStoreOrphanCleanup(
+        environment,
+        {
+          list: true,
+        },
+      );
+
+    assert.equal(
+      report.mode,
+      "list",
+    );
+    assert.equal(
+      report.vectorStoreId,
+      environment.vectorStoreId,
+    );
+    assert.equal(
+      report.files?.length,
+      2,
+    );
+    assert.equal(
+      report.files?.[0].filename,
+      "ISE_Admission_AY2027_Public_Clean_RAG_Master_v2.docx",
+    );
+    assert.equal(
+      environment.client
+        .vectorStoreFileDeleteCalls
+        .length,
+      0,
+    );
+  }
+
+  {
+    const environment =
+      await createVectorStoreCleanupTestEnvironment();
+
+    const report =
+      await runVectorStoreOrphanCleanup(
+        environment,
+        {
+          fileId:
+            environment.orphanFileId,
+        },
+      );
+
+    assert.equal(
+      report.mode,
+      "inspect",
+    );
+    assert.equal(
+      report.dryRun,
+      true,
+    );
+    assert.equal(
+      report.file?.fileId,
+      environment.orphanFileId,
+    );
+    assert.deepEqual(
+      report.publicationReferences,
+      [],
+    );
+    assert.equal(
+      environment.client
+        .vectorStoreFileDeleteCalls
+        .length,
+      0,
+    );
+  }
+
+  {
+    const environment =
+      await createVectorStoreCleanupTestEnvironment();
+
+    await assert.rejects(
+      () =>
+        runVectorStoreOrphanCleanup(
+          environment,
+          {
+            fileId:
+              environment.canonicalFileId,
+            execute: true,
+          },
+        ),
+      /protected canonical Admission file/,
+    );
+    assert.equal(
+      environment.client
+        .vectorStoreFileDeleteCalls
+        .length,
+      0,
+    );
+  }
+
+  {
+    const environment =
+      await createVectorStoreCleanupTestEnvironment({
+        referencedFileId:
+          "file-Qt36UTLZREr7L5f7sMSiyg",
+      });
+
+    await assert.rejects(
+      () =>
+        runVectorStoreOrphanCleanup(
+          environment,
+          {
+            fileId:
+              environment.orphanFileId,
+            execute: true,
+          },
+        ),
+      /referenced by Firestore publication/,
+    );
+    assert.equal(
+      environment.client
+        .vectorStoreFileDeleteCalls
+        .length,
+      0,
+    );
+  }
+
+  {
+    const environment =
+      await createVectorStoreCleanupTestEnvironment();
+
+    const report =
+      await runVectorStoreOrphanCleanup(
+        environment,
+        {
+          fileId:
+            environment.orphanFileId,
+          execute: true,
+        },
+      );
+
+    assert.equal(
+      report.mode,
+      "detach",
+    );
+    assert.equal(
+      report.executed,
+      true,
+    );
+    assert.deepEqual(
+      environment.client
+        .vectorStoreFileDeleteCalls,
+      [
+        {
+          fileId:
+            environment.orphanFileId,
+          vectorStoreId:
+            environment.vectorStoreId,
+        },
+      ],
+    );
+    assert.deepEqual(
+      environment.client
+        .baseFileDeleteCalls,
+      [],
     );
   }
 }
@@ -3648,6 +4627,1580 @@ async function testInMemoryRepositories() {
   );
 }
 
+async function testFirestoreConversationRepository() {
+  const db =
+    new FakeFirestore();
+  const repository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+
+  const conversation =
+    await repository.createConversation({
+      id: "conversation-firestore-1",
+      channel: "web",
+      channelAudience: "external",
+      channelUserId: "user-1",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+      metadata: {
+        keepNull: null,
+        nested: {
+          missing:
+            undefined,
+          value: "kept",
+        },
+      },
+    });
+
+  assert.equal(
+    conversation.id,
+    "conversation-firestore-1",
+  );
+  assert.equal(
+    (
+      await repository.getConversation(
+        "conversation-firestore-1",
+      )
+    )?.mode,
+    "ai_active",
+  );
+  assert.deepEqual(
+    db.getStoredDocument(
+      "ai_platform_conversations",
+      "conversation-firestore-1",
+    )?.metadata,
+    {
+      keepNull: null,
+      nested: {
+        value: "kept",
+      },
+    },
+  );
+
+  await assert.rejects(
+    () =>
+      repository.createConversation({
+        id: "conversation-firestore-1",
+        channel: "web",
+        channelAudience:
+          "external",
+        channelUserId: "user-1",
+        mode: "ai_active",
+        createdAt:
+          "2027-01-01T00:00:00.000Z",
+        updatedAt:
+          "2027-01-01T00:00:00.000Z",
+      }),
+    /already exists/,
+  );
+
+  await repository.updateConversation({
+    id: "conversation-firestore-1",
+    mode: "waiting_human",
+    assignedAgentId:
+      "agent-1",
+    updatedAt:
+      "2027-01-01T00:00:01.000Z",
+    lastMessageAt:
+      "2027-01-01T00:00:01.000Z",
+  });
+
+  assert.equal(
+    (
+      await repository.getConversation(
+        "conversation-firestore-1",
+      )
+    )?.assignedAgentId,
+    "agent-1",
+  );
+
+  await repository.updateConversation({
+    id: "conversation-firestore-1",
+    clearAssignedAgentId: true,
+    updatedAt:
+      "2027-01-01T00:00:02.000Z",
+  });
+
+  const storedAfterClear =
+    db.getStoredDocument(
+      "ai_platform_conversations",
+      "conversation-firestore-1",
+    );
+
+  assert.equal(
+    hasOwn(
+      storedAfterClear ?? {},
+      "assignedAgentId",
+    ),
+    false,
+  );
+
+  await assert.rejects(
+    () =>
+      repository.updateConversation({
+        id: "conversation-missing",
+        updatedAt:
+          "2027-01-01T00:00:00.000Z",
+      }),
+    /Conversation not found/,
+  );
+
+  await repository.createConversation({
+    id: "conversation-firestore-2",
+    channel: "line",
+    channelAudience: "external",
+    channelUserId: "user-2",
+    mode: "ai_active",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+    updatedAt:
+      "2027-01-01T00:00:03.000Z",
+  });
+  await repository.createConversation({
+    id: "conversation-firestore-3",
+    channel: "web",
+    channelAudience: "external",
+    channelUserId: "user-3",
+    mode: "waiting_human",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+    updatedAt:
+      "2027-01-01T00:00:04.000Z",
+  });
+  await repository.updateConversation({
+    id: "conversation-firestore-3",
+    assignedAgentId:
+      "agent-2",
+    updatedAt:
+      "2027-01-01T00:00:04.000Z",
+    lastMessageAt:
+      "2027-01-01T00:00:05.000Z",
+  });
+
+  assert.deepEqual(
+    (
+      await repository.listConversations({
+        channel: "web",
+      })
+    ).map(
+      (item) => item.id,
+    ),
+    [
+      "conversation-firestore-3",
+      "conversation-firestore-1",
+    ],
+  );
+  assert.deepEqual(
+    (
+      await repository.listConversations({
+        assignedAgentId:
+          "agent-2",
+      })
+    ).map(
+      (item) => item.id,
+    ),
+    [
+      "conversation-firestore-3",
+    ],
+  );
+  assert.deepEqual(
+    (
+      await repository.listConversations({
+        mode: "ai_active",
+      })
+    ).map(
+      (item) => item.id,
+    ),
+    [
+      "conversation-firestore-2",
+    ],
+  );
+
+  await repository.appendMessage({
+    id: "message-2",
+    conversationId:
+      "conversation-firestore-1",
+    senderType: "user",
+    text: "second",
+    createdAt:
+      "2027-01-01T00:00:02.000Z",
+  });
+  await repository.appendMessage({
+    id: "message-1",
+    conversationId:
+      "conversation-firestore-1",
+    senderType: "user",
+    text: "first",
+    createdAt:
+      "2027-01-01T00:00:01.000Z",
+    metadata: {
+      keepFalse: false,
+      missing: undefined,
+    },
+  });
+  await repository.appendMessage({
+    id: "message-3",
+    conversationId:
+      "conversation-firestore-2",
+    senderType: "user",
+    text: "other conversation",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+  });
+
+  assert.deepEqual(
+    (
+      await repository.listMessages(
+        "conversation-firestore-1",
+      )
+    ).map((message) => message.id),
+    [
+      "message-1",
+      "message-2",
+    ],
+  );
+  assert.deepEqual(
+    db.getStoredDocument(
+      "ai_platform_conversation_messages",
+      "message-1",
+    )?.metadata,
+    {
+      keepFalse: false,
+    },
+  );
+  await assert.rejects(
+    () =>
+      repository.appendMessage({
+        id: "message-1",
+        conversationId:
+          "conversation-firestore-1",
+        senderType: "user",
+        text: "duplicate",
+        createdAt:
+          "2027-01-01T00:00:03.000Z",
+      }),
+    /already exists/,
+  );
+}
+
+async function testFirestoreHandoffRepository() {
+  const db =
+    new FakeFirestore();
+  const repository =
+    new FirestoreAIPlatformHandoffRepository(
+      db,
+    );
+
+  await repository.createHandoff({
+    id: "handoff-resolved",
+    conversationId:
+      "conversation-1",
+    reason:
+      "knowledge_not_found",
+    status: "resolved",
+    requestedAt:
+      "2027-01-01T00:00:00.000Z",
+    requestedBy: "ai",
+  });
+
+  assert.equal(
+    await repository.getActiveHandoff(
+      "conversation-1",
+    ),
+    null,
+  );
+
+  const waiting =
+    await repository.createHandoff({
+      id: "handoff-waiting",
+      conversationId:
+        "conversation-1",
+      reason:
+        "user_requested_human",
+      status: "waiting",
+      requestedAt:
+        "2027-01-01T00:00:02.000Z",
+      requestedBy: "user",
+      metadata: {
+        keepZero: 0,
+        nested: {
+          missing:
+            undefined,
+          value: "kept",
+        },
+      },
+    });
+
+  assert.equal(
+    waiting.status,
+    "waiting",
+  );
+  assert.equal(
+    (
+      await repository.getActiveHandoff(
+        "conversation-1",
+      )
+    )?.id,
+    "handoff-waiting",
+  );
+  assert.deepEqual(
+    db.getStoredDocument(
+      "ai_platform_handoffs",
+      "handoff-waiting",
+    )?.metadata,
+    {
+      keepZero: 0,
+      nested: {
+        value: "kept",
+      },
+    },
+  );
+
+  const active =
+    await repository.updateHandoff({
+      id: "handoff-waiting",
+      status: "active",
+      assignedAgentId:
+        "agent-1",
+      takenAt:
+        "2027-01-01T00:00:03.000Z",
+    });
+
+  assert.equal(
+    active.status,
+    "active",
+  );
+  assert.equal(
+    active.assignedAgentId,
+    "agent-1",
+  );
+
+  await repository.updateHandoff({
+    id: "handoff-waiting",
+    clearAssignedAgentId: true,
+    status: "waiting",
+  });
+  assert.equal(
+    hasOwn(
+      db.getStoredDocument(
+        "ai_platform_handoffs",
+        "handoff-waiting",
+      ) ?? {},
+      "assignedAgentId",
+    ),
+    false,
+  );
+
+  await repository.updateHandoff({
+    id: "handoff-waiting",
+    status: "resolved",
+    resolvedAt:
+      "2027-01-01T00:00:04.000Z",
+    resolutionNote:
+      "handled",
+  });
+  assert.equal(
+    await repository.getActiveHandoff(
+      "conversation-1",
+    ),
+    null,
+  );
+
+  await repository.createHandoff({
+    id: "handoff-later",
+    conversationId:
+      "conversation-2",
+    reason: "other",
+    status: "waiting",
+    requestedAt:
+      "2027-01-01T00:00:06.000Z",
+    requestedBy: "staff",
+  });
+  await repository.createHandoff({
+    id: "handoff-earlier",
+    conversationId:
+      "conversation-3",
+    reason: "other",
+    status: "waiting",
+    requestedAt:
+      "2027-01-01T00:00:05.000Z",
+    requestedBy: "staff",
+  });
+
+  assert.deepEqual(
+    (
+      await repository.listWaitingHandoffs({
+        limit: 1,
+      })
+    ).map((handoff) => handoff.id),
+    [
+      "handoff-earlier",
+    ],
+  );
+
+  await assert.rejects(
+    () =>
+      repository.updateHandoff({
+        id: "handoff-missing",
+        status: "active",
+      }),
+    /Handoff not found/,
+  );
+  await assert.rejects(
+    () =>
+      repository.createHandoff({
+        id: "handoff-later",
+        conversationId:
+          "conversation-2",
+        reason: "other",
+        status: "waiting",
+        requestedAt:
+          "2027-01-01T00:00:06.000Z",
+        requestedBy: "staff",
+      }),
+    /already exists/,
+  );
+}
+
+async function testProductionSafeConversationIds() {
+  const idGenerator =
+    new RandomUuidIdGenerator();
+  const conversationId =
+    idGenerator.nextId(
+      "conversation",
+    );
+  const messageId =
+    idGenerator.nextId("message");
+  const handoffId =
+    idGenerator.nextId("handoff");
+
+  assert.match(
+    conversationId,
+    /^conversation-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  );
+  assert.match(
+    messageId,
+    /^message-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  );
+  assert.match(
+    handoffId,
+    /^handoff-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  );
+  assert.notEqual(
+    idGenerator.nextId(
+      "conversation",
+    ),
+    idGenerator.nextId(
+      "conversation",
+    ),
+  );
+
+  const service =
+    new ConversationService({
+      conversationRepository:
+        new InMemoryConversationRepository(),
+      handoffRepository:
+        new InMemoryHandoffRepository(),
+      answerService:
+        new AnswerService(
+          new CountingProvider({
+            answerable: true,
+            answer: "ok",
+            citations: [
+              {
+                documentId: "doc-1",
+              },
+            ],
+            provider: "counting",
+          }),
+        ),
+      now: () =>
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  const first =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const second =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-2",
+    });
+
+  assert.match(
+    first.id,
+    /^conversation-[0-9a-f-]{36}$/i,
+  );
+  assert.notEqual(first.id, second.id);
+  assert.notEqual(
+    first.id,
+    "conversation-000001",
+  );
+}
+
+async function testAtomicHandoffRequestWorkflow() {
+  const db =
+    new FakeFirestore();
+  const conversationRepository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+  const handoffRepository =
+    new FirestoreAIPlatformHandoffRepository(
+      db,
+    );
+  const workflow =
+    new FirestoreAIPlatformConversationWorkflowRepository(
+      db,
+    );
+
+  await conversationRepository
+    .createConversation({
+      id: "conversation-atomic-1",
+      channel: "web",
+      channelAudience: "external",
+      channelUserId: "user-1",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  const first =
+    await workflow.requestHumanHandoff({
+      conversationId:
+        "conversation-atomic-1",
+      updatedAt:
+        "2027-01-01T00:00:01.000Z",
+      handoff: {
+        id: "handoff-atomic-1",
+        conversationId:
+          "conversation-atomic-1",
+        reason:
+          "knowledge_not_found",
+        status: "waiting",
+        requestedAt:
+          "2027-01-01T00:00:01.000Z",
+        requestedBy: "ai",
+      },
+      systemMessage: {
+        id: "message-system-1",
+        conversationId:
+          "conversation-atomic-1",
+        senderType: "system",
+        text:
+          "Human handoff requested.",
+        createdAt:
+          "2027-01-01T00:00:01.000Z",
+      },
+    });
+
+  assert.equal(first.created, true);
+  assert.equal(
+    first.conversation.mode,
+    "waiting_human",
+  );
+  assert.equal(
+    first.handoff.status,
+    "waiting",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(
+          "conversation-atomic-1",
+        )
+    ).length,
+    1,
+  );
+
+  const second =
+    await workflow.requestHumanHandoff({
+      conversationId:
+        "conversation-atomic-1",
+      updatedAt:
+        "2027-01-01T00:00:02.000Z",
+      handoff: {
+        id: "handoff-atomic-2",
+        conversationId:
+          "conversation-atomic-1",
+        reason:
+          "user_requested_human",
+        status: "waiting",
+        requestedAt:
+          "2027-01-01T00:00:02.000Z",
+        requestedBy: "user",
+      },
+      systemMessage: {
+        id: "message-system-2",
+        conversationId:
+          "conversation-atomic-1",
+        senderType: "system",
+        text:
+          "Human handoff requested.",
+        createdAt:
+          "2027-01-01T00:00:02.000Z",
+      },
+    });
+
+  assert.equal(second.created, false);
+  assert.equal(
+    second.handoff.id,
+    "handoff-atomic-1",
+  );
+  assert.equal(
+    (
+      await handoffRepository
+        .listWaitingHandoffs()
+    ).length,
+    1,
+  );
+}
+
+async function testAtomicHandoffRequestHasNoPartialStateOnFailure() {
+  const db =
+    new FakeFirestore();
+  const conversationRepository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+  const handoffRepository =
+    new FirestoreAIPlatformHandoffRepository(
+      db,
+    );
+  const workflow =
+    new FirestoreAIPlatformConversationWorkflowRepository(
+      db,
+    );
+
+  await conversationRepository
+    .createConversation({
+      id: "conversation-no-partial",
+      channel: "web",
+      channelAudience: "external",
+      channelUserId: "user-1",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  await conversationRepository
+    .appendMessage({
+      id: "message-duplicate",
+      conversationId:
+        "conversation-no-partial",
+      senderType: "system",
+      text: "existing",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  await assert.rejects(
+    () =>
+      workflow.requestHumanHandoff({
+        conversationId:
+          "conversation-no-partial",
+        updatedAt:
+          "2027-01-01T00:00:01.000Z",
+        handoff: {
+          id: "handoff-no-partial",
+          conversationId:
+            "conversation-no-partial",
+          reason:
+            "knowledge_not_found",
+          status: "waiting",
+          requestedAt:
+            "2027-01-01T00:00:01.000Z",
+          requestedBy: "ai",
+        },
+        systemMessage: {
+          id: "message-duplicate",
+          conversationId:
+            "conversation-no-partial",
+          senderType: "system",
+          text:
+            "Human handoff requested.",
+          createdAt:
+            "2027-01-01T00:00:01.000Z",
+        },
+      }),
+    /already exists/,
+  );
+
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "conversation-no-partial",
+        )
+    )?.mode,
+    "ai_active",
+  );
+  assert.equal(
+    await handoffRepository.getActiveHandoff(
+      "conversation-no-partial",
+    ),
+    null,
+  );
+}
+
+async function testAtomicCompetingTakeoverWorkflow() {
+  const provider =
+    new CountingProvider({
+      answerable: true,
+      answer: "ok",
+      citations: [
+        {
+          documentId: "doc-1",
+        },
+      ],
+      provider: "counting",
+    });
+  const {
+    service,
+    handoffRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+
+  const results =
+    await Promise.allSettled([
+      service.takeOverConversation({
+        conversationId:
+          conversation.id,
+        agentId: "agent-A",
+      }),
+      service.takeOverConversation({
+        conversationId:
+          conversation.id,
+        agentId: "agent-B",
+      }),
+    ]);
+  const fulfilled =
+    results.filter(
+      (
+        result,
+      ): result is PromiseFulfilledResult<ConversationServiceResult> =>
+        result.status ===
+        "fulfilled",
+    );
+  const rejected =
+    results.filter(
+      (result) =>
+        result.status === "rejected",
+    );
+
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(
+    rejected[0].reason instanceof
+      ConversationConflictError,
+    true,
+  );
+
+  const winningAgent =
+    fulfilled[0].value.conversation
+      .assignedAgentId;
+  const activeHandoff =
+    await handoffRepository
+      .getActiveHandoff(
+        conversation.id,
+      );
+
+  assert.equal(
+    fulfilled[0].value.conversation
+      .mode,
+    "human_active",
+  );
+  assert.equal(
+    activeHandoff?.assignedAgentId,
+    winningAgent,
+  );
+  assert.equal(
+    activeHandoff?.status,
+    "active",
+  );
+}
+
+async function testAtomicResolveAndReturnWorkflow() {
+  const provider =
+    new CountingProvider({
+      answerable: true,
+      answer: "ok",
+      citations: [
+        {
+          documentId: "doc-1",
+        },
+      ],
+      provider: "counting",
+    });
+
+  {
+    const {
+      db,
+      service,
+      conversationRepository,
+      handoffRepository,
+    } = createAtomicTestService(provider);
+    const conversation =
+      await service.createConversation({
+        channel: "web",
+        channelUserId:
+          "waiting-user",
+      });
+
+    await service.requestHumanHandoff({
+      conversationId:
+        conversation.id,
+      requestedBy: "ai",
+      reason:
+        "knowledge_not_found",
+    });
+
+    const resolved =
+      await service.resolveConversation({
+        conversationId:
+          conversation.id,
+        resolvedBy: "agent-1",
+        resolutionNote:
+          "resolved while waiting",
+      });
+
+    assert.equal(
+      resolved.conversation.mode,
+      "resolved",
+    );
+    assert.equal(
+      resolved.conversation
+        .assignedAgentId,
+      undefined,
+    );
+    assert.equal(
+      resolved.handoff?.status,
+      "resolved",
+    );
+    assert.equal(
+      await handoffRepository
+        .getActiveHandoff(
+          conversation.id,
+        ),
+      null,
+    );
+
+    const returned =
+      await service.returnConversationToAI({
+        conversationId:
+          conversation.id,
+      });
+
+    assert.equal(
+      returned.conversation.mode,
+      "ai_active",
+    );
+    assert.equal(
+      returned.conversation
+        .assignedAgentId,
+      undefined,
+    );
+    assert.equal(
+      await handoffRepository
+        .getActiveHandoff(
+          conversation.id,
+        ),
+      null,
+    );
+    assert.equal(
+      db.getStoredDocument(
+        "ai_platform_handoffs",
+        resolved.handoff?.id ?? "",
+      )?.status,
+      "resolved",
+    );
+    assert.equal(
+      (
+        await conversationRepository
+          .getConversation(
+            conversation.id,
+          )
+      )?.mode,
+      "ai_active",
+    );
+  }
+
+  {
+    const {
+      service,
+    } = createAtomicTestService(provider);
+    const conversation =
+      await service.createConversation({
+        channel: "web",
+        channelUserId:
+          "active-user",
+      });
+
+    await service.requestHumanHandoff({
+      conversationId:
+        conversation.id,
+      requestedBy: "user",
+      reason:
+        "user_requested_human",
+    });
+    await service.takeOverConversation({
+      conversationId:
+        conversation.id,
+      agentId: "agent-1",
+    });
+
+    const resolved =
+      await service.resolveConversation({
+        conversationId:
+          conversation.id,
+      });
+
+    assert.equal(
+      resolved.conversation.mode,
+      "resolved",
+    );
+    assert.equal(
+      resolved.handoff?.status,
+      "resolved",
+    );
+  }
+}
+
+async function testAtomicResolveDetectsMissingActiveHandoff() {
+  const db =
+    new FakeFirestore();
+  const conversationRepository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+  const workflow =
+    new FirestoreAIPlatformConversationWorkflowRepository(
+      db,
+    );
+
+  await conversationRepository
+    .createConversation({
+      id: "conversation-invariant",
+      channel: "web",
+      channelAudience: "external",
+      channelUserId: "user-1",
+      mode: "waiting_human",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  await assert.rejects(
+    () =>
+      workflow.resolveConversation({
+        conversationId:
+          "conversation-invariant",
+        resolvedAt:
+          "2027-01-01T00:00:01.000Z",
+      }),
+    ConversationInvariantError,
+  );
+}
+
+async function testLateAiReplyIsDiscarded() {
+  const provider =
+    new DeferredProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const pending =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "question",
+    });
+
+  for (
+    let attempt = 0;
+    attempt < 10 && provider.calls === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 0),
+    );
+  }
+  assert.equal(provider.calls, 1);
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+
+  provider.resolve({
+    answerable: true,
+    answer:
+      "late answer should be discarded",
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "deferred",
+  });
+
+  const result =
+    await pending;
+
+  assert.equal(
+    result.outboundMessage,
+    undefined,
+  );
+  assert.equal(
+    result.conversation.mode,
+    "waiting_human",
+  );
+  assert.deepEqual(
+    (
+      await service.listMessages(
+        conversation.id,
+      )
+    ).map((message) => message.text),
+    [
+      "question",
+      "Human handoff requested.",
+    ],
+  );
+}
+
+async function testAtomicHumanReplyOwnershipRace() {
+  const provider =
+    new CountingProvider({
+      answerable: true,
+      answer: "ok",
+      citations: [
+        {
+          documentId: "doc-1",
+        },
+      ],
+      provider: "counting",
+    });
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.takeOverConversation({
+    conversationId:
+      conversation.id,
+    agentId: "agent-1",
+  });
+
+  await assert.rejects(
+    () =>
+      service.sendHumanReply({
+        conversationId:
+          conversation.id,
+        agentId: "agent-2",
+        text: "wrong agent",
+      }),
+    ConversationConflictError,
+  );
+
+  await service.resolveConversation({
+    conversationId:
+      conversation.id,
+  });
+
+  await assert.rejects(
+    () =>
+      service.sendHumanReply({
+        conversationId:
+          conversation.id,
+        agentId: "agent-1",
+        text: "stale agent",
+      }),
+    ConversationConflictError,
+  );
+
+  assert.deepEqual(
+    (
+      await service.listMessages(
+        conversation.id,
+      )
+    ).filter(
+      (message) =>
+        message.senderType === "human",
+    ),
+    [],
+  );
+}
+
+async function testProductionConversationCompositionSource() {
+  const source =
+    await readFile(
+      path.join(
+        process.cwd(),
+        "src",
+        "core",
+        "ai-platform",
+        "conversations",
+        "production-conversation-environment.ts",
+      ),
+      "utf8",
+    );
+
+  assert.equal(
+    source.includes(
+      "FirestoreAIPlatformConversationRepository",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "FirestoreAIPlatformHandoffRepository",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "FirestoreAIPlatformConversationWorkflowRepository",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "new OpenAIGroundedQAProvider({",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "FirestoreOpenAIVectorStoreConfigRepository",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "conversationWorkflowRepository,",
+    ),
+    true,
+  );
+}
+
+async function testConversationExperimentRoutesUseProductionComposition() {
+  const routePaths = [
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "messages",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "handoff",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "takeover",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "human-reply",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "resolve",
+      "route.ts",
+    ],
+    [
+      "src",
+      "app",
+      "api",
+      "admin",
+      "experiments",
+      "conversations",
+      "[id]",
+      "return-to-ai",
+      "route.ts",
+    ],
+  ];
+
+  for (const routePath of routePaths) {
+    const source =
+      await readFile(
+        path.join(
+          process.cwd(),
+          ...routePath,
+        ),
+        "utf8",
+      );
+
+    assert.equal(
+      source.includes(
+        "createProductionConversationEnvironment",
+      ),
+      true,
+      routePath.join("/"),
+    );
+    assert.equal(
+      source.includes(
+        "createMockConversationService",
+      ),
+      false,
+      routePath.join("/"),
+    );
+  }
+
+  const messagesSource =
+    await readFile(
+      path.join(
+        process.cwd(),
+        "src",
+        "app",
+        "api",
+        "admin",
+        "experiments",
+        "conversations",
+        "[id]",
+        "messages",
+        "route.ts",
+      ),
+      "utf8",
+    );
+
+  assert.equal(
+    messagesSource.includes("scenario"),
+    false,
+  );
+}
+
+async function testConversationRouteErrorMappingSource() {
+  const source =
+    await readFile(
+      path.join(
+        process.cwd(),
+        "src",
+        "app",
+        "api",
+        "admin",
+        "experiments",
+        "conversations",
+        "route-utils.ts",
+      ),
+      "utf8",
+    );
+
+  assert.equal(
+    source.includes(
+      "ConversationConflictError",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes("status: 409"),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "ConversationInvariantError",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes("status: 500"),
+    true,
+  );
+  assert.equal(
+    source.includes("status: 404"),
+    true,
+  );
+  assert.equal(
+    source.includes("status: 401"),
+    true,
+  );
+}
+
+async function testMultiTurnContextIncludesPreviousTurnsOnly() {
+  const provider =
+    new CountingProvider({
+      answerable: true,
+      answer:
+        "grounded answer",
+      citations: [
+        {
+          documentId: "doc-1",
+        },
+      ],
+      provider: "counting",
+    });
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "first question",
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "second question",
+  });
+
+  assert.deepEqual(
+    provider.requests[0]
+      .conversationContext,
+    [],
+  );
+  assert.deepEqual(
+    provider.requests[1]
+      .conversationContext,
+    [
+      {
+        role: "user",
+        text: "first question",
+      },
+      {
+        role: "assistant",
+        text: "grounded answer",
+      },
+    ],
+  );
+  assert.equal(
+    provider.requests[1]
+      .conversationContext?.some(
+        (message) =>
+          message.text ===
+          "second question",
+      ),
+    false,
+  );
+}
+
+async function testConversationContextExcludesSystemAndMapsHumanReplies() {
+  const provider =
+    new CountingProvider({
+      answerable: true,
+      answer:
+        "grounded answer",
+      citations: [
+        {
+          documentId: "doc-1",
+        },
+      ],
+      provider: "counting",
+    });
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.takeOverConversation({
+    conversationId:
+      conversation.id,
+    agentId: "agent-1",
+  });
+  await service.sendHumanReply({
+    conversationId:
+      conversation.id,
+    agentId: "agent-1",
+    text: "human answer",
+  });
+  await service.resolveConversation({
+    conversationId:
+      conversation.id,
+  });
+  await service.returnConversationToAI({
+    conversationId:
+      conversation.id,
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "follow-up question",
+  });
+
+  assert.deepEqual(
+    provider.requests[0]
+      .conversationContext,
+    [
+      {
+        role: "assistant",
+        text: "human answer",
+      },
+    ],
+  );
+}
+
+async function testConversationContextIsBoundedToTenMessages() {
+  const provider =
+    new CountingProvider({
+      answerable: true,
+      answer:
+        "grounded answer",
+      citations: [
+        {
+          documentId: "doc-1",
+        },
+      ],
+      provider: "counting",
+    });
+  const {
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  for (let index = 1; index <= 12; index += 1) {
+    await conversationRepository
+      .appendMessage({
+        id: `seed-message-${String(index).padStart(2, "0")}`,
+        conversationId:
+          conversation.id,
+        senderType:
+          index % 2 === 0
+            ? "ai"
+            : "user",
+        text: `seed ${index}`,
+        createdAt:
+          `2027-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      });
+  }
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "current question",
+  });
+
+  assert.deepEqual(
+    provider.requests[0]
+      .conversationContext?.map(
+        (message) => message.text,
+      ),
+    [
+      "seed 3",
+      "seed 4",
+      "seed 5",
+      "seed 6",
+      "seed 7",
+      "seed 8",
+      "seed 9",
+      "seed 10",
+      "seed 11",
+      "seed 12",
+    ],
+  );
+}
+
 async function testConversationServiceGroundedAnswer() {
   const provider =
     new CountingProvider({
@@ -4502,6 +7055,7 @@ async function main() {
   await testOpenAIPublisherPolicyAndIdempotency();
   await testOpenAIPublisherVectorStoreReuse();
   await testKnowledgeUnpublishAdmin();
+  await testVectorStoreOrphanCleanupAdmin();
   await testProductionSafeGovernanceIds();
   await testGovernanceTransitionIsAtomicWhenAuditFails();
   await testSharePointDeterministicPartialStateRecovery();
@@ -4515,6 +7069,22 @@ async function main() {
   testAudiencePolicy();
   testConversationTransitions();
   await testInMemoryRepositories();
+  await testFirestoreConversationRepository();
+  await testFirestoreHandoffRepository();
+  await testProductionSafeConversationIds();
+  await testAtomicHandoffRequestWorkflow();
+  await testAtomicHandoffRequestHasNoPartialStateOnFailure();
+  await testAtomicCompetingTakeoverWorkflow();
+  await testAtomicResolveAndReturnWorkflow();
+  await testAtomicResolveDetectsMissingActiveHandoff();
+  await testLateAiReplyIsDiscarded();
+  await testAtomicHumanReplyOwnershipRace();
+  await testProductionConversationCompositionSource();
+  await testConversationExperimentRoutesUseProductionComposition();
+  await testConversationRouteErrorMappingSource();
+  await testMultiTurnContextIncludesPreviousTurnsOnly();
+  await testConversationContextExcludesSystemAndMapsHumanReplies();
+  await testConversationContextIsBoundedToTenMessages();
   await testConversationServiceGroundedAnswer();
   await testConversationServiceUnsupportedHandoff();
   await testConversationServiceMissingCitationHandoff();

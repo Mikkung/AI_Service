@@ -1,12 +1,13 @@
 import { z } from "zod";
 
 import {
-  createMockConversationService,
-} from "@/core/ai-platform/providers/mock/mock-conversation-environment";
+  createProductionConversationEnvironment,
+} from "@/core/ai-platform/conversations/production-conversation-environment";
 
 import {
-  hasValidApiKey,
-} from "@/lib/http/api-key";
+  conversationRouteError,
+  requireConversationExperimentApiKey,
+} from "../../route-utils";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -48,16 +49,13 @@ export async function POST(
     }>;
   },
 ) {
-  if (!hasValidApiKey(request)) {
-    return Response.json(
-      {
-        ok: false,
-        error: "Unauthorized",
-      },
-      {
-        status: 401,
-      },
+  const unauthorized =
+    requireConversationExperimentApiKey(
+      request,
     );
+
+  if (unauthorized) {
+    return unauthorized;
   }
 
   const parsed =
@@ -83,10 +81,11 @@ export async function POST(
     id,
   } = await context.params;
 
-  const service =
-    createMockConversationService();
-
   try {
+    const {
+      service,
+    } =
+      createProductionConversationEnvironment();
     const result =
       await service.requestHumanHandoff({
         conversationId: id,
@@ -98,17 +97,6 @@ export async function POST(
       ...result,
     });
   } catch (error) {
-    return Response.json(
-      {
-        ok: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unknown handoff error",
-      },
-      {
-        status: 400,
-      },
-    );
+    return conversationRouteError(error);
   }
 }

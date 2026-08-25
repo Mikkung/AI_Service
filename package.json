@@ -28,7 +28,8 @@
     "rag-v2:publish-admission": "node scripts/rag-v2-publish-admission.mjs",
     "benchmark:rag-v2-admission": "node scripts/rag-v2-admission-benchmark.mjs",
     "knowledge:publish-queue": "node scripts/knowledge-publish-queue.cjs",
-    "knowledge:unpublish": "node scripts/knowledge-unpublish.mjs"
+    "knowledge:unpublish": "node scripts/knowledge-unpublish.mjs",
+    "knowledge:vector-store-cleanup": "node scripts/vector-store-orphan-cleanup.mjs"
   },
   "allowScripts": {
     "@firebase/util@1.15.1": true,

@@ -10,6 +10,10 @@ import type {
 } from "@/core/ai-platform/types/conversations";
 
 import {
+  firestore,
+} from "@/infrastructure/db/firebase-admin";
+
+import {
   removeUndefinedFirestoreValues,
 } from "./firestore-serialization";
 
@@ -47,16 +51,6 @@ interface FirestoreLike {
   ): FirestoreCollectionReference;
 }
 
-function getDefaultFirestore(): FirestoreLike {
-  const {
-    firestore: adminFirestore,
-  } = require("@/infrastructure/db/firebase-admin") as {
-    firestore: FirestoreLike;
-  };
-
-  return adminFirestore;
-}
-
 function cloneHandoff(
   handoff: HumanHandoff,
 ): HumanHandoff {
@@ -90,7 +84,8 @@ export class FirestoreAIPlatformHandoffRepository
 
   constructor(db?: FirestoreLike) {
     this.db =
-      db ?? getDefaultFirestore();
+      db ??
+      (firestore as unknown as FirestoreLike);
   }
 
   async createHandoff(

@@ -24,6 +24,10 @@ import type {
 } from "@/core/ai-platform/types/conversations";
 
 import {
+  firestore,
+} from "@/infrastructure/db/firebase-admin";
+
+import {
   removeUndefinedFirestoreValues,
 } from "./firestore-serialization";
 
@@ -92,16 +96,6 @@ interface FirestoreLike {
       transaction: FirestoreTransaction,
     ) => Promise<T>,
   ): Promise<T>;
-}
-
-function getDefaultFirestore(): FirestoreLike {
-  const {
-    firestore: adminFirestore,
-  } = require("@/infrastructure/db/firebase-admin") as {
-    firestore: FirestoreLike;
-  };
-
-  return adminFirestore;
 }
 
 function isCollectionSnapshot(
@@ -237,7 +231,8 @@ export class FirestoreAIPlatformConversationWorkflowRepository
 
   constructor(db?: FirestoreLike) {
     this.db =
-      db ?? getDefaultFirestore();
+      db ??
+      (firestore as unknown as FirestoreLike);
   }
 
   async appendUserMessage(

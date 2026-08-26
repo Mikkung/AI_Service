@@ -26,6 +26,11 @@ export interface AppendUserMessageInput {
   updatedAt: string;
 }
 
+export interface AppendUserMessageWorkflowResult {
+  conversation: Conversation;
+  appended: boolean;
+}
+
 export interface PersistAiMessageIfActiveInput {
   conversationId: string;
   message: ConversationMessage;
@@ -77,7 +82,7 @@ export interface ConditionalMessageWorkflowResult {
 export interface ConversationWorkflowRepository {
   appendUserMessage(
     input: AppendUserMessageInput,
-  ): Promise<Conversation>;
+  ): Promise<AppendUserMessageWorkflowResult>;
 
   persistAiMessageIfActive(
     input: PersistAiMessageIfActiveInput,

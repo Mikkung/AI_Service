@@ -1,10 +1,15 @@
 import {
+  createHash,
+} from "node:crypto";
+
+import {
   assertConversationTransition,
 } from "@/core/ai-platform/conversations/conversation-transitions";
 
 import {
   ConversationConflictError,
   ConversationInvariantError,
+  type AppendUserMessageWorkflowResult,
   type AppendUserMessageInput,
   type ConditionalMessageWorkflowResult,
   type ConversationWorkflowRepository,
@@ -39,6 +44,9 @@ const MESSAGES_COLLECTION =
 
 const HANDOFFS_COLLECTION =
   "ai_platform_handoffs";
+
+const INBOUND_RECEIPTS_COLLECTION =
+  "ai_platform_inbound_message_receipts";
 
 interface FirestoreDocumentSnapshot {
   id: string;
@@ -172,6 +180,21 @@ function serialize(
   ) as Record<string, unknown>;
 }
 
+function sha256(value: string): string {
+  return createHash("sha256")
+    .update(value)
+    .digest("hex");
+}
+
+function getInboundReceiptId(
+  conversationId: string,
+  channelMessageId: string,
+): string {
+  return sha256(
+    `${conversationId}\0${channelMessageId}`,
+  );
+}
+
 function mapConversationSnapshot(
   snapshot: FirestoreDocumentSnapshot,
 ): Conversation {
@@ -237,7 +260,7 @@ export class FirestoreAIPlatformConversationWorkflowRepository
 
   async appendUserMessage(
     input: AppendUserMessageInput,
-  ): Promise<Conversation> {
+  ): Promise<AppendUserMessageWorkflowResult> {
     return this.db.runTransaction(
       async (transaction) => {
         const {
@@ -247,6 +270,68 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           transaction,
           input.conversationId,
         );
+
+        const channelMessageId =
+          input.message.channelMessageId;
+        const receiptRef =
+          channelMessageId
+            ? this.inboundReceiptRef(
+                getInboundReceiptId(
+                  input.conversationId,
+                  channelMessageId,
+                ),
+              )
+            : undefined;
+        const textSha256 =
+          channelMessageId
+            ? sha256(input.message.text)
+            : undefined;
+
+        if (
+          receiptRef &&
+          channelMessageId &&
+          textSha256
+        ) {
+          const receiptSnapshot =
+            assertDocumentSnapshot(
+              await transaction.get(
+                receiptRef,
+              ),
+            );
+
+          if (receiptSnapshot.exists) {
+            const receipt =
+              receiptSnapshot.data() ?? {};
+
+            if (
+              receipt.conversationId !==
+                input.conversationId ||
+              receipt.channelMessageId !==
+                channelMessageId
+            ) {
+              throw new ConversationInvariantError(
+                `Inbound receipt ${receiptSnapshot.id} does not match conversation message identity`,
+              );
+            }
+
+            if (
+              receipt.textSha256 !==
+              textSha256
+            ) {
+              throw new ConversationConflictError(
+                "Inbound message receipt already exists with different text",
+              );
+            }
+
+            return {
+              conversation:
+                cloneConversation(
+                  conversation,
+                ),
+              appended: false,
+            };
+          }
+        }
 
         if (
           conversation.mode === "resolved"
@@ -277,7 +362,31 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           ),
         );
 
-        return cloneConversation(updated);
+        if (
+          receiptRef &&
+          channelMessageId &&
+          textSha256
+        ) {
+          transaction.create(
+            receiptRef,
+            serialize({
+              conversationId:
+                input.conversationId,
+              channelMessageId,
+              messageId:
+                input.message.id,
+              textSha256,
+              receivedAt:
+                input.updatedAt,
+            }),
+          );
+        }
+
+        return {
+          conversation:
+            cloneConversation(updated),
+          appended: true,
+        };
       },
     );
   }
@@ -852,6 +961,16 @@ export class FirestoreAIPlatformConversationWorkflowRepository
   ): FirestoreDocumentReference {
     return this.db
       .collection(MESSAGES_COLLECTION)
+      .doc(id);
+  }
+
+  private inboundReceiptRef(
+    id: string,
+  ): FirestoreDocumentReference {
+    return this.db
+      .collection(
+        INBOUND_RECEIPTS_COLLECTION,
+      )
       .doc(id);
   }
 }

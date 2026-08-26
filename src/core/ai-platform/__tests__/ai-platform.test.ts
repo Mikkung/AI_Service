@@ -167,6 +167,10 @@ import type {
 } from "../types/grounded-answer";
 
 import type {
+  ConversationMessage,
+} from "../types/conversations";
+
+import type {
   KnowledgeDocument,
 } from "../types/knowledge";
 
@@ -1086,6 +1090,40 @@ function createAtomicTestService(
     conversationWorkflowRepository,
     provider,
   };
+}
+
+function groundedCountingProvider(
+  answer = "grounded answer",
+): CountingProvider {
+  return new CountingProvider({
+    answerable: true,
+    answer,
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "counting",
+  });
+}
+
+function unsupportedCountingProvider(): CountingProvider {
+  return new CountingProvider({
+    answerable: false,
+    answer: "",
+    citations: [],
+    provider: "counting",
+  });
+}
+
+function countMessagesBySender(
+  messages: ConversationMessage[],
+  senderType: ConversationMessage["senderType"],
+): number {
+  return messages.filter(
+    (message) =>
+      message.senderType === senderType,
+  ).length;
 }
 
 function createKnowledgeTestService() {
@@ -6201,6 +6239,504 @@ async function testConversationContextIsBoundedToTenMessages() {
   );
 }
 
+async function testInboundMessageReceiptFirstAppendProcessesOnce() {
+  const provider =
+    groundedCountingProvider(
+      "first grounded answer",
+    );
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  const result =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "hello",
+      channelMessageId:
+        "external-message-1",
+    });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(
+    result.duplicateInbound,
+    undefined,
+  );
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    result.outboundMessage?.text,
+    "first grounded answer",
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    1,
+  );
+}
+
+async function testInboundMessageReceiptSequentialRetryIsIdempotent() {
+  const provider =
+    groundedCountingProvider(
+      "grounded retry answer",
+    );
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "hello",
+    channelMessageId:
+      "external-message-1",
+  });
+  const duplicate =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "hello",
+      channelMessageId:
+        "external-message-1",
+    });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(
+    duplicate.duplicateInbound,
+    true,
+  );
+  assert.equal(
+    duplicate.outboundMessage,
+    undefined,
+  );
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    1,
+  );
+}
+
+async function testInboundMessageReceiptConcurrentRetryIsIdempotent() {
+  const provider =
+    new DeferredProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  const first =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "hello",
+      channelMessageId:
+        "external-message-1",
+    });
+  const second =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "hello",
+      channelMessageId:
+        "external-message-1",
+    });
+
+  for (
+    let attempt = 0;
+    attempt < 10 && provider.calls === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 0),
+    );
+  }
+  assert.equal(provider.calls, 1);
+
+  provider.resolve({
+    answerable: true,
+    answer:
+      "concurrent grounded answer",
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "deferred",
+  });
+
+  const results =
+    await Promise.all([first, second]);
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    results.filter(
+      (result) =>
+        result.duplicateInbound ===
+        true,
+    ).length,
+    1,
+  );
+  assert.equal(
+    results.filter(
+      (result) =>
+        result.outboundMessage
+          ?.senderType === "ai",
+    ).length,
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    1,
+  );
+}
+
+async function testInboundMessageReceiptUnsupportedRetryDoesNotDuplicateHandoff() {
+  const provider =
+    unsupportedCountingProvider();
+  const {
+    service,
+    handoffRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "unknown",
+    channelMessageId:
+      "external-message-1",
+  });
+  const duplicate =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "unknown",
+      channelMessageId:
+        "external-message-1",
+    });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+  const waitingHandoffs =
+    await handoffRepository
+      .listWaitingHandoffs();
+
+  assert.equal(
+    duplicate.duplicateInbound,
+    true,
+  );
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    waitingHandoffs.length,
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "system",
+    ),
+    1,
+  );
+}
+
+async function testInboundMessageReceiptSameChannelMessageDifferentConversations() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const firstConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const secondConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-2",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      firstConversation.id,
+    text: "first",
+    channelMessageId:
+      "shared-channel-message",
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      secondConversation.id,
+    text: "second",
+    channelMessageId:
+      "shared-channel-message",
+  });
+
+  assert.equal(provider.calls, 2);
+  assert.equal(
+    countMessagesBySender(
+      await service.listMessages(
+        firstConversation.id,
+      ),
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      await service.listMessages(
+        secondConversation.id,
+      ),
+      "user",
+    ),
+    1,
+  );
+}
+
+async function testInboundMessageReceiptSameConversationDifferentTextConflicts() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "original text",
+    channelMessageId:
+      "external-message-1",
+  });
+
+  await assert.rejects(
+    () =>
+      service.receiveUserMessage({
+        conversationId:
+          conversation.id,
+        text: "changed text",
+        channelMessageId:
+          "external-message-1",
+      }),
+    ConversationConflictError,
+  );
+  assert.equal(provider.calls, 1);
+}
+
+async function testInboundMessageReceiptAbsentChannelMessageIdPreservesRepeatBehavior() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "hello",
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "hello",
+  });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(provider.calls, 2);
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    2,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    2,
+  );
+}
+
+async function testInboundMessageReceiptDuplicateInHumanModesDoesNotMutateState() {
+  const provider =
+    unsupportedCountingProvider();
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "unknown",
+    channelMessageId:
+      "external-message-1",
+  });
+  const waitingBefore =
+    db.getStoredDocument(
+      "ai_platform_conversations",
+      conversation.id,
+    );
+  const waitingDuplicate =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "unknown",
+      channelMessageId:
+        "external-message-1",
+    });
+  const waitingAfter =
+    db.getStoredDocument(
+      "ai_platform_conversations",
+      conversation.id,
+    );
+
+  assert.equal(
+    waitingDuplicate
+      .duplicateInbound,
+    true,
+  );
+  assert.deepEqual(
+    waitingAfter,
+    waitingBefore,
+  );
+
+  await service.takeOverConversation({
+    conversationId:
+      conversation.id,
+    agentId: "agent-1",
+  });
+  const activeBefore =
+    db.getStoredDocument(
+      "ai_platform_conversations",
+      conversation.id,
+    );
+  const activeDuplicate =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "unknown",
+      channelMessageId:
+        "external-message-1",
+    });
+  const activeAfter =
+    db.getStoredDocument(
+      "ai_platform_conversations",
+      conversation.id,
+    );
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(
+    activeDuplicate
+      .duplicateInbound,
+    true,
+  );
+  assert.deepEqual(
+    activeAfter,
+    activeBefore,
+  );
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "system",
+    ),
+    1,
+  );
+}
+
 async function testConversationServiceGroundedAnswer() {
   const provider =
     new CountingProvider({
@@ -7085,6 +7621,14 @@ async function main() {
   await testMultiTurnContextIncludesPreviousTurnsOnly();
   await testConversationContextExcludesSystemAndMapsHumanReplies();
   await testConversationContextIsBoundedToTenMessages();
+  await testInboundMessageReceiptFirstAppendProcessesOnce();
+  await testInboundMessageReceiptSequentialRetryIsIdempotent();
+  await testInboundMessageReceiptConcurrentRetryIsIdempotent();
+  await testInboundMessageReceiptUnsupportedRetryDoesNotDuplicateHandoff();
+  await testInboundMessageReceiptSameChannelMessageDifferentConversations();
+  await testInboundMessageReceiptSameConversationDifferentTextConflicts();
+  await testInboundMessageReceiptAbsentChannelMessageIdPreservesRepeatBehavior();
+  await testInboundMessageReceiptDuplicateInHumanModesDoesNotMutateState();
   await testConversationServiceGroundedAnswer();
   await testConversationServiceUnsupportedHandoff();
   await testConversationServiceMissingCitationHandoff();

@@ -115,6 +115,7 @@ export interface ConversationServiceResult {
   outboundMessage?: OutboundConversationMessage;
   handoff?: HumanHandoff;
   events: ConversationDomainEvent[];
+  duplicateInbound?: boolean;
 }
 
 export class SequentialIdGenerator
@@ -259,7 +260,7 @@ export class ConversationService {
         input.metadata,
     };
 
-    const conversation =
+    const appendResult =
       this.dependencies
         .conversationWorkflowRepository
         ? await this.dependencies
@@ -272,10 +273,24 @@ export class ConversationService {
               updatedAt:
                 timestamp,
             })
-        : await this.appendUserMessageWithoutWorkflow(
-            userMessage,
-            timestamp,
-          );
+        : {
+            conversation:
+              await this.appendUserMessageWithoutWorkflow(
+                userMessage,
+                timestamp,
+              ),
+            appended: true,
+          };
+    const conversation =
+      appendResult.conversation;
+
+    if (!appendResult.appended) {
+      return {
+        conversation,
+        duplicateInbound: true,
+        events: [],
+      };
+    }
 
     if (conversation.mode !== "ai_active") {
       return {

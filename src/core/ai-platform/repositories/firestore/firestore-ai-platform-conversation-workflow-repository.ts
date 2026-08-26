@@ -1,5 +1,6 @@
 import {
   createHash,
+  randomUUID,
 } from "node:crypto";
 
 import {
@@ -13,8 +14,13 @@ import {
   type AppendUserMessageInput,
   type ConditionalMessageWorkflowResult,
   type ConversationWorkflowRepository,
+  type InboundProcessingOwnershipInput,
+  type PersistAiMessageForInboundIfOwnedInput,
+  type PersistAiMessageForInboundIfOwnedResult,
   type PersistAiMessageIfActiveInput,
   type PersistHumanMessageIfOwnedInput,
+  type RequestHandoffForInboundIfOwnedInput,
+  type RequestHandoffForInboundIfOwnedResult,
   type RequestHandoffWorkflowInput,
   type RequestHandoffWorkflowResult,
   type ResolveConversationWorkflowInput,
@@ -47,6 +53,27 @@ const HANDOFFS_COLLECTION =
 
 const INBOUND_RECEIPTS_COLLECTION =
   "ai_platform_inbound_message_receipts";
+
+const INBOUND_PROCESSING_LEASE_SECONDS =
+  120;
+
+type InboundProcessingStatus =
+  | "processing"
+  | "completed";
+
+interface InboundMessageReceipt {
+  conversationId: string;
+  channelMessageId: string;
+  messageId: string;
+  textSha256: string;
+  receivedAt: string;
+  processingStatus?: InboundProcessingStatus;
+  processingToken?: string;
+  leaseExpiresAt?: string;
+  processingAttempts?: number;
+  completedAt?: string;
+  completionOutcome?: string;
+}
 
 interface FirestoreDocumentSnapshot {
   id: string;
@@ -195,6 +222,45 @@ function getInboundReceiptId(
   );
 }
 
+function createProcessingToken(): string {
+  return `inbound-${randomUUID()}`;
+}
+
+function addSeconds(
+  isoTimestamp: string,
+  seconds: number,
+): string {
+  return new Date(
+    new Date(isoTimestamp).getTime() +
+      seconds * 1000,
+  ).toISOString();
+}
+
+function getLeaseExpiresAt(
+  timestamp: string,
+): string {
+  return addSeconds(
+    timestamp,
+    INBOUND_PROCESSING_LEASE_SECONDS,
+  );
+}
+
+function isLeaseExpired(
+  leaseExpiresAt: string,
+  now: string,
+): boolean {
+  return (
+    new Date(leaseExpiresAt).getTime() <=
+    new Date(now).getTime()
+  );
+}
+
+function mapInboundReceiptSnapshot(
+  snapshot: FirestoreDocumentSnapshot,
+): InboundMessageReceipt {
+  return snapshot.data() as unknown as InboundMessageReceipt;
+}
+
 function mapConversationSnapshot(
   snapshot: FirestoreDocumentSnapshot,
 ): Conversation {
@@ -301,7 +367,9 @@ export class FirestoreAIPlatformConversationWorkflowRepository
 
           if (receiptSnapshot.exists) {
             const receipt =
-              receiptSnapshot.data() ?? {};
+              mapInboundReceiptSnapshot(
+                receiptSnapshot,
+              );
 
             if (
               receipt.conversationId !==
@@ -323,12 +391,117 @@ export class FirestoreAIPlatformConversationWorkflowRepository
               );
             }
 
+            if (
+              receipt.processingStatus ===
+              "processing"
+            ) {
+              if (
+                typeof receipt.leaseExpiresAt !==
+                  "string" ||
+                typeof receipt.processingToken !==
+                  "string" ||
+                typeof receipt.processingAttempts !==
+                  "number" ||
+                typeof receipt.messageId !==
+                  "string"
+              ) {
+                throw new ConversationInvariantError(
+                  `Inbound receipt ${receiptSnapshot.id} is processing without complete lease state`,
+                );
+              }
+
+              if (
+                !isLeaseExpired(
+                  receipt.leaseExpiresAt,
+                  input.updatedAt,
+                )
+              ) {
+                return {
+                  conversation:
+                    cloneConversation(
+                      conversation,
+                    ),
+                  appended: false,
+                  shouldProcess: false,
+                  messageId:
+                    receipt.messageId,
+                };
+              }
+
+              if (
+                conversation.mode !==
+                "ai_active"
+              ) {
+                const outcome =
+                  `recovery_no_ai_processing_${conversation.mode}`;
+                transaction.set(
+                  receiptRef,
+                  serialize(
+                    this.completeReceipt(
+                      receipt,
+                      input.updatedAt,
+                      outcome,
+                    ),
+                  ),
+                );
+
+                return {
+                  conversation:
+                    cloneConversation(
+                      conversation,
+                    ),
+                  appended: false,
+                  shouldProcess: false,
+                  messageId:
+                    receipt.messageId,
+                };
+              }
+
+              const processingToken =
+                createProcessingToken();
+              const reclaimedReceipt: InboundMessageReceipt =
+                {
+                  ...receipt,
+                  processingToken,
+                  leaseExpiresAt:
+                    getLeaseExpiresAt(
+                      input.updatedAt,
+                    ),
+                  processingAttempts:
+                    receipt.processingAttempts +
+                    1,
+                };
+
+              transaction.set(
+                receiptRef,
+                serialize(
+                  reclaimedReceipt,
+                ),
+              );
+
+              return {
+                conversation:
+                  cloneConversation(
+                    conversation,
+                  ),
+                appended: false,
+                shouldProcess: true,
+                messageId:
+                  receipt.messageId,
+                processingToken,
+                recovered: true,
+              };
+            }
+
             return {
               conversation:
                 cloneConversation(
                   conversation,
                 ),
               appended: false,
+              shouldProcess: false,
+              messageId:
+                receipt.messageId,
             };
           }
         }
@@ -367,9 +540,13 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           channelMessageId &&
           textSha256
         ) {
-          transaction.create(
-            receiptRef,
-            serialize({
+          const processingToken =
+            createProcessingToken();
+          const shouldProcess =
+            conversation.mode ===
+            "ai_active";
+          const receipt: InboundMessageReceipt =
+            {
               conversationId:
                 input.conversationId,
               channelMessageId,
@@ -378,14 +555,52 @@ export class FirestoreAIPlatformConversationWorkflowRepository
               textSha256,
               receivedAt:
                 input.updatedAt,
-            }),
+              processingStatus:
+                shouldProcess
+                  ? "processing"
+                  : "completed",
+              processingToken,
+              leaseExpiresAt:
+                getLeaseExpiresAt(
+                  input.updatedAt,
+                ),
+              processingAttempts: 1,
+              completedAt:
+                shouldProcess
+                  ? undefined
+                  : input.updatedAt,
+              completionOutcome:
+                shouldProcess
+                  ? undefined
+                  : `no_ai_processing_${conversation.mode}`,
+            };
+
+          transaction.create(
+            receiptRef,
+            serialize(receipt),
           );
+
+          return {
+            conversation:
+              cloneConversation(updated),
+            appended: true,
+            shouldProcess,
+            messageId:
+              input.message.id,
+            processingToken:
+              shouldProcess
+                ? processingToken
+                : undefined,
+          };
         }
 
         return {
           conversation:
             cloneConversation(updated),
           appended: true,
+          shouldProcess: true,
+          messageId:
+            input.message.id,
         };
       },
     );
@@ -443,6 +658,107 @@ export class FirestoreAIPlatformConversationWorkflowRepository
               updated,
             ),
           persisted: true,
+        };
+      },
+    );
+  }
+
+  async persistAiMessageForInboundIfOwned(
+    input: PersistAiMessageForInboundIfOwnedInput,
+  ): Promise<PersistAiMessageForInboundIfOwnedResult> {
+    return this.db.runTransaction(
+      async (transaction) => {
+        const {
+          conversation,
+          conversationRef,
+        } = await this.getRequiredConversation(
+          transaction,
+          input.conversationId,
+        );
+        const ownership =
+          await this.getInboundProcessingOwnership(
+            transaction,
+            input,
+          );
+
+        if (!ownership.owned) {
+          return {
+            conversation:
+              cloneConversation(
+                conversation,
+              ),
+            persisted: false,
+            completed: false,
+          };
+        }
+
+        if (
+          conversation.mode !== "ai_active"
+        ) {
+          const outcome =
+            "ai_suppressed_mode_changed";
+          transaction.set(
+            ownership.receiptRef,
+            serialize(
+              this.completeReceipt(
+                ownership.receipt,
+                input.updatedAt,
+                outcome,
+              ),
+            ),
+          );
+
+          return {
+            conversation:
+              cloneConversation(
+                conversation,
+              ),
+            persisted: false,
+            completed: true,
+            completionOutcome:
+              outcome,
+          };
+        }
+
+        const updated =
+          this.withMessageTimestamps(
+            conversation,
+            input.updatedAt,
+          );
+        const outcome = "ai_replied";
+
+        transaction.set(
+          conversationRef,
+          serialize(updated),
+        );
+        transaction.create(
+          this.messageRef(
+            input.message.id,
+          ),
+          serialize(
+            cloneMessage(
+              input.message,
+            ),
+          ),
+        );
+        transaction.set(
+          ownership.receiptRef,
+          serialize(
+            this.completeReceipt(
+              ownership.receipt,
+              input.updatedAt,
+              outcome,
+            ),
+          ),
+        );
+
+        return {
+          conversation:
+            cloneConversation(updated),
+          persisted: true,
+          completed: true,
+          completionOutcome:
+            outcome,
         };
       },
     );
@@ -611,6 +927,199 @@ export class FirestoreAIPlatformConversationWorkflowRepository
               input.handoff,
             ),
           created: true,
+        };
+      },
+    );
+  }
+
+  async requestHumanHandoffForInboundIfOwned(
+    input: RequestHandoffForInboundIfOwnedInput,
+  ): Promise<RequestHandoffForInboundIfOwnedResult> {
+    return this.db.runTransaction(
+      async (transaction) => {
+        const {
+          conversation,
+          conversationRef,
+        } = await this.getRequiredConversation(
+          transaction,
+          input.conversationId,
+        );
+        const ownership =
+          await this.getInboundProcessingOwnership(
+            transaction,
+            input,
+          );
+
+        if (!ownership.owned) {
+          return {
+            conversation:
+              cloneConversation(
+                conversation,
+              ),
+            created: false,
+            completed: false,
+          };
+        }
+
+        const existingHandoff =
+          await this.getActiveHandoff(
+            transaction,
+            input.conversationId,
+          );
+        const outcome =
+          "handoff_requested";
+
+        if (existingHandoff) {
+          if (
+            conversation.mode !==
+              "waiting_human" &&
+            conversation.mode !==
+              "human_active"
+          ) {
+            throw new ConversationInvariantError(
+              `Conversation ${conversation.id} is ${conversation.mode} but already has an active handoff`,
+            );
+          }
+
+          transaction.set(
+            ownership.receiptRef,
+            serialize(
+              this.completeReceipt(
+                ownership.receipt,
+                input.updatedAt,
+                outcome,
+              ),
+            ),
+          );
+
+          return {
+            conversation:
+              cloneConversation(
+                conversation,
+              ),
+            handoff:
+              cloneHandoff(
+                existingHandoff,
+              ),
+            created: false,
+            completed: true,
+            completionOutcome:
+              outcome,
+          };
+        }
+
+        if (
+          conversation.mode !== "ai_active"
+        ) {
+          if (
+            conversation.mode ===
+            "resolved"
+          ) {
+            const suppressedOutcome =
+              "handoff_suppressed_mode_changed";
+            transaction.set(
+              ownership.receiptRef,
+              serialize(
+                this.completeReceipt(
+                  ownership.receipt,
+                  input.updatedAt,
+                  suppressedOutcome,
+                ),
+              ),
+            );
+
+            return {
+              conversation:
+                cloneConversation(
+                  conversation,
+                ),
+              created: false,
+              completed: true,
+              completionOutcome:
+                suppressedOutcome,
+            };
+          }
+
+          if (
+            conversation.mode !==
+              "waiting_human" &&
+            conversation.mode !==
+              "human_active"
+          ) {
+            throw new ConversationConflictError(
+              `Conversation cannot request handoff from mode ${conversation.mode}`,
+            );
+          }
+
+          throw new ConversationInvariantError(
+            `Conversation ${conversation.id} is ${conversation.mode} without an active handoff`,
+          );
+        }
+
+        assertConversationTransition({
+          from: conversation.mode,
+          to: "waiting_human",
+          reason:
+            input.handoff.reason,
+          requestedBy:
+            input.handoff.requestedBy,
+        });
+
+        const updated: Conversation = {
+          ...conversation,
+          mode: "waiting_human",
+          updatedAt:
+            input.updatedAt,
+        };
+
+        transaction.set(
+          conversationRef,
+          serialize(updated),
+        );
+        transaction.create(
+          this.handoffRef(
+            input.handoff.id,
+          ),
+          serialize(
+            cloneHandoff(
+              input.handoff,
+            ),
+          ),
+        );
+        transaction.create(
+          this.messageRef(
+            input.systemMessage.id,
+          ),
+          serialize(
+            cloneMessage(
+              input.systemMessage,
+            ),
+          ),
+        );
+        transaction.set(
+          ownership.receiptRef,
+          serialize(
+            this.completeReceipt(
+              ownership.receipt,
+              input.updatedAt,
+              outcome,
+            ),
+          ),
+        );
+
+        return {
+          conversation:
+            cloneConversation(
+              updated,
+            ),
+          handoff:
+            cloneHandoff(
+              input.handoff,
+            ),
+          created: true,
+          completed: true,
+          completionOutcome:
+            outcome,
         };
       },
     );
@@ -858,6 +1367,84 @@ export class FirestoreAIPlatformConversationWorkflowRepository
         );
       },
     );
+  }
+
+  private async getInboundProcessingOwnership(
+    transaction: FirestoreTransaction,
+    input: InboundProcessingOwnershipInput,
+  ): Promise<
+    | {
+        owned: true;
+        receipt: InboundMessageReceipt;
+        receiptRef: FirestoreDocumentReference;
+      }
+    | {
+        owned: false;
+      }
+  > {
+    const receiptRef =
+      this.inboundReceiptRef(
+        getInboundReceiptId(
+          input.conversationId,
+          input.channelMessageId,
+        ),
+      );
+    const receiptSnapshot =
+      assertDocumentSnapshot(
+        await transaction.get(receiptRef),
+      );
+
+    if (!receiptSnapshot.exists) {
+      throw new ConversationInvariantError(
+        `Inbound receipt not found for conversation ${input.conversationId}`,
+      );
+    }
+
+    const receipt =
+      mapInboundReceiptSnapshot(
+        receiptSnapshot,
+      );
+
+    if (
+      receipt.conversationId !==
+        input.conversationId ||
+      receipt.channelMessageId !==
+        input.channelMessageId
+    ) {
+      throw new ConversationInvariantError(
+        `Inbound receipt ${receiptSnapshot.id} does not match processing identity`,
+      );
+    }
+
+    if (
+      receipt.processingStatus !==
+        "processing" ||
+      receipt.processingToken !==
+        input.processingToken
+    ) {
+      return {
+        owned: false,
+      };
+    }
+
+    return {
+      owned: true,
+      receipt,
+      receiptRef,
+    };
+  }
+
+  private completeReceipt(
+    receipt: InboundMessageReceipt,
+    completedAt: string,
+    completionOutcome: string,
+  ): InboundMessageReceipt {
+    return {
+      ...receipt,
+      processingStatus: "completed",
+      completedAt,
+      completionOutcome,
+    };
   }
 
   private async getRequiredConversation(

@@ -116,6 +116,7 @@ export interface ConversationServiceResult {
   handoff?: HumanHandoff;
   events: ConversationDomainEvent[];
   duplicateInbound?: boolean;
+  recoveredInbound?: boolean;
 }
 
 export class SequentialIdGenerator
@@ -273,21 +274,27 @@ export class ConversationService {
               updatedAt:
                 timestamp,
             })
-        : {
-            conversation:
-              await this.appendUserMessageWithoutWorkflow(
-                userMessage,
-                timestamp,
-              ),
-            appended: true,
-          };
+          : {
+              conversation:
+                await this.appendUserMessageWithoutWorkflow(
+                  userMessage,
+                  timestamp,
+                ),
+              appended: true,
+              shouldProcess: true,
+              messageId:
+                userMessage.id,
+            };
     const conversation =
       appendResult.conversation;
 
-    if (!appendResult.appended) {
+    if (!appendResult.shouldProcess) {
       return {
         conversation,
-        duplicateInbound: true,
+        duplicateInbound:
+          !appendResult.appended
+            ? true
+            : undefined,
         events: [],
       };
     }
@@ -307,7 +314,7 @@ export class ConversationService {
     const conversationContext =
       await this.buildConversationContext(
         conversation.id,
-        userMessage.id,
+        appendResult.messageId,
       );
 
     const answer =
@@ -347,16 +354,34 @@ export class ConversationService {
       const result =
         this.dependencies
           .conversationWorkflowRepository
-          ? await this.dependencies
-              .conversationWorkflowRepository
-              .persistAiMessageIfActive({
-                conversationId:
-                  conversation.id,
-                message:
-                  aiMessage,
-                updatedAt:
-                  aiMessage.createdAt,
-              })
+          ? input.channelMessageId &&
+            appendResult.processingToken
+            ? await this.dependencies
+                .conversationWorkflowRepository
+                .persistAiMessageForInboundIfOwned(
+                  {
+                    conversationId:
+                      conversation.id,
+                    channelMessageId:
+                      input.channelMessageId,
+                    processingToken:
+                      appendResult.processingToken,
+                    message:
+                      aiMessage,
+                    updatedAt:
+                      aiMessage.createdAt,
+                  },
+                )
+            : await this.dependencies
+                .conversationWorkflowRepository
+                .persistAiMessageIfActive({
+                  conversationId:
+                    conversation.id,
+                  message:
+                    aiMessage,
+                  updatedAt:
+                    aiMessage.createdAt,
+                })
           : {
               conversation:
                 await this.persistAiMessageWithoutWorkflow(
@@ -370,6 +395,10 @@ export class ConversationService {
           conversation:
             result.conversation,
           events: [],
+          recoveredInbound:
+            appendResult.recovered
+              ? true
+              : undefined,
         };
       }
 
@@ -384,6 +413,117 @@ export class ConversationService {
             aiMessage.citations,
         },
         events: [],
+        recoveredInbound:
+          appendResult.recovered
+            ? true
+            : undefined,
+      };
+    }
+
+    if (
+      this.dependencies
+        .conversationWorkflowRepository &&
+      input.channelMessageId &&
+      appendResult.processingToken
+    ) {
+      const handoffTimestamp =
+        this.now();
+      const handoff: HumanHandoff = {
+        id:
+          this.idGenerator.nextId(
+            "handoff",
+          ),
+        conversationId:
+          conversation.id,
+        reason:
+          mapGroundingReasonToHandoffReason(
+            answer.groundingReason,
+          ),
+        status: "waiting",
+        requestedAt:
+          handoffTimestamp,
+        requestedBy: "ai",
+        metadata: {
+          groundingReason:
+            answer.groundingReason,
+        },
+      };
+      const systemMessage: ConversationMessage =
+        {
+          id:
+            this.idGenerator.nextId(
+              "message",
+            ),
+          conversationId:
+            conversation.id,
+          senderType: "system",
+          text:
+            "Human handoff requested.",
+          createdAt:
+            handoffTimestamp,
+          metadata: {
+            handoffId:
+              handoff.id,
+            reason:
+              handoff.reason,
+          },
+        };
+      const result =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .requestHumanHandoffForInboundIfOwned(
+            {
+              conversationId:
+                conversation.id,
+              channelMessageId:
+                input.channelMessageId,
+              processingToken:
+                appendResult.processingToken,
+              handoff,
+              systemMessage,
+              updatedAt:
+                handoffTimestamp,
+            },
+          );
+
+      return {
+        conversation:
+          result.conversation,
+        handoff:
+          result.handoff,
+        outboundMessage:
+          result.created
+            ? {
+                text:
+                  systemMessage.text,
+                senderType:
+                  "system",
+              }
+            : undefined,
+        events:
+          result.created &&
+          result.handoff
+            ? [
+                {
+                  type:
+                    "conversation.handoff_requested",
+                  conversationId:
+                    result.conversation
+                      .id,
+                  handoffId:
+                    result.handoff.id,
+                  reason:
+                    result.handoff
+                      .reason,
+                  occurredAt:
+                    handoffTimestamp,
+                },
+              ]
+            : [],
+        recoveredInbound:
+          appendResult.recovered
+            ? true
+            : undefined,
       };
     }
 

@@ -29,6 +29,10 @@ export interface AppendUserMessageInput {
 export interface AppendUserMessageWorkflowResult {
   conversation: Conversation;
   appended: boolean;
+  shouldProcess: boolean;
+  messageId: string;
+  processingToken?: string;
+  recovered?: boolean;
 }
 
 export interface PersistAiMessageIfActiveInput {
@@ -55,6 +59,40 @@ export interface RequestHandoffWorkflowResult {
   conversation: Conversation;
   handoff: HumanHandoff;
   created: boolean;
+}
+
+export interface InboundProcessingOwnershipInput {
+  conversationId: string;
+  channelMessageId: string;
+  processingToken: string;
+}
+
+export interface PersistAiMessageForInboundIfOwnedInput
+  extends InboundProcessingOwnershipInput {
+  message: ConversationMessage;
+  updatedAt: string;
+}
+
+export interface PersistAiMessageForInboundIfOwnedResult {
+  conversation: Conversation;
+  persisted: boolean;
+  completed: boolean;
+  completionOutcome?: string;
+}
+
+export interface RequestHandoffForInboundIfOwnedInput
+  extends InboundProcessingOwnershipInput {
+  handoff: HumanHandoff;
+  systemMessage: ConversationMessage;
+  updatedAt: string;
+}
+
+export interface RequestHandoffForInboundIfOwnedResult {
+  conversation: Conversation;
+  handoff?: HumanHandoff;
+  created: boolean;
+  completed: boolean;
+  completionOutcome?: string;
 }
 
 export interface TakeOverConversationWorkflowInput {
@@ -88,6 +126,10 @@ export interface ConversationWorkflowRepository {
     input: PersistAiMessageIfActiveInput,
   ): Promise<ConditionalMessageWorkflowResult>;
 
+  persistAiMessageForInboundIfOwned(
+    input: PersistAiMessageForInboundIfOwnedInput,
+  ): Promise<PersistAiMessageForInboundIfOwnedResult>;
+
   persistHumanMessageIfOwned(
     input: PersistHumanMessageIfOwnedInput,
   ): Promise<Conversation>;
@@ -95,6 +137,10 @@ export interface ConversationWorkflowRepository {
   requestHumanHandoff(
     input: RequestHandoffWorkflowInput,
   ): Promise<RequestHandoffWorkflowResult>;
+
+  requestHumanHandoffForInboundIfOwned(
+    input: RequestHandoffForInboundIfOwnedInput,
+  ): Promise<RequestHandoffForInboundIfOwnedResult>;
 
   takeOverConversation(
     input: TakeOverConversationWorkflowInput,

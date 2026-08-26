@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import {
+  createHash,
+} from "node:crypto";
+import {
   mkdir,
   mkdtemp,
   readFile,
@@ -829,6 +832,45 @@ class DeferredProvider
   }
 }
 
+class ScriptedProvider
+  implements GroundedQAProvider
+{
+  readonly name = "scripted";
+
+  calls = 0;
+
+  readonly requests: GroundedQARequest[] =
+    [];
+
+  constructor(
+    private readonly results: Array<
+      GroundedQAResult | Error
+    >,
+  ) {}
+
+  async answer(
+    request: GroundedQARequest,
+  ): Promise<GroundedQAResult> {
+    this.calls += 1;
+    this.requests.push(request);
+
+    const result =
+      this.results.shift();
+
+    if (!result) {
+      throw new Error(
+        "Scripted provider result missing",
+      );
+    }
+
+    if (result instanceof Error) {
+      throw result;
+    }
+
+    return result;
+  }
+}
+
 class MockOpenAIKnowledgePublisherClient
   implements OpenAIKnowledgePublisherClient
 {
@@ -1053,7 +1095,11 @@ function createTestService(
 function createAtomicTestService(
   provider:
     | CountingProvider
-    | DeferredProvider,
+    | DeferredProvider
+    | ScriptedProvider,
+  options: {
+    now?: () => string;
+  } = {},
 ) {
   const db =
     new FakeFirestore();
@@ -1078,8 +1124,10 @@ function createAtomicTestService(
         new AnswerService(provider),
       idGenerator:
         new TestIdGenerator(),
-      now: () =>
-        `2027-01-01T00:00:${String(provider.calls).padStart(2, "0")}.000Z`,
+      now:
+        options.now ??
+        (() =>
+          `2027-01-01T00:00:${String(provider.calls).padStart(2, "0")}.000Z`),
     });
 
   return {
@@ -1124,6 +1172,135 @@ function countMessagesBySender(
     (message) =>
       message.senderType === senderType,
   ).length;
+}
+
+function sha256TestValue(
+  value: string,
+): string {
+  return createHash("sha256")
+    .update(value)
+    .digest("hex");
+}
+
+function inboundReceiptId(
+  conversationId: string,
+  channelMessageId: string,
+): string {
+  return sha256TestValue(
+    `${conversationId}\0${channelMessageId}`,
+  );
+}
+
+function inboundTextSha256(
+  text: string,
+): string {
+  return sha256TestValue(text);
+}
+
+function getInboundReceipt(
+  db: FakeFirestore,
+  conversationId: string,
+  channelMessageId: string,
+): FakeFirestoreData | undefined {
+  return db.getStoredDocument(
+    "ai_platform_inbound_message_receipts",
+    inboundReceiptId(
+      conversationId,
+      channelMessageId,
+    ),
+  );
+}
+
+async function seedInboundReceipt(
+  db: FakeFirestore,
+  input: {
+    conversationId: string;
+    channelMessageId: string;
+    text: string;
+    messageId?: string;
+    processingStatus?: "processing" | "completed";
+    processingToken?: string;
+    leaseExpiresAt?: string;
+    processingAttempts?: number;
+    receivedAt?: string;
+  },
+): Promise<void> {
+  const receipt: Record<
+    string,
+    unknown
+  > = {
+    conversationId:
+      input.conversationId,
+    channelMessageId:
+      input.channelMessageId,
+    messageId:
+      input.messageId ??
+      "message-existing",
+    textSha256:
+      inboundTextSha256(input.text),
+    receivedAt:
+      input.receivedAt ??
+      "2027-01-01T00:00:00.000Z",
+  };
+
+  if (input.processingStatus) {
+    receipt.processingStatus =
+      input.processingStatus;
+  }
+
+  if (input.processingToken) {
+    receipt.processingToken =
+      input.processingToken;
+  }
+
+  if (input.leaseExpiresAt) {
+    receipt.leaseExpiresAt =
+      input.leaseExpiresAt;
+  }
+
+  if (
+    input.processingAttempts !==
+    undefined
+  ) {
+    receipt.processingAttempts =
+      input.processingAttempts;
+  }
+
+  await db
+    .collection(
+      "ai_platform_inbound_message_receipts",
+    )
+    .doc(
+      inboundReceiptId(
+        input.conversationId,
+        input.channelMessageId,
+      ),
+    )
+    .set(receipt);
+}
+
+function groundedResult(
+  answer = "grounded answer",
+): GroundedQAResult {
+  return {
+    answerable: true,
+    answer,
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "scripted",
+  };
+}
+
+function unsupportedResult(): GroundedQAResult {
+  return {
+    answerable: false,
+    answer: "",
+    citations: [],
+    provider: "scripted",
+  };
 }
 
 function createKnowledgeTestService() {
@@ -6737,6 +6914,1282 @@ async function testInboundMessageReceiptDuplicateInHumanModesDoesNotMutateState(
   );
 }
 
+async function testInboundProcessingLeaseStartsAndCompletesAiReply() {
+  const provider =
+    new DeferredProvider();
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  const pending =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "leased question",
+      channelMessageId:
+        "leased-message",
+    });
+
+  for (
+    let attempt = 0;
+    attempt < 10 && provider.calls === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 0),
+    );
+  }
+
+  const processingReceipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "leased-message",
+    );
+
+  assert.equal(
+    processingReceipt?.processingStatus,
+    "processing",
+  );
+  assert.equal(
+    typeof processingReceipt?.processingToken,
+    "string",
+  );
+  assert.equal(
+    processingReceipt?.processingAttempts,
+    1,
+  );
+  assert.equal(
+    processingReceipt?.leaseExpiresAt,
+    "2027-01-01T00:02:00.000Z",
+  );
+
+  provider.resolve({
+    answerable: true,
+    answer: "leased answer",
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "deferred",
+  });
+
+  const result =
+    await pending;
+  const completedReceipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "leased-message",
+    );
+
+  assert.equal(
+    result.outboundMessage?.text,
+    "leased answer",
+  );
+  assert.equal(
+    completedReceipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    completedReceipt?.completionOutcome,
+    "ai_replied",
+  );
+  assert.equal(
+    completedReceipt?.completedAt,
+    "2027-01-01T00:00:01.000Z",
+  );
+}
+
+async function testInboundDuplicateBeforeLeaseExpiryIsSuppressedWhileProcessing() {
+  const provider =
+    new DeferredProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  const pending =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "leased question",
+      channelMessageId:
+        "leased-message",
+    });
+
+  for (
+    let attempt = 0;
+    attempt < 10 && provider.calls === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 0),
+    );
+  }
+
+  const duplicate =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "leased question",
+      channelMessageId:
+        "leased-message",
+    });
+
+  assert.equal(
+    duplicate.duplicateInbound,
+    true,
+  );
+  assert.equal(
+    duplicate.outboundMessage,
+    undefined,
+  );
+  assert.equal(provider.calls, 1);
+
+  provider.resolve({
+    answerable: true,
+    answer: "leased answer",
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "deferred",
+  });
+
+  await pending;
+}
+
+async function testExpiredInboundLeaseRetryRecoversOriginalMessage() {
+  let now =
+    "2027-01-01T00:00:00.000Z";
+  const provider =
+    new ScriptedProvider([
+      groundedResult(
+        "previous answer",
+      ),
+      new Error(
+        "provider crashed",
+      ),
+      groundedResult(
+        "recovered answer",
+      ),
+    ]);
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider, {
+    now: () => now,
+  });
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "previous question",
+  });
+
+  now =
+    "2027-01-01T00:00:10.000Z";
+  await assert.rejects(
+    () =>
+      service.receiveUserMessage({
+        conversationId:
+          conversation.id,
+        text: "crashy question",
+        channelMessageId:
+          "recover-message",
+      }),
+    /provider crashed/,
+  );
+
+  const processingReceipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "recover-message",
+    );
+  const originalMessageId =
+    processingReceipt?.messageId;
+
+  assert.equal(
+    processingReceipt?.processingStatus,
+    "processing",
+  );
+  assert.equal(
+    processingReceipt?.processingAttempts,
+    1,
+  );
+
+  now =
+    "2027-01-01T00:02:11.000Z";
+  const recovered =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "crashy question",
+      channelMessageId:
+        "recover-message",
+    });
+  const completedReceipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "recover-message",
+    );
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+  const recoveredContext =
+    provider.requests[2]
+      .conversationContext ?? [];
+
+  assert.equal(
+    recovered.recoveredInbound,
+    true,
+  );
+  assert.equal(
+    recovered.duplicateInbound,
+    undefined,
+  );
+  assert.equal(
+    completedReceipt?.messageId,
+    originalMessageId,
+  );
+  assert.equal(
+    completedReceipt?.processingAttempts,
+    2,
+  );
+  assert.equal(
+    completedReceipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    2,
+  );
+  assert.equal(
+    recoveredContext.some(
+      (message) =>
+        message.text ===
+        "crashy question",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    recoveredContext.map(
+      (message) => message.text,
+    ),
+    [
+      "previous question",
+      "previous answer",
+    ],
+  );
+}
+
+async function testLegacyInboundReceiptWithoutStatusIsCompletedDuplicate() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await db
+    .collection(
+      "ai_platform_inbound_message_receipts",
+    )
+    .doc(
+      inboundReceiptId(
+        conversation.id,
+        "legacy-message",
+      ),
+    )
+    .set({
+      conversationId:
+        conversation.id,
+      channelMessageId:
+        "legacy-message",
+      messageId:
+        "message-existing",
+      textSha256:
+        inboundTextSha256(
+          "legacy text",
+        ),
+      receivedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  const result =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "legacy text",
+      channelMessageId:
+        "legacy-message",
+    });
+
+  assert.equal(
+    result.duplicateInbound,
+    true,
+  );
+  assert.equal(provider.calls, 0);
+  assert.deepEqual(
+    await service.listMessages(
+      conversation.id,
+    ),
+    [],
+  );
+}
+
+async function testInboundAtomicAiFailureDoesNotCompleteReceipt() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationWorkflowRepository:
+      workflow,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  const append =
+    await workflow.appendUserMessage({
+      conversationId:
+        conversation.id,
+      message: {
+        id: "message-user",
+        conversationId:
+          conversation.id,
+        senderType: "user",
+        senderId: "user-1",
+        text: "question",
+        createdAt:
+          "2027-01-01T00:00:00.000Z",
+        channelMessageId:
+          "atomic-message",
+      },
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  await db
+    .collection(
+      "ai_platform_conversation_messages",
+    )
+    .doc("message-ai-duplicate")
+    .create({
+      conversationId:
+        conversation.id,
+      senderType: "ai",
+      text: "existing",
+      createdAt:
+        "2027-01-01T00:00:01.000Z",
+    });
+
+  await assert.rejects(
+    () =>
+      workflow.persistAiMessageForInboundIfOwned(
+        {
+          conversationId:
+            conversation.id,
+          channelMessageId:
+            "atomic-message",
+          processingToken:
+            append.processingToken ?? "",
+          message: {
+            id: "message-ai-duplicate",
+            conversationId:
+              conversation.id,
+            senderType: "ai",
+            text: "new answer",
+            createdAt:
+              "2027-01-01T00:00:02.000Z",
+          },
+          updatedAt:
+            "2027-01-01T00:00:02.000Z",
+        },
+      ),
+    /already exists/,
+  );
+
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "atomic-message",
+    )?.processingStatus,
+    "processing",
+  );
+}
+
+async function testStaleInboundTokenCannotPersistAiOrHandoff() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    handoffRepository,
+    conversationWorkflowRepository:
+      workflow,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await workflow.appendUserMessage({
+    conversationId:
+      conversation.id,
+    message: {
+      id: "message-user",
+      conversationId:
+        conversation.id,
+      senderType: "user",
+      senderId: "user-1",
+      text: "question",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      channelMessageId:
+        "stale-message",
+    },
+    updatedAt:
+      "2027-01-01T00:00:00.000Z",
+  });
+
+  const staleAi =
+    await workflow.persistAiMessageForInboundIfOwned(
+      {
+        conversationId:
+          conversation.id,
+        channelMessageId:
+          "stale-message",
+        processingToken:
+          "wrong-token",
+        message: {
+          id: "message-ai-stale",
+          conversationId:
+            conversation.id,
+          senderType: "ai",
+          text: "stale answer",
+          createdAt:
+            "2027-01-01T00:00:01.000Z",
+        },
+        updatedAt:
+          "2027-01-01T00:00:01.000Z",
+      },
+    );
+  const staleHandoff =
+    await workflow.requestHumanHandoffForInboundIfOwned(
+      {
+        conversationId:
+          conversation.id,
+        channelMessageId:
+          "stale-message",
+        processingToken:
+          "wrong-token",
+        handoff: {
+          id: "handoff-stale",
+          conversationId:
+            conversation.id,
+          reason:
+            "knowledge_not_found",
+          status: "waiting",
+          requestedAt:
+            "2027-01-01T00:00:02.000Z",
+          requestedBy: "ai",
+        },
+        systemMessage: {
+          id: "message-system-stale",
+          conversationId:
+            conversation.id,
+          senderType: "system",
+          text:
+            "Human handoff requested.",
+          createdAt:
+            "2027-01-01T00:00:02.000Z",
+        },
+        updatedAt:
+          "2027-01-01T00:00:02.000Z",
+      },
+    );
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(
+    staleAi.persisted,
+    false,
+  );
+  assert.equal(
+    staleAi.completed,
+    false,
+  );
+  assert.equal(
+    staleHandoff.created,
+    false,
+  );
+  assert.equal(
+    staleHandoff.completed,
+    false,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "stale-message",
+    )?.processingStatus,
+    "processing",
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    0,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "system",
+    ),
+    0,
+  );
+  assert.equal(
+    await handoffRepository
+      .getActiveHandoff(
+        conversation.id,
+      ),
+    null,
+  );
+}
+
+async function testInboundUnsafeAnswerCompletesReceiptAndRetryDoesNotDuplicateHandoff() {
+  const provider =
+    unsupportedCountingProvider();
+  const {
+    db,
+    service,
+    handoffRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "unknown",
+    channelMessageId:
+      "handoff-message",
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "unknown",
+    channelMessageId:
+      "handoff-message",
+  });
+
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    (
+      await handoffRepository
+        .listWaitingHandoffs()
+    ).length,
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "system",
+    ),
+    1,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "handoff-message",
+    )?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "handoff-message",
+    )?.completionOutcome,
+    "handoff_requested",
+  );
+}
+
+async function testInboundHumanModeReceiptsCompleteWithoutProcessing() {
+  const provider =
+    unsupportedCountingProvider();
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "unknown",
+    channelMessageId:
+      "initial-handoff",
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "waiting note",
+    channelMessageId:
+      "waiting-message",
+  });
+
+  await service.takeOverConversation({
+    conversationId:
+      conversation.id,
+    agentId: "agent-1",
+  });
+  await service.receiveUserMessage({
+    conversationId:
+      conversation.id,
+    text: "human active note",
+    channelMessageId:
+      "active-message",
+  });
+
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "waiting-message",
+    )?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "waiting-message",
+    )?.completionOutcome,
+    "no_ai_processing_waiting_human",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "active-message",
+    )?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "active-message",
+    )?.completionOutcome,
+    "no_ai_processing_human_active",
+  );
+}
+
+async function testInboundLateAiModeChangeCompletesReceiptWithoutAiMessage() {
+  const provider =
+    new DeferredProvider();
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const pending =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "question",
+      channelMessageId:
+        "late-ai-message",
+    });
+
+  for (
+    let attempt = 0;
+    attempt < 10 && provider.calls === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 0),
+    );
+  }
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+
+  provider.resolve({
+    answerable: true,
+    answer:
+      "late answer should be discarded",
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "deferred",
+  });
+
+  const result =
+    await pending;
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(
+    result.outboundMessage,
+    undefined,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    0,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "late-ai-message",
+    )?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "late-ai-message",
+    )?.completionOutcome,
+    "ai_suppressed_mode_changed",
+  );
+}
+
+async function testProcessingReceiptMissingTokenIsInvariantError() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "missing-token-message",
+    text: "same text",
+    processingStatus:
+      "processing",
+    leaseExpiresAt:
+      "2027-01-01T00:02:00.000Z",
+    processingAttempts: 1,
+  });
+
+  await assert.rejects(
+    () =>
+      service.receiveUserMessage({
+        conversationId:
+          conversation.id,
+        text: "same text",
+        channelMessageId:
+          "missing-token-message",
+      }),
+    ConversationInvariantError,
+  );
+}
+
+async function testExpiredProcessingReceiptInWaitingHumanCompletesWithoutProcessing() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await conversationRepository
+    .appendMessage({
+      id: "message-original",
+      conversationId:
+        conversation.id,
+      senderType: "user",
+      senderId: "user-1",
+      text: "same text",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      channelMessageId:
+        "expired-waiting",
+    });
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "expired-waiting",
+    text: "same text",
+    messageId:
+      "message-original",
+    processingStatus:
+      "processing",
+    processingToken:
+      "token-old",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 1,
+  });
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+
+  const result =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "same text",
+      channelMessageId:
+        "expired-waiting",
+    });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+  const receipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "expired-waiting",
+    );
+
+  assert.equal(
+    result.duplicateInbound,
+    true,
+  );
+  assert.equal(provider.calls, 0);
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    receipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    receipt?.completionOutcome,
+    "recovery_no_ai_processing_waiting_human",
+  );
+}
+
+async function testExpiredProcessingReceiptInHumanActiveCompletesWithoutProcessing() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await conversationRepository
+    .appendMessage({
+      id: "message-original",
+      conversationId:
+        conversation.id,
+      senderType: "user",
+      senderId: "user-1",
+      text: "same text",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      channelMessageId:
+        "expired-active",
+    });
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "expired-active",
+    text: "same text",
+    messageId:
+      "message-original",
+    processingStatus:
+      "processing",
+    processingToken:
+      "token-old",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 1,
+  });
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.takeOverConversation({
+    conversationId:
+      conversation.id,
+    agentId: "agent-1",
+  });
+
+  const result =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "same text",
+      channelMessageId:
+        "expired-active",
+    });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+  const receipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "expired-active",
+    );
+
+  assert.equal(
+    result.duplicateInbound,
+    true,
+  );
+  assert.equal(provider.calls, 0);
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    receipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    receipt?.completionOutcome,
+    "recovery_no_ai_processing_human_active",
+  );
+}
+
+async function testExpiredProcessingReceiptInResolvedCompletesWithoutProcessing() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await conversationRepository
+    .appendMessage({
+      id: "message-original",
+      conversationId:
+        conversation.id,
+      senderType: "user",
+      senderId: "user-1",
+      text: "same text",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      channelMessageId:
+        "expired-resolved",
+    });
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "expired-resolved",
+    text: "same text",
+    messageId:
+      "message-original",
+    processingStatus:
+      "processing",
+    processingToken:
+      "token-old",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 1,
+  });
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.resolveConversation({
+    conversationId:
+      conversation.id,
+  });
+
+  const result =
+    await service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "same text",
+      channelMessageId:
+        "expired-resolved",
+    });
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+  const receipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "expired-resolved",
+    );
+
+  assert.equal(
+    result.duplicateInbound,
+    true,
+  );
+  assert.equal(provider.calls, 0);
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    1,
+  );
+  assert.equal(
+    receipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    receipt?.completionOutcome,
+    "recovery_no_ai_processing_resolved",
+  );
+}
+
+async function testNewInboundMessageToResolvedConversationStillRejects() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    service,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.resolveConversation({
+    conversationId:
+      conversation.id,
+  });
+
+  await assert.rejects(
+    () =>
+      service.receiveUserMessage({
+        conversationId:
+          conversation.id,
+        text: "new message",
+        channelMessageId:
+          "new-resolved-message",
+      }),
+    ConversationConflictError,
+  );
+}
+
+async function testInboundUnsafeAnswerResolvedBeforeCompletionSuppressesHandoff() {
+  const provider =
+    new DeferredProvider();
+  const {
+    db,
+    service,
+    handoffRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const pending =
+    service.receiveUserMessage({
+      conversationId:
+        conversation.id,
+      text: "unknown",
+      channelMessageId:
+        "late-unsafe-message",
+    });
+
+  for (
+    let attempt = 0;
+    attempt < 10 && provider.calls === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 0),
+    );
+  }
+
+  await service.requestHumanHandoff({
+    conversationId:
+      conversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.resolveConversation({
+    conversationId:
+      conversation.id,
+  });
+
+  const systemMessagesBefore =
+    countMessagesBySender(
+      await service.listMessages(
+        conversation.id,
+      ),
+      "system",
+    );
+
+  provider.resolve({
+    answerable: false,
+    answer: "",
+    citations: [],
+    provider: "deferred",
+  });
+
+  const result =
+    await pending;
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+  const receipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "late-unsafe-message",
+    );
+
+  assert.equal(
+    result.outboundMessage,
+    undefined,
+  );
+  assert.equal(
+    result.handoff,
+    undefined,
+  );
+  assert.equal(
+    await handoffRepository
+      .getActiveHandoff(
+        conversation.id,
+      ),
+    null,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "system",
+    ),
+    systemMessagesBefore,
+  );
+  assert.equal(
+    receipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    receipt?.completionOutcome,
+    "handoff_suppressed_mode_changed",
+  );
+}
+
 async function testConversationServiceGroundedAnswer() {
   const provider =
     new CountingProvider({
@@ -7629,6 +9082,21 @@ async function main() {
   await testInboundMessageReceiptSameConversationDifferentTextConflicts();
   await testInboundMessageReceiptAbsentChannelMessageIdPreservesRepeatBehavior();
   await testInboundMessageReceiptDuplicateInHumanModesDoesNotMutateState();
+  await testInboundProcessingLeaseStartsAndCompletesAiReply();
+  await testInboundDuplicateBeforeLeaseExpiryIsSuppressedWhileProcessing();
+  await testExpiredInboundLeaseRetryRecoversOriginalMessage();
+  await testLegacyInboundReceiptWithoutStatusIsCompletedDuplicate();
+  await testInboundAtomicAiFailureDoesNotCompleteReceipt();
+  await testStaleInboundTokenCannotPersistAiOrHandoff();
+  await testInboundUnsafeAnswerCompletesReceiptAndRetryDoesNotDuplicateHandoff();
+  await testInboundHumanModeReceiptsCompleteWithoutProcessing();
+  await testInboundLateAiModeChangeCompletesReceiptWithoutAiMessage();
+  await testProcessingReceiptMissingTokenIsInvariantError();
+  await testExpiredProcessingReceiptInWaitingHumanCompletesWithoutProcessing();
+  await testExpiredProcessingReceiptInHumanActiveCompletesWithoutProcessing();
+  await testExpiredProcessingReceiptInResolvedCompletesWithoutProcessing();
+  await testNewInboundMessageToResolvedConversationStillRejects();
+  await testInboundUnsafeAnswerResolvedBeforeCompletionSuppressesHandoff();
   await testConversationServiceGroundedAnswer();
   await testConversationServiceUnsupportedHandoff();
   await testConversationServiceMissingCitationHandoff();

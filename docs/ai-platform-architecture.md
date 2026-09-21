@@ -344,3 +344,17 @@ The public integration endpoint uses `Authorization: Bearer <SHAREPOINT_PUBLISHE
 Production publication state is stored in Firestore collections for AI-platform governance documents, publications, and OpenAI vector-store config. `OPENAI_PUBLIC_VECTOR_STORE_ID` can override vector-store creation and force reuse of a pre-created public vector store.
 
 External AI remains PUBLIC only. Internal AI later may use PUBLIC + INTERNAL knowledge, but Phase E2 does not implement Teams or internal RAG.
+
+## 13. External Channel Response Modes
+
+LINE and Facebook channel accounts have a provider-neutral response mode:
+
+- `off`: do not generate an AI response and do not send automatically.
+- `draft`: AI generation may produce a separately persisted suggested reply, but nothing is sent automatically.
+- `auto`: a grounded, safe AI answer may be eligible for later automatic delivery by a channel adapter.
+
+An external account without configuration resolves to `off`. Response mode is separate from knowledge audience: LINE and Facebook remain restricted to public knowledge in every mode, and `auto` never bypasses grounding policy.
+
+`SuggestedReplyDraft` is a separate domain record, not an outbound `ConversationMessage`. Saving or editing a draft does not append an AI message, change conversation ownership, or imply delivery.
+
+Human read state is also independent. `lastStaffReadAt` changes only through a future explicit staff-read action. AI processing, draft generation, RAG, recovery, and webhook ingestion must never mark a conversation as read by staff.

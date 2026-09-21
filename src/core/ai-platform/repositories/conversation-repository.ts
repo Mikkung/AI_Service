@@ -17,6 +17,7 @@ export interface CreateConversationInput {
   mode: ConversationMode;
   createdAt: string;
   updatedAt: string;
+  lastStaffReadAt?: string;
   metadata?: Record<string, unknown>;
 }
 

@@ -51,6 +51,7 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
   lastMessageAt?: string;
+  lastStaffReadAt?: string;
   metadata?: Record<string, unknown>;
 }
 

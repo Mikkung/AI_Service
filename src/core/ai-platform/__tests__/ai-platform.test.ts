@@ -33,6 +33,14 @@ import {
 } from "../channels/channel-policy";
 
 import {
+  ChannelResponseConfigService,
+} from "../channels/channel-response-config-service";
+
+import {
+  getResponseModeDecision,
+} from "../channels/response-mode-policy";
+
+import {
   computeContentHash,
 } from "../knowledge/content-hash";
 
@@ -103,12 +111,28 @@ import {
 } from "../repositories/firestore/firestore-ai-platform-handoff-repository";
 
 import {
+  FirestoreChannelResponseConfigRepository,
+} from "../repositories/firestore/firestore-channel-response-config-repository";
+
+import {
+  FirestoreSuggestedReplyDraftRepository,
+} from "../repositories/firestore/firestore-suggested-reply-draft-repository";
+
+import {
   InMemoryConversationRepository,
 } from "../repositories/in-memory/in-memory-conversation-repository";
 
 import {
   InMemoryHandoffRepository,
 } from "../repositories/in-memory/in-memory-handoff-repository";
+
+import {
+  InMemoryChannelResponseConfigRepository,
+} from "../repositories/in-memory/in-memory-channel-response-config-repository";
+
+import {
+  InMemorySuggestedReplyDraftRepository,
+} from "../repositories/in-memory/in-memory-suggested-reply-draft-repository";
 
 import {
   InMemoryKnowledgePublicationRepository,
@@ -4916,6 +4940,561 @@ function testConversationTransitions() {
   );
 }
 
+function testResponseModePolicy() {
+  assert.deepEqual(
+    getResponseModeDecision("off"),
+    {
+      generateAi: false,
+      persistAsDraft: false,
+      autoSend: false,
+    },
+  );
+  assert.deepEqual(
+    getResponseModeDecision("draft"),
+    {
+      generateAi: true,
+      persistAsDraft: true,
+      autoSend: false,
+    },
+  );
+  assert.deepEqual(
+    getResponseModeDecision("auto"),
+    {
+      generateAi: true,
+      persistAsDraft: false,
+      autoSend: true,
+    },
+  );
+}
+
+async function testChannelResponseConfigRepositoriesAndResolver() {
+  const memoryRepository =
+    new InMemoryChannelResponseConfigRepository();
+  const service =
+    new ChannelResponseConfigService(
+      memoryRepository,
+      () =>
+        "2027-01-01T00:00:00.000Z",
+    );
+
+  assert.deepEqual(
+    await service.resolveResponseMode(
+      "line",
+      "line-account-1",
+    ),
+    {
+      channel: "line",
+      channelAccountId:
+        "line-account-1",
+      responseMode: "off",
+      configured: false,
+      config: null,
+    },
+  );
+
+  const created =
+    await service.updateResponseMode({
+      channel: "line",
+      channelAccountId:
+        "line-account-1",
+      responseMode: "draft",
+    });
+
+  assert.equal(
+    created.responseMode,
+    "draft",
+  );
+  assert.equal(
+    (
+      await service.resolveResponseMode(
+        "facebook",
+        "line-account-1",
+      )
+    ).responseMode,
+    "off",
+  );
+  assert.equal(
+    (
+      await service.resolveResponseMode(
+        "line",
+        "line-account-2",
+      )
+    ).responseMode,
+    "off",
+  );
+
+  const updated =
+    await memoryRepository.upsertConfig({
+      channel: "line",
+      channelAccountId:
+        "line-account-1",
+      responseMode: "auto",
+      updatedAt:
+        "2027-01-01T00:01:00.000Z",
+    });
+
+  assert.equal(
+    updated.createdAt,
+    created.createdAt,
+  );
+  assert.equal(
+    updated.responseMode,
+    "auto",
+  );
+
+  const db = new FakeFirestore();
+  const firestoreRepository =
+    new FirestoreChannelResponseConfigRepository(
+      db,
+    );
+
+  const firestoreCreated =
+    await firestoreRepository.upsertConfig({
+      channel: "facebook",
+      channelAccountId:
+        "page/account/1",
+      responseMode: "draft",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+
+  const firestoreUpdated =
+    await firestoreRepository.upsertConfig({
+      channel: "facebook",
+      channelAccountId:
+        "page/account/1",
+      responseMode: "auto",
+      updatedAt:
+        "2027-01-01T00:01:00.000Z",
+    });
+
+  assert.equal(
+    (
+      await firestoreRepository.getConfig(
+        "facebook",
+        "page/account/1",
+      )
+    )?.responseMode,
+    "auto",
+  );
+  assert.equal(
+    firestoreUpdated.createdAt,
+    firestoreCreated.createdAt,
+  );
+  assert.equal(
+    await firestoreRepository.getConfig(
+      "line",
+      "page/account/1",
+    ),
+    null,
+  );
+}
+
+async function testSuggestedReplyDraftRepositoriesAndConversationSeparation() {
+  const conversationRepository =
+    new InMemoryConversationRepository();
+  const draftRepository =
+    new InMemorySuggestedReplyDraftRepository();
+
+  const conversation =
+    await conversationRepository
+      .createConversation({
+        id: "draft-conversation",
+        channel: "line",
+        channelAudience:
+          "external",
+        channelUserId:
+          "line-user",
+        mode: "ai_active",
+        createdAt:
+          "2027-01-01T00:00:00.000Z",
+        updatedAt:
+          "2027-01-01T00:00:00.000Z",
+      });
+
+  assert.equal(
+    conversation.lastStaffReadAt,
+    undefined,
+  );
+
+  const first =
+    await draftRepository.saveDraft({
+      conversationId:
+        conversation.id,
+      sourceMessageId:
+        "source-message-1",
+      text: "Suggested answer",
+      status: "ready",
+      createdAt:
+        "2027-01-01T00:00:01.000Z",
+      updatedAt:
+        "2027-01-01T00:00:01.000Z",
+      provider: "mock",
+      citations: [
+        {
+          documentId: "public-doc",
+        },
+      ],
+    });
+  const regenerated =
+    await draftRepository.saveDraft({
+      conversationId:
+        conversation.id,
+      sourceMessageId:
+        "source-message-1",
+      text: "Regenerated answer",
+      status: "ready",
+      createdAt:
+        "2027-01-01T00:00:02.000Z",
+      updatedAt:
+        "2027-01-01T00:00:02.000Z",
+    });
+
+  assert.equal(regenerated.id, first.id);
+  assert.equal(
+    regenerated.createdAt,
+    first.createdAt,
+  );
+  assert.equal(
+    (
+      await draftRepository.getDraft(
+        conversation.id,
+        "source-message-1",
+      )
+    )?.text,
+    "Regenerated answer",
+  );
+
+  const dismissed =
+    await draftRepository.updateDraft({
+      conversationId:
+        conversation.id,
+      sourceMessageId:
+        "source-message-1",
+      text: "Edited by staff",
+      status: "dismissed",
+      updatedAt:
+        "2027-01-01T00:00:03.000Z",
+    });
+
+  assert.equal(
+    dismissed.status,
+    "dismissed",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(conversation.id)
+    ).length,
+    0,
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          conversation.id,
+        )
+    )?.lastStaffReadAt,
+    undefined,
+  );
+
+  const db = new FakeFirestore();
+  const firestoreDraftRepository =
+    new FirestoreSuggestedReplyDraftRepository(
+      db,
+    );
+
+  const persisted =
+    await firestoreDraftRepository.saveDraft({
+      conversationId:
+        "firestore-conversation",
+      sourceMessageId:
+        "firestore-message",
+      text: "Stored draft",
+      status: "ready",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+      metadata: {
+        nested: {
+          omitted: undefined,
+          kept: false,
+        },
+      },
+    });
+
+  assert.equal(
+    (
+      await firestoreDraftRepository.getDraft(
+        "firestore-conversation",
+        "firestore-message",
+      )
+    )?.id,
+    persisted.id,
+  );
+  assert.deepEqual(
+    db.getStoredDocument(
+      "ai_platform_suggested_reply_drafts",
+      persisted.id,
+    )?.metadata,
+    {
+      nested: {
+        kept: false,
+      },
+    },
+  );
+}
+
+async function testConversationStaffReadPersistenceFoundation() {
+  const memoryRepository =
+    new InMemoryConversationRepository();
+  const readAt =
+    "2027-01-01T00:00:05.000Z";
+
+  await memoryRepository.createConversation({
+    id: "read-conversation",
+    channel: "facebook",
+    channelAudience: "external",
+    channelUserId: "facebook-user",
+    mode: "ai_active",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+    updatedAt:
+      "2027-01-01T00:00:00.000Z",
+    lastStaffReadAt: readAt,
+  });
+
+  await memoryRepository.updateConversation({
+    id: "read-conversation",
+    updatedAt:
+      "2027-01-01T00:00:06.000Z",
+    lastMessageAt:
+      "2027-01-01T00:00:06.000Z",
+  });
+
+  assert.equal(
+    (
+      await memoryRepository.getConversation(
+        "read-conversation",
+      )
+    )?.lastStaffReadAt,
+    readAt,
+  );
+
+  const db = new FakeFirestore();
+  const firestoreRepository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+
+  await firestoreRepository.createConversation({
+    id: "legacy-conversation",
+    channel: "line",
+    channelAudience: "external",
+    channelUserId: "legacy-user",
+    mode: "ai_active",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+    updatedAt:
+      "2027-01-01T00:00:00.000Z",
+  });
+  await firestoreRepository.createConversation({
+    id: "read-firestore-conversation",
+    channel: "line",
+    channelAudience: "external",
+    channelUserId: "read-user",
+    mode: "ai_active",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+    updatedAt:
+      "2027-01-01T00:00:00.000Z",
+    lastStaffReadAt: readAt,
+  });
+
+  assert.equal(
+    (
+      await firestoreRepository.getConversation(
+        "legacy-conversation",
+      )
+    )?.lastStaffReadAt,
+    undefined,
+  );
+  assert.equal(
+    (
+      await firestoreRepository.getConversation(
+        "read-firestore-conversation",
+      )
+    )?.lastStaffReadAt,
+    readAt,
+  );
+}
+
+async function testChannelResponseConfigAdminApi() {
+  const route = await import(
+    "@/app/api/admin/channel-response-configs/[channel]/[channelAccountId]/route"
+  );
+  const testApiKey =
+    process.env.APP_API_KEY;
+
+  assert.equal(
+    typeof testApiKey,
+    "string",
+  );
+
+  if (!testApiKey) {
+    throw new Error(
+      "APP_API_KEY must be set for channel response config route test",
+    );
+  }
+
+  const repository =
+    new InMemoryChannelResponseConfigRepository();
+  const service =
+    new ChannelResponseConfigService(
+      repository,
+      () =>
+        "2027-01-01T00:00:00.000Z",
+    );
+  const handlers =
+    route.createChannelResponseConfigRouteHandlers(
+      () => service,
+    );
+  const context = {
+    params: Promise.resolve({
+      channel: "line",
+      channelAccountId:
+        "official-account",
+    }),
+  };
+  const url =
+    "http://localhost/api/admin/channel-response-configs/line/official-account";
+
+  assert.equal(
+    (
+      await handlers.GET(
+        new Request(url),
+        context,
+      )
+    ).status,
+    401,
+  );
+  assert.equal(
+    (
+      await handlers.GET(
+        new Request(url, {
+          headers: {
+            "x-api-key":
+              "wrong-test-key",
+          },
+        }),
+        context,
+      )
+    ).status,
+    401,
+  );
+
+  const missing =
+    await handlers.GET(
+      new Request(url, {
+        headers: {
+          "x-api-key": testApiKey,
+        },
+      }),
+      context,
+    );
+  const missingBody =
+    (await missing.json()) as {
+      responseMode: string;
+      configured: boolean;
+    };
+
+  assert.equal(missing.status, 200);
+  assert.equal(
+    missingBody.responseMode,
+    "off",
+  );
+  assert.equal(
+    missingBody.configured,
+    false,
+  );
+
+  const invalid =
+    await handlers.PUT(
+      new Request(url, {
+        method: "PUT",
+        headers: {
+          "content-type":
+            "application/json",
+          "x-api-key": testApiKey,
+        },
+        body: JSON.stringify({
+          responseMode: "always",
+        }),
+      }),
+      context,
+    );
+
+  assert.equal(invalid.status, 400);
+
+  const invalidChannel =
+    await handlers.GET(
+      new Request(
+        "http://localhost/api/admin/channel-response-configs/web/official-account",
+        {
+          headers: {
+            "x-api-key": testApiKey,
+          },
+        },
+      ),
+      {
+        params: Promise.resolve({
+          channel: "web",
+          channelAccountId:
+            "official-account",
+        }),
+      },
+    );
+
+  assert.equal(
+    invalidChannel.status,
+    400,
+  );
+
+  for (const responseMode of [
+    "draft",
+    "auto",
+    "off",
+  ] as const) {
+    const updated =
+      await handlers.PUT(
+        new Request(url, {
+          method: "PUT",
+          headers: {
+            "content-type":
+              "application/json",
+            "x-api-key": testApiKey,
+          },
+          body: JSON.stringify({
+            responseMode,
+          }),
+        }),
+        context,
+      );
+
+    assert.equal(updated.status, 200);
+    assert.equal(
+      (
+        await service.resolveResponseMode(
+          "line",
+          "official-account",
+        )
+      ).responseMode,
+      responseMode,
+    );
+  }
+}
+
 async function testInMemoryRepositories() {
   const conversationRepository =
     new InMemoryConversationRepository();
@@ -9462,6 +10041,11 @@ async function testConversationServiceGroundedAnswer() {
     "ai_active",
   );
   assert.equal(
+    result.conversation
+      .lastStaffReadAt,
+    undefined,
+  );
+  assert.equal(
     result.outboundMessage?.senderType,
     "ai",
   );
@@ -10285,6 +10869,11 @@ async function main() {
   await testProductionDefaultAvoidsLocalVectorStoreFiles();
   await testOneDriveQueueAdapter();
   testAudiencePolicy();
+  testResponseModePolicy();
+  await testChannelResponseConfigRepositoriesAndResolver();
+  await testSuggestedReplyDraftRepositoriesAndConversationSeparation();
+  await testConversationStaffReadPersistenceFoundation();
+  await testChannelResponseConfigAdminApi();
   testConversationTransitions();
   await testInMemoryRepositories();
   await testFirestoreConversationRepository();

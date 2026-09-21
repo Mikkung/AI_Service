@@ -334,8 +334,14 @@ class FakeFirestoreCollectionReference {
     readonly collectionName: string,
     readonly filters: Array<{
       field: string;
+      operator: "==" | "<=";
       value: unknown;
     }> = [],
+    readonly orderings: Array<{
+      field: string;
+      direction: "asc" | "desc";
+    }> = [],
+    readonly resultLimit?: number,
   ) {}
 
   doc(
@@ -350,11 +356,9 @@ class FakeFirestoreCollectionReference {
 
   where(
     field: string,
-    operator: "==",
+    operator: "==" | "<=",
     value: unknown,
   ): FakeFirestoreCollectionReference {
-    assert.equal(operator, "==");
-
     return new FakeFirestoreCollectionReference(
       this.documents,
       this.collectionName,
@@ -362,23 +366,68 @@ class FakeFirestoreCollectionReference {
         ...this.filters,
         {
           field,
+          operator,
           value,
         },
       ],
+      this.orderings,
+      this.resultLimit,
+    );
+  }
+
+  orderBy(
+    field: string,
+    direction: "asc" | "desc",
+  ): FakeFirestoreCollectionReference {
+    return new FakeFirestoreCollectionReference(
+      this.documents,
+      this.collectionName,
+      this.filters,
+      [
+        ...this.orderings,
+        {
+          field,
+          direction,
+        },
+      ],
+      this.resultLimit,
+    );
+  }
+
+  limit(
+    resultLimit: number,
+  ): FakeFirestoreCollectionReference {
+    return new FakeFirestoreCollectionReference(
+      this.documents,
+      this.collectionName,
+      this.filters,
+      this.orderings,
+      resultLimit,
     );
   }
 
   async get(): Promise<{
     docs: FakeFirestoreDocumentSnapshot[];
   }> {
+    const entries = [
+      ...this.documents.entries(),
+    ]
+      .filter(([, data]) =>
+        this.matchesFilters(data),
+      )
+      .sort((left, right) =>
+        this.compareOrderings(
+          left[1],
+          right[1],
+        ),
+      )
+      .slice(
+        0,
+        this.resultLimit,
+      );
+
     return {
-      docs: [
-        ...this.documents.entries(),
-      ]
-        .filter(([, data]) =>
-          this.matchesFilters(data),
-        )
-        .map(
+      docs: entries.map(
         ([id, data]) =>
           new FakeFirestoreDocumentSnapshot(
             id,
@@ -392,10 +441,55 @@ class FakeFirestoreCollectionReference {
     data: FakeFirestoreData,
   ): boolean {
     return this.filters.every(
-      (filter) =>
-        data[filter.field] ===
-        filter.value,
+      (filter) => {
+        if (
+          filter.operator === "=="
+        ) {
+          return (
+            data[filter.field] ===
+            filter.value
+          );
+        }
+
+        if (
+          filter.operator === "<="
+        ) {
+          return (
+            String(
+              data[filter.field],
+            ) <=
+            String(filter.value)
+          );
+        }
+
+        return false;
+      },
     );
+  }
+
+  private compareOrderings(
+    left: FakeFirestoreData,
+    right: FakeFirestoreData,
+  ): number {
+    for (const ordering of this.orderings) {
+      const leftValue =
+        String(left[ordering.field]);
+      const rightValue =
+        String(right[ordering.field]);
+      const comparison =
+        leftValue.localeCompare(
+          rightValue,
+        );
+
+      if (comparison !== 0) {
+        return ordering.direction ===
+          "asc"
+          ? comparison
+          : -comparison;
+      }
+    }
+
+    return 0;
   }
 }
 
@@ -626,11 +720,48 @@ class FakeFirestoreTransaction {
     const docs = [...collection.entries()]
         .filter(([, data]) =>
           ref.filters.every(
-            (filter) =>
-              data[filter.field] ===
-              filter.value,
+            (filter) => {
+              if (
+                filter.operator ===
+                "=="
+              ) {
+                return (
+                  data[filter.field] ===
+                  filter.value
+                );
+              }
+
+              return (
+                String(
+                  data[filter.field],
+                ) <=
+                String(filter.value)
+              );
+            },
           ),
         )
+        .sort((left, right) => {
+          for (const ordering of ref.orderings) {
+            const comparison =
+              String(
+                left[1][ordering.field],
+              ).localeCompare(
+                String(
+                  right[1][ordering.field],
+                ),
+              );
+
+            if (comparison !== 0) {
+              return ordering.direction ===
+                "asc"
+                ? comparison
+                : -comparison;
+            }
+          }
+
+          return 0;
+        })
+        .slice(0, ref.resultLimit);
     for (const [id] of docs) {
       this.readVersions.set(
         this.documentKey(
@@ -805,6 +936,15 @@ class DeferredProvider
       ) => void)
     | undefined;
 
+  private resolveCalled:
+    | (() => void)
+    | undefined;
+
+  readonly called =
+    new Promise<void>((resolve) => {
+      this.resolveCalled = resolve;
+    });
+
   readonly pending =
     new Promise<GroundedQAResult>(
       (resolve) => {
@@ -816,6 +956,7 @@ class DeferredProvider
     _request: GroundedQARequest,
   ): Promise<GroundedQAResult> {
     this.calls += 1;
+    this.resolveCalled?.();
     return this.pending;
   }
 
@@ -1277,6 +1418,64 @@ async function seedInboundReceipt(
       ),
     )
     .set(receipt);
+}
+
+async function seedRecoverableInbound(
+  input: {
+    db: FakeFirestore;
+    conversationRepository: FirestoreAIPlatformConversationRepository;
+    conversationId: string;
+    channelMessageId: string;
+    text: string;
+    messageId?: string;
+    leaseExpiresAt?: string;
+    processingToken?: string;
+    processingAttempts?: number;
+  },
+): Promise<string> {
+  const messageId =
+    input.messageId ??
+    `message-${input.channelMessageId}`;
+
+  await input.conversationRepository
+    .appendMessage({
+      id: messageId,
+      conversationId:
+        input.conversationId,
+      senderType: "user",
+      senderId: "user-1",
+      text:
+        input.text,
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      channelMessageId:
+        input.channelMessageId,
+    });
+  await seedInboundReceipt(
+    input.db,
+    {
+      conversationId:
+        input.conversationId,
+      channelMessageId:
+        input.channelMessageId,
+      text:
+        input.text,
+      messageId,
+      processingStatus:
+        "processing",
+      processingToken:
+        input.processingToken ??
+        "token-old",
+      leaseExpiresAt:
+        input.leaseExpiresAt ??
+        "2026-12-31T23:59:59.000Z",
+      processingAttempts:
+        input.processingAttempts ??
+        1,
+    },
+  );
+
+  return messageId;
 }
 
 function groundedResult(
@@ -8190,6 +8389,1036 @@ async function testInboundUnsafeAnswerResolvedBeforeCompletionSuppressesHandoff(
   );
 }
 
+async function testInboundRecoveryCandidateDiscovery() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationWorkflowRepository:
+      workflow,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  assert.deepEqual(
+    await workflow.listExpiredInboundProcessingCandidates(
+      {
+        now:
+          "2027-01-01T00:00:00.000Z",
+        limit: 5,
+      },
+    ),
+    [],
+  );
+
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "completed-message",
+    text: "completed",
+    processingStatus:
+      "completed",
+    processingToken: "token",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 1,
+  });
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "unexpired-message",
+    text: "unexpired",
+    processingStatus:
+      "processing",
+    processingToken: "token",
+    leaseExpiresAt:
+      "2027-01-01T00:01:00.000Z",
+    processingAttempts: 1,
+  });
+
+  assert.deepEqual(
+    await workflow.listExpiredInboundProcessingCandidates(
+      {
+        now:
+          "2027-01-01T00:00:00.000Z",
+        limit: 5,
+      },
+    ),
+    [],
+  );
+
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "expired-message",
+    text: "expired",
+    processingStatus:
+      "processing",
+    processingToken: "token",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 1,
+  });
+
+  assert.deepEqual(
+    await workflow.listExpiredInboundProcessingCandidates(
+      {
+        now:
+          "2027-01-01T00:00:00.000Z",
+        limit: 5,
+      },
+    ),
+    [
+      {
+        conversationId:
+          conversation.id,
+        channelMessageId:
+          "expired-message",
+      },
+    ],
+  );
+}
+
+async function testInboundRecoveryClaimReturnsOriginalMessageAndIncrementsAttempts() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+    conversationWorkflowRepository:
+      workflow,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const messageId =
+    await seedRecoverableInbound({
+      db,
+      conversationRepository,
+      conversationId:
+        conversation.id,
+      channelMessageId:
+        "claim-message",
+      text: "claim text",
+      processingAttempts: 3,
+    });
+
+  const claim =
+    await workflow.claimExpiredInboundProcessing(
+      {
+        conversationId:
+          conversation.id,
+        channelMessageId:
+          "claim-message",
+        now:
+          "2027-01-01T00:00:00.000Z",
+      },
+    );
+  const receipt =
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "claim-message",
+    );
+
+  assert.equal(claim.claimed, true);
+  assert.equal(
+    claim.message?.id,
+    messageId,
+  );
+  assert.equal(
+    claim.message?.text,
+    "claim text",
+  );
+  assert.equal(
+    claim.processingToken ===
+      "token-old",
+    false,
+  );
+  assert.equal(
+    receipt?.processingAttempts,
+    4,
+  );
+  assert.equal(
+    receipt?.leaseExpiresAt,
+    "2027-01-01T00:02:00.000Z",
+  );
+}
+
+async function testInboundRecoverySafeAnswerUsesOriginalContextAndNoSecondUserMessage() {
+  const provider =
+    new ScriptedProvider([
+      groundedResult(
+        "recovered answer",
+      ),
+    ]);
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await conversationRepository
+    .appendMessage({
+      id: "message-prior-user",
+      conversationId:
+        conversation.id,
+      senderType: "user",
+      senderId: "user-1",
+      text: "prior question",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  await conversationRepository
+    .appendMessage({
+      id: "message-prior-ai",
+      conversationId:
+        conversation.id,
+      senderType: "ai",
+      text: "prior answer",
+      createdAt:
+        "2027-01-01T00:00:01.000Z",
+    });
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "recover-safe",
+    text: "recover question",
+  });
+
+  const summary =
+    await service.recoverExpiredInboundProcessing();
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(summary.scanned, 1);
+  assert.equal(summary.claimed, 1);
+  assert.equal(summary.processed, 1);
+  assert.equal(summary.aiReplied, 1);
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    provider.requests[0].question,
+    "recover question",
+  );
+  assert.equal(
+    provider.requests[0]
+      .conversationContext?.some(
+        (message) =>
+          message.text ===
+          "recover question",
+      ),
+    false,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "user",
+    ),
+    2,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    2,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "recover-safe",
+    )?.completionOutcome,
+    "ai_replied",
+  );
+}
+
+async function testInboundRecoveryUnsafeAnswerCreatesOneHandoff() {
+  const provider =
+    new ScriptedProvider([
+      unsupportedResult(),
+    ]);
+  const {
+    db,
+    service,
+    conversationRepository,
+    handoffRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "recover-unsafe",
+    text: "unknown",
+  });
+
+  const summary =
+    await service.recoverExpiredInboundProcessing();
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(summary.claimed, 1);
+  assert.equal(
+    summary.handoffRequested,
+    1,
+  );
+  assert.equal(provider.calls, 1);
+  assert.equal(
+    (
+      await handoffRepository
+        .listWaitingHandoffs()
+    ).length,
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "system",
+    ),
+    1,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      conversation.id,
+      "recover-unsafe",
+    )?.completionOutcome,
+    "handoff_requested",
+  );
+}
+
+async function testInboundRecoveryConcurrentSweepersOnlyOneProcesses() {
+  const provider =
+    new DeferredProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "concurrent-recovery",
+    text: "recover question",
+  });
+
+  const first =
+    service.recoverExpiredInboundProcessing();
+  const second =
+    service.recoverExpiredInboundProcessing();
+
+  await provider.called;
+
+  assert.equal(provider.calls, 1);
+
+  provider.resolve({
+    answerable: true,
+    answer: "recovered",
+    citations: [
+      {
+        documentId: "doc-1",
+      },
+    ],
+    provider: "deferred",
+  });
+
+  const summaries =
+    await Promise.all([
+      first,
+      second,
+    ]);
+  const messages =
+    await service.listMessages(
+      conversation.id,
+    );
+
+  assert.equal(
+    summaries.reduce(
+      (sum, summary) =>
+        sum + summary.claimed,
+      0,
+    ),
+    1,
+  );
+  assert.equal(
+    summaries.reduce(
+      (sum, summary) =>
+        sum + summary.skippedRace,
+      0,
+    ),
+    1,
+  );
+  assert.equal(
+    countMessagesBySender(
+      messages,
+      "ai",
+    ),
+    1,
+  );
+}
+
+async function testInboundRecoveryClaimRaceSkipsRenewedOrCompletedReceipt() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+    conversationWorkflowRepository:
+      workflow,
+  } = createAtomicTestService(provider);
+  const renewedConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const completedConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-2",
+    });
+
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      renewedConversation.id,
+    channelMessageId:
+      "renewed-race",
+    text: "renewed",
+  });
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      completedConversation.id,
+    channelMessageId:
+      "completed-race",
+    text: "completed",
+  });
+  await seedInboundReceipt(db, {
+    conversationId:
+      renewedConversation.id,
+    channelMessageId:
+      "renewed-race",
+    text: "renewed",
+    messageId:
+      "message-renewed-race",
+    processingStatus:
+      "processing",
+    processingToken:
+      "token-new",
+    leaseExpiresAt:
+      "2027-01-01T00:10:00.000Z",
+    processingAttempts: 2,
+  });
+  await seedInboundReceipt(db, {
+    conversationId:
+      completedConversation.id,
+    channelMessageId:
+      "completed-race",
+    text: "completed",
+    messageId:
+      "message-completed-race",
+    processingStatus:
+      "completed",
+    processingToken:
+      "token-complete",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 2,
+  });
+
+  assert.deepEqual(
+    await workflow.claimExpiredInboundProcessing(
+      {
+        conversationId:
+          renewedConversation.id,
+        channelMessageId:
+          "renewed-race",
+        now:
+          "2027-01-01T00:00:00.000Z",
+      },
+    ),
+    {
+      claimed: false,
+      completed: false,
+    },
+  );
+  assert.deepEqual(
+    await workflow.claimExpiredInboundProcessing(
+      {
+        conversationId:
+          completedConversation.id,
+        channelMessageId:
+          "completed-race",
+        now:
+          "2027-01-01T00:00:00.000Z",
+      },
+    ),
+    {
+      claimed: false,
+      completed: false,
+    },
+  );
+  assert.equal(provider.calls, 0);
+}
+
+async function testInboundRecoveryStaleOriginalWorkerCannotCommitAfterClaim() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+    conversationWorkflowRepository:
+      workflow,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      conversation.id,
+    channelMessageId:
+      "stale-after-claim",
+    text: "question",
+    processingToken:
+      "token-stale",
+  });
+
+  const claim =
+    await workflow.claimExpiredInboundProcessing(
+      {
+        conversationId:
+          conversation.id,
+        channelMessageId:
+          "stale-after-claim",
+        now:
+          "2027-01-01T00:00:00.000Z",
+      },
+    );
+  const stale =
+    await workflow.persistAiMessageForInboundIfOwned(
+      {
+        conversationId:
+          conversation.id,
+        channelMessageId:
+          "stale-after-claim",
+        processingToken:
+          "token-stale",
+        message: {
+          id: "message-stale-ai",
+          conversationId:
+            conversation.id,
+          senderType: "ai",
+          text: "stale",
+          createdAt:
+            "2027-01-01T00:00:01.000Z",
+        },
+        updatedAt:
+          "2027-01-01T00:00:01.000Z",
+      },
+    );
+
+  assert.equal(claim.claimed, true);
+  assert.equal(
+    stale.persisted,
+    false,
+  );
+  assert.equal(
+    stale.completed,
+    false,
+  );
+  assert.equal(
+    countMessagesBySender(
+      await service.listMessages(
+        conversation.id,
+      ),
+      "ai",
+    ),
+    0,
+  );
+}
+
+async function testInboundRecoveryCompletesNonAiModesWithoutProviderCall() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const waitingConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "waiting-user",
+    });
+  const activeConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "active-user",
+    });
+  const resolvedConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId:
+        "resolved-user",
+    });
+
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      waitingConversation.id,
+    channelMessageId:
+      "recover-waiting",
+    text: "waiting",
+  });
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      activeConversation.id,
+    channelMessageId:
+      "recover-active",
+    text: "active",
+  });
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      resolvedConversation.id,
+    channelMessageId:
+      "recover-resolved",
+    text: "resolved",
+  });
+
+  await service.requestHumanHandoff({
+    conversationId:
+      waitingConversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.requestHumanHandoff({
+    conversationId:
+      activeConversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.takeOverConversation({
+    conversationId:
+      activeConversation.id,
+    agentId: "agent-1",
+  });
+  await service.requestHumanHandoff({
+    conversationId:
+      resolvedConversation.id,
+    requestedBy: "user",
+    reason:
+      "user_requested_human",
+  });
+  await service.resolveConversation({
+    conversationId:
+      resolvedConversation.id,
+  });
+
+  const summary =
+    await service.recoverExpiredInboundProcessing(
+      {
+        limit: 3,
+      },
+    );
+
+  assert.equal(provider.calls, 0);
+  assert.equal(
+    summary.completedWithoutProcessing,
+    3,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      waitingConversation.id,
+      "recover-waiting",
+    )?.completionOutcome,
+    "recovery_no_ai_processing_waiting_human",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      activeConversation.id,
+      "recover-active",
+    )?.completionOutcome,
+    "recovery_no_ai_processing_human_active",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      resolvedConversation.id,
+      "recover-resolved",
+    )?.completionOutcome,
+    "recovery_no_ai_processing_resolved",
+  );
+}
+
+async function testInboundRecoveryOriginalMessageInvariants() {
+  const provider =
+    groundedCountingProvider();
+
+  async function setup(
+    channelMessageId: string,
+  ) {
+    const {
+      db,
+      service,
+      conversationRepository,
+      conversationWorkflowRepository:
+        workflow,
+    } = createAtomicTestService(provider);
+    const conversation =
+      await service.createConversation({
+        channel: "web",
+        channelUserId: "user-1",
+      });
+
+    await seedRecoverableInbound({
+      db,
+      conversationRepository,
+      conversationId:
+        conversation.id,
+      channelMessageId,
+      text: "original",
+    });
+
+    return {
+      db,
+      conversation,
+      workflow,
+    };
+  }
+
+  {
+    const {
+      db,
+      conversation,
+      workflow,
+    } = await setup("missing-original");
+
+    await db
+      .collection(
+        "ai_platform_inbound_message_receipts",
+      )
+      .doc(
+        inboundReceiptId(
+          conversation.id,
+          "missing-original",
+        ),
+      )
+      .set({
+        ...(getInboundReceipt(
+          db,
+          conversation.id,
+          "missing-original",
+        ) ?? {}),
+        messageId:
+          "message-missing",
+      });
+
+    await assert.rejects(
+      () =>
+        workflow.claimExpiredInboundProcessing(
+          {
+            conversationId:
+              conversation.id,
+            channelMessageId:
+              "missing-original",
+            now:
+              "2027-01-01T00:00:00.000Z",
+          },
+        ),
+      ConversationInvariantError,
+    );
+  }
+
+  for (const [
+    channelMessageId,
+    mutation,
+  ] of [
+    [
+      "wrong-conversation",
+      {
+        conversationId:
+          "conversation-other",
+      },
+    ],
+    [
+      "wrong-channel",
+      {
+        channelMessageId:
+          "other-channel",
+      },
+    ],
+    [
+      "wrong-text",
+      {
+        text: "changed",
+      },
+    ],
+  ] as const) {
+    const {
+      db,
+      conversation,
+      workflow,
+    } = await setup(channelMessageId);
+
+    await db
+      .collection(
+        "ai_platform_conversation_messages",
+      )
+      .doc(
+        `message-${channelMessageId}`,
+      )
+      .set({
+        id:
+          `message-${channelMessageId}`,
+        conversationId:
+          conversation.id,
+        senderType: "user",
+        senderId: "user-1",
+        text: "original",
+        createdAt:
+          "2027-01-01T00:00:00.000Z",
+        channelMessageId,
+        ...mutation,
+      });
+
+    await assert.rejects(
+      () =>
+        workflow.claimExpiredInboundProcessing(
+          {
+            conversationId:
+              conversation.id,
+            channelMessageId,
+            now:
+              "2027-01-01T00:00:00.000Z",
+          },
+        ),
+      ConversationInvariantError,
+    );
+  }
+}
+
+async function testInboundRecoveryProviderFailureIsolation() {
+  const provider =
+    new ScriptedProvider([
+      new Error("provider down"),
+      groundedResult(
+        "second recovered",
+      ),
+    ]);
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const firstConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-1",
+    });
+  const secondConversation =
+    await service.createConversation({
+      channel: "web",
+      channelUserId: "user-2",
+    });
+
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      firstConversation.id,
+    channelMessageId:
+      "failure-first",
+    text: "first",
+    leaseExpiresAt:
+      "2026-12-31T23:59:58.000Z",
+  });
+  await seedRecoverableInbound({
+    db,
+    conversationRepository,
+    conversationId:
+      secondConversation.id,
+    channelMessageId:
+      "failure-second",
+    text: "second",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+  });
+
+  const summary =
+    await service.recoverExpiredInboundProcessing(
+      {
+        limit: 2,
+      },
+    );
+
+  assert.equal(summary.scanned, 2);
+  assert.equal(summary.claimed, 2);
+  assert.equal(summary.processed, 1);
+  assert.equal(summary.failed, 1);
+  assert.equal(provider.calls, 2);
+  assert.equal(
+    getInboundReceipt(
+      db,
+      firstConversation.id,
+      "failure-first",
+    )?.processingStatus,
+    "processing",
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      firstConversation.id,
+      "failure-first",
+    )?.processingAttempts,
+    2,
+  );
+  assert.equal(
+    getInboundReceipt(
+      db,
+      secondConversation.id,
+      "failure-second",
+    )?.processingStatus,
+    "completed",
+  );
+}
+
+async function testConversationRecoveryEndpointAuthAndLimitValidation() {
+  const route =
+    await import(
+      "@/app/api/admin/experiments/conversations/recovery/route"
+    );
+
+  const unauthorized =
+    await route.POST(
+      new Request(
+        "http://localhost/api/admin/experiments/conversations/recovery",
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+        },
+      ),
+    );
+
+  assert.equal(
+    unauthorized.status,
+    401,
+  );
+
+  const testApiKey =
+    process.env.APP_API_KEY;
+  assert.equal(
+    typeof testApiKey,
+    "string",
+  );
+
+  if (!testApiKey) {
+    throw new Error(
+      "APP_API_KEY must be set for recovery route test",
+    );
+  }
+
+  const wrongKey =
+    await route.POST(
+      new Request(
+        "http://localhost/api/admin/experiments/conversations/recovery",
+        {
+          method: "POST",
+          headers: {
+            "x-api-key":
+              "wrong-test-key",
+          },
+          body: JSON.stringify({}),
+        },
+      ),
+    );
+
+  assert.equal(
+    wrongKey.status,
+    401,
+  );
+
+  const invalid =
+    await route.POST(
+      new Request(
+        "http://localhost/api/admin/experiments/conversations/recovery",
+        {
+          method: "POST",
+          headers: {
+            "x-api-key": testApiKey,
+          },
+          body: JSON.stringify({
+            limit: 21,
+          }),
+        },
+      ),
+    );
+
+  assert.equal(invalid.status, 400);
+  assert.match(
+    JSON.stringify(
+      await invalid.json(),
+    ),
+    /limit/,
+  );
+}
+
 async function testConversationServiceGroundedAnswer() {
   const provider =
     new CountingProvider({
@@ -9097,6 +10326,17 @@ async function main() {
   await testExpiredProcessingReceiptInResolvedCompletesWithoutProcessing();
   await testNewInboundMessageToResolvedConversationStillRejects();
   await testInboundUnsafeAnswerResolvedBeforeCompletionSuppressesHandoff();
+  await testInboundRecoveryCandidateDiscovery();
+  await testInboundRecoveryClaimReturnsOriginalMessageAndIncrementsAttempts();
+  await testInboundRecoverySafeAnswerUsesOriginalContextAndNoSecondUserMessage();
+  await testInboundRecoveryUnsafeAnswerCreatesOneHandoff();
+  await testInboundRecoveryConcurrentSweepersOnlyOneProcesses();
+  await testInboundRecoveryClaimRaceSkipsRenewedOrCompletedReceipt();
+  await testInboundRecoveryStaleOriginalWorkerCannotCommitAfterClaim();
+  await testInboundRecoveryCompletesNonAiModesWithoutProviderCall();
+  await testInboundRecoveryOriginalMessageInvariants();
+  await testInboundRecoveryProviderFailureIsolation();
+  await testConversationRecoveryEndpointAuthAndLimitValidation();
   await testConversationServiceGroundedAnswer();
   await testConversationServiceUnsupportedHandoff();
   await testConversationServiceMissingCitationHandoff();

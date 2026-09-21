@@ -119,6 +119,21 @@ export interface ConversationServiceResult {
   recoveredInbound?: boolean;
 }
 
+export interface RecoverExpiredInboundInput {
+  limit?: number;
+}
+
+export interface RecoverExpiredInboundSummary {
+  scanned: number;
+  claimed: number;
+  processed: number;
+  aiReplied: number;
+  handoffRequested: number;
+  completedWithoutProcessing: number;
+  skippedRace: number;
+  failed: number;
+}
+
 export class SequentialIdGenerator
   implements IdGenerator
 {
@@ -307,239 +322,142 @@ export class ConversationService {
       };
     }
 
-    const policy =
-      getChannelPolicy(
-        conversation.channel,
-      );
-    const conversationContext =
-      await this.buildConversationContext(
-        conversation.id,
-        appendResult.messageId,
-      );
-
-    const answer =
-      await this.dependencies
-        .answerService
-        .answer({
-          question:
-            input.text,
-          audience:
-            policy.allowedKnowledgeAudience,
-          conversationContext,
-        });
-
-    if (answer.safeToSend) {
-      const aiMessage: ConversationMessage = {
+    return this.processOwnedInbound({
+      conversation,
+      message: {
+        ...userMessage,
         id:
-          this.idGenerator.nextId(
-            "message",
-          ),
-        conversationId:
-          conversation.id,
-        senderType: "ai",
-        text:
-          answer.answer,
-        createdAt:
-          this.now(),
-        citations:
-          answer.citations,
-        metadata: {
-          provider:
-            answer.provider,
-          groundingReason:
-            answer.groundingReason,
-        },
-      };
+          appendResult.messageId,
+      },
+      channelMessageId:
+        input.channelMessageId,
+      processingToken:
+        appendResult.processingToken,
+      recoveredInbound:
+        appendResult.recovered,
+    });
+  }
 
-      const result =
-        this.dependencies
-          .conversationWorkflowRepository
-          ? input.channelMessageId &&
-            appendResult.processingToken
-            ? await this.dependencies
-                .conversationWorkflowRepository
-                .persistAiMessageForInboundIfOwned(
-                  {
-                    conversationId:
-                      conversation.id,
-                    channelMessageId:
-                      input.channelMessageId,
-                    processingToken:
-                      appendResult.processingToken,
-                    message:
-                      aiMessage,
-                    updatedAt:
-                      aiMessage.createdAt,
-                  },
-                )
-            : await this.dependencies
-                .conversationWorkflowRepository
-                .persistAiMessageIfActive({
-                  conversationId:
-                    conversation.id,
-                  message:
-                    aiMessage,
-                  updatedAt:
-                    aiMessage.createdAt,
-                })
-          : {
-              conversation:
-                await this.persistAiMessageWithoutWorkflow(
-                  aiMessage,
-                ),
-              persisted: true,
-            };
+  async recoverExpiredInboundProcessing(
+    input: RecoverExpiredInboundInput = {},
+  ): Promise<RecoverExpiredInboundSummary> {
+    const workflow =
+      this.dependencies
+        .conversationWorkflowRepository;
 
-      if (!result.persisted) {
-        return {
-          conversation:
-            result.conversation,
-          events: [],
-          recoveredInbound:
-            appendResult.recovered
-              ? true
-              : undefined,
-        };
-      }
-
+    if (!workflow) {
       return {
-        conversation:
-          result.conversation,
-        outboundMessage: {
-          text:
-            aiMessage.text,
-          senderType: "ai",
-          citations:
-            aiMessage.citations,
-        },
-        events: [],
-        recoveredInbound:
-          appendResult.recovered
-            ? true
-            : undefined,
+        scanned: 0,
+        claimed: 0,
+        processed: 0,
+        aiReplied: 0,
+        handoffRequested: 0,
+        completedWithoutProcessing: 0,
+        skippedRace: 0,
+        failed: 0,
       };
     }
 
-    if (
-      this.dependencies
-        .conversationWorkflowRepository &&
-      input.channelMessageId &&
-      appendResult.processingToken
-    ) {
-      const handoffTimestamp =
-        this.now();
-      const handoff: HumanHandoff = {
-        id:
-          this.idGenerator.nextId(
-            "handoff",
-          ),
-        conversationId:
-          conversation.id,
-        reason:
-          mapGroundingReasonToHandoffReason(
-            answer.groundingReason,
-          ),
-        status: "waiting",
-        requestedAt:
-          handoffTimestamp,
-        requestedBy: "ai",
-        metadata: {
-          groundingReason:
-            answer.groundingReason,
-        },
-      };
-      const systemMessage: ConversationMessage =
-        {
-          id:
-            this.idGenerator.nextId(
-              "message",
-            ),
-          conversationId:
-            conversation.id,
-          senderType: "system",
-          text:
-            "Human handoff requested.",
-          createdAt:
-            handoffTimestamp,
-          metadata: {
-            handoffId:
-              handoff.id,
-            reason:
-              handoff.reason,
+    const limit =
+      Math.min(
+        20,
+        Math.max(
+          1,
+          input.limit ?? 5,
+        ),
+      );
+    const now =
+      this.now();
+    const candidates =
+      await workflow
+        .listExpiredInboundProcessingCandidates(
+          {
+            now,
+            limit,
           },
-        };
-      const result =
-        await this.dependencies
-          .conversationWorkflowRepository
-          .requestHumanHandoffForInboundIfOwned(
+        );
+    const summary: RecoverExpiredInboundSummary =
+      {
+        scanned:
+          candidates.length,
+        claimed: 0,
+        processed: 0,
+        aiReplied: 0,
+        handoffRequested: 0,
+        completedWithoutProcessing: 0,
+        skippedRace: 0,
+        failed: 0,
+      };
+
+    for (const candidate of candidates) {
+      try {
+        const claim =
+          await workflow
+            .claimExpiredInboundProcessing(
+              {
+                conversationId:
+                  candidate.conversationId,
+                channelMessageId:
+                  candidate.channelMessageId,
+                now: this.now(),
+              },
+            );
+
+        if (claim.completed) {
+          summary.completedWithoutProcessing +=
+            1;
+          continue;
+        }
+
+        if (
+          !claim.claimed ||
+          !claim.conversation ||
+          !claim.message ||
+          !claim.channelMessageId ||
+          !claim.processingToken
+        ) {
+          summary.skippedRace +=
+            1;
+          continue;
+        }
+
+        summary.claimed += 1;
+
+        const result =
+          await this.processOwnedInbound(
             {
-              conversationId:
-                conversation.id,
+              conversation:
+                claim.conversation,
+              message:
+                claim.message,
               channelMessageId:
-                input.channelMessageId,
+                claim.channelMessageId,
               processingToken:
-                appendResult.processingToken,
-              handoff,
-              systemMessage,
-              updatedAt:
-                handoffTimestamp,
+                claim.processingToken,
+              recoveredInbound:
+                true,
             },
           );
 
-      return {
-        conversation:
-          result.conversation,
-        handoff:
-          result.handoff,
-        outboundMessage:
-          result.created
-            ? {
-                text:
-                  systemMessage.text,
-                senderType:
-                  "system",
-              }
-            : undefined,
-        events:
-          result.created &&
-          result.handoff
-            ? [
-                {
-                  type:
-                    "conversation.handoff_requested",
-                  conversationId:
-                    result.conversation
-                      .id,
-                  handoffId:
-                    result.handoff.id,
-                  reason:
-                    result.handoff
-                      .reason,
-                  occurredAt:
-                    handoffTimestamp,
-                },
-              ]
-            : [],
-        recoveredInbound:
-          appendResult.recovered
-            ? true
-            : undefined,
-      };
+        summary.processed += 1;
+
+        if (
+          result.outboundMessage
+            ?.senderType === "ai"
+        ) {
+          summary.aiReplied += 1;
+        }
+
+        if (result.handoff) {
+          summary.handoffRequested +=
+            1;
+        }
+      } catch {
+        summary.failed += 1;
+      }
     }
 
-    return this.requestHumanHandoff({
-      conversationId:
-        conversation.id,
-      requestedBy: "ai",
-      reason:
-        mapGroundingReasonToHandoffReason(
-          answer.groundingReason,
-        ),
-      metadata: {
-        groundingReason:
-          answer.groundingReason,
-      },
-    });
+    return summary;
   }
 
   async requestHumanHandoff(
@@ -1179,6 +1097,273 @@ export class ConversationService {
       conversation:
         updated,
       events: [],
+    };
+  }
+
+  private async processOwnedInbound(
+    input: {
+      conversation: Conversation;
+      message: ConversationMessage;
+      channelMessageId?: string;
+      processingToken?: string;
+      recoveredInbound?: boolean;
+    },
+  ): Promise<ConversationServiceResult> {
+    const {
+      conversation,
+      message,
+    } = input;
+
+    if (conversation.mode !== "ai_active") {
+      return {
+        conversation,
+        events: [],
+        recoveredInbound:
+          input.recoveredInbound
+            ? true
+            : undefined,
+      };
+    }
+
+    const policy =
+      getChannelPolicy(
+        conversation.channel,
+      );
+    const conversationContext =
+      await this.buildConversationContext(
+        conversation.id,
+        message.id,
+      );
+    const answer =
+      await this.dependencies
+        .answerService
+        .answer({
+          question:
+            message.text,
+          audience:
+            policy.allowedKnowledgeAudience,
+          conversationContext,
+        });
+
+    if (answer.safeToSend) {
+      const aiMessage: ConversationMessage = {
+        id:
+          this.idGenerator.nextId(
+            "message",
+          ),
+        conversationId:
+          conversation.id,
+        senderType: "ai",
+        text:
+          answer.answer,
+        createdAt:
+          this.now(),
+        citations:
+          answer.citations,
+        metadata: {
+          provider:
+            answer.provider,
+          groundingReason:
+            answer.groundingReason,
+        },
+      };
+      const result =
+        this.dependencies
+          .conversationWorkflowRepository
+          ? input.channelMessageId &&
+            input.processingToken
+            ? await this.dependencies
+                .conversationWorkflowRepository
+                .persistAiMessageForInboundIfOwned(
+                  {
+                    conversationId:
+                      conversation.id,
+                    channelMessageId:
+                      input.channelMessageId,
+                    processingToken:
+                      input.processingToken,
+                    message:
+                      aiMessage,
+                    updatedAt:
+                      aiMessage.createdAt,
+                  },
+                )
+            : await this.dependencies
+                .conversationWorkflowRepository
+                .persistAiMessageIfActive({
+                  conversationId:
+                    conversation.id,
+                  message:
+                    aiMessage,
+                  updatedAt:
+                    aiMessage.createdAt,
+                })
+          : {
+              conversation:
+                await this.persistAiMessageWithoutWorkflow(
+                  aiMessage,
+                ),
+              persisted: true,
+            };
+
+      if (!result.persisted) {
+        return {
+          conversation:
+            result.conversation,
+          events: [],
+          recoveredInbound:
+            input.recoveredInbound
+              ? true
+              : undefined,
+        };
+      }
+
+      return {
+        conversation:
+          result.conversation,
+        outboundMessage: {
+          text:
+            aiMessage.text,
+          senderType: "ai",
+          citations:
+            aiMessage.citations,
+        },
+        events: [],
+        recoveredInbound:
+          input.recoveredInbound
+            ? true
+            : undefined,
+      };
+    }
+
+    if (
+      this.dependencies
+        .conversationWorkflowRepository &&
+      input.channelMessageId &&
+      input.processingToken
+    ) {
+      const handoffTimestamp =
+        this.now();
+      const handoff: HumanHandoff = {
+        id:
+          this.idGenerator.nextId(
+            "handoff",
+          ),
+        conversationId:
+          conversation.id,
+        reason:
+          mapGroundingReasonToHandoffReason(
+            answer.groundingReason,
+          ),
+        status: "waiting",
+        requestedAt:
+          handoffTimestamp,
+        requestedBy: "ai",
+        metadata: {
+          groundingReason:
+            answer.groundingReason,
+        },
+      };
+      const systemMessage: ConversationMessage =
+        {
+          id:
+            this.idGenerator.nextId(
+              "message",
+            ),
+          conversationId:
+            conversation.id,
+          senderType: "system",
+          text:
+            "Human handoff requested.",
+          createdAt:
+            handoffTimestamp,
+          metadata: {
+            handoffId:
+              handoff.id,
+            reason:
+              handoff.reason,
+          },
+        };
+      const result =
+        await this.dependencies
+          .conversationWorkflowRepository
+          .requestHumanHandoffForInboundIfOwned(
+            {
+              conversationId:
+                conversation.id,
+              channelMessageId:
+                input.channelMessageId,
+              processingToken:
+                input.processingToken,
+              handoff,
+              systemMessage,
+              updatedAt:
+                handoffTimestamp,
+            },
+          );
+
+      return {
+        conversation:
+          result.conversation,
+        handoff:
+          result.handoff,
+        outboundMessage:
+          result.created
+            ? {
+                text:
+                  systemMessage.text,
+                senderType:
+                  "system",
+              }
+            : undefined,
+        events:
+          result.created &&
+          result.handoff
+            ? [
+                {
+                  type:
+                    "conversation.handoff_requested",
+                  conversationId:
+                    result.conversation
+                      .id,
+                  handoffId:
+                    result.handoff.id,
+                  reason:
+                    result.handoff
+                      .reason,
+                  occurredAt:
+                    handoffTimestamp,
+                },
+              ]
+            : [],
+        recoveredInbound:
+          input.recoveredInbound
+            ? true
+            : undefined,
+      };
+    }
+
+    const fallback =
+      await this.requestHumanHandoff({
+        conversationId:
+          conversation.id,
+        requestedBy: "ai",
+        reason:
+          mapGroundingReasonToHandoffReason(
+            answer.groundingReason,
+          ),
+        metadata: {
+          groundingReason:
+            answer.groundingReason,
+        },
+      });
+
+    return {
+      ...fallback,
+      recoveredInbound:
+        input.recoveredInbound
+          ? true
+          : fallback.recoveredInbound,
     };
   }
 

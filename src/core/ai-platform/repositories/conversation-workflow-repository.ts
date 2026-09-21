@@ -35,6 +35,32 @@ export interface AppendUserMessageWorkflowResult {
   recovered?: boolean;
 }
 
+export interface ListExpiredInboundProcessingCandidatesInput {
+  now: string;
+  limit: number;
+}
+
+export interface ExpiredInboundProcessingCandidate {
+  conversationId: string;
+  channelMessageId: string;
+}
+
+export interface ClaimExpiredInboundProcessingInput {
+  conversationId: string;
+  channelMessageId: string;
+  now: string;
+}
+
+export interface ClaimExpiredInboundProcessingResult {
+  claimed: boolean;
+  completed: boolean;
+  conversation?: Conversation;
+  message?: ConversationMessage;
+  channelMessageId?: string;
+  processingToken?: string;
+  completionOutcome?: string;
+}
+
 export interface PersistAiMessageIfActiveInput {
   conversationId: string;
   message: ConversationMessage;
@@ -121,6 +147,14 @@ export interface ConversationWorkflowRepository {
   appendUserMessage(
     input: AppendUserMessageInput,
   ): Promise<AppendUserMessageWorkflowResult>;
+
+  listExpiredInboundProcessingCandidates(
+    input: ListExpiredInboundProcessingCandidatesInput,
+  ): Promise<ExpiredInboundProcessingCandidate[]>;
+
+  claimExpiredInboundProcessing(
+    input: ClaimExpiredInboundProcessingInput,
+  ): Promise<ClaimExpiredInboundProcessingResult>;
 
   persistAiMessageIfActive(
     input: PersistAiMessageIfActiveInput,

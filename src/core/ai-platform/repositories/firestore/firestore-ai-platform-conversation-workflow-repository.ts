@@ -12,9 +12,13 @@ import {
   ConversationInvariantError,
   type AppendUserMessageWorkflowResult,
   type AppendUserMessageInput,
+  type ClaimExpiredInboundProcessingInput,
+  type ClaimExpiredInboundProcessingResult,
   type ConditionalMessageWorkflowResult,
   type ConversationWorkflowRepository,
+  type ExpiredInboundProcessingCandidate,
   type InboundProcessingOwnershipInput,
+  type ListExpiredInboundProcessingCandidatesInput,
   type PersistAiMessageForInboundIfOwnedInput,
   type PersistAiMessageForInboundIfOwnedResult,
   type PersistAiMessageIfActiveInput,
@@ -90,10 +94,18 @@ interface FirestoreDocumentReference {
 }
 
 interface FirestoreQueryReference {
+  get(): Promise<FirestoreCollectionSnapshot>;
   where(
     field: string,
-    operator: "==",
+    operator: "==" | "<=",
     value: unknown,
+  ): FirestoreQueryReference;
+  orderBy(
+    field: string,
+    direction: "asc" | "desc",
+  ): FirestoreQueryReference;
+  limit(
+    limit: number,
   ): FirestoreQueryReference;
 }
 
@@ -268,6 +280,18 @@ function mapConversationSnapshot(
     id: snapshot.id,
     ...(snapshot.data() as Omit<
       Conversation,
+      "id"
+    >),
+  });
+}
+
+function mapMessageSnapshot(
+  snapshot: FirestoreDocumentSnapshot,
+): ConversationMessage {
+  return cloneMessage({
+    id: snapshot.id,
+    ...(snapshot.data() as Omit<
+      ConversationMessage,
       "id"
     >),
   });
@@ -601,6 +625,217 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           shouldProcess: true,
           messageId:
             input.message.id,
+        };
+      },
+    );
+  }
+
+  async listExpiredInboundProcessingCandidates(
+    input: ListExpiredInboundProcessingCandidatesInput,
+  ): Promise<ExpiredInboundProcessingCandidate[]> {
+    const snapshot =
+      assertCollectionSnapshot(
+        await this.db
+          .collection(
+            INBOUND_RECEIPTS_COLLECTION,
+          )
+          .where(
+            "processingStatus",
+            "==",
+            "processing",
+          )
+          .where(
+            "leaseExpiresAt",
+            "<=",
+            input.now,
+          )
+          .orderBy(
+            "leaseExpiresAt",
+            "asc",
+          )
+          .limit(input.limit)
+          .get(),
+      );
+
+    return snapshot.docs.map((doc) => {
+      const receipt =
+        mapInboundReceiptSnapshot(doc);
+
+      return {
+        conversationId:
+          receipt.conversationId,
+        channelMessageId:
+          receipt.channelMessageId,
+      };
+    });
+  }
+
+  async claimExpiredInboundProcessing(
+    input: ClaimExpiredInboundProcessingInput,
+  ): Promise<ClaimExpiredInboundProcessingResult> {
+    return this.db.runTransaction(
+      async (transaction) => {
+        const receiptRef =
+          this.inboundReceiptRef(
+            getInboundReceiptId(
+              input.conversationId,
+              input.channelMessageId,
+            ),
+          );
+        const receiptSnapshot =
+          assertDocumentSnapshot(
+            await transaction.get(
+              receiptRef,
+            ),
+          );
+
+        if (!receiptSnapshot.exists) {
+          return {
+            claimed: false,
+            completed: false,
+          };
+        }
+
+        const receipt =
+          mapInboundReceiptSnapshot(
+            receiptSnapshot,
+          );
+
+        if (
+          receipt.conversationId !==
+            input.conversationId ||
+          receipt.channelMessageId !==
+            input.channelMessageId
+        ) {
+          throw new ConversationInvariantError(
+            `Inbound receipt ${receiptSnapshot.id} does not match claim identity`,
+          );
+        }
+
+        if (
+          receipt.processingStatus !==
+          "processing"
+        ) {
+          return {
+            claimed: false,
+            completed: false,
+          };
+        }
+
+        this.assertRecoverableReceiptState(
+          receiptSnapshot.id,
+          receipt,
+        );
+
+        if (
+          !isLeaseExpired(
+            receipt.leaseExpiresAt,
+            input.now,
+          )
+        ) {
+          return {
+            claimed: false,
+            completed: false,
+          };
+        }
+
+        const {
+          conversation,
+        } = await this.getRequiredConversation(
+          transaction,
+          input.conversationId,
+        );
+        const messageSnapshot =
+          assertDocumentSnapshot(
+            await transaction.get(
+              this.messageRef(
+                receipt.messageId,
+              ),
+            ),
+          );
+
+        if (!messageSnapshot.exists) {
+          throw new ConversationInvariantError(
+            `Original inbound message not found for receipt ${receiptSnapshot.id}`,
+          );
+        }
+
+        const message =
+          mapMessageSnapshot(
+            messageSnapshot,
+          );
+
+        this.assertOriginalMessageMatchesReceipt(
+          receiptSnapshot.id,
+          receipt,
+          message,
+        );
+
+        if (
+          conversation.mode !==
+          "ai_active"
+        ) {
+          const outcome =
+            `recovery_no_ai_processing_${conversation.mode}`;
+          transaction.set(
+            receiptRef,
+            serialize(
+              this.completeReceipt(
+                receipt,
+                input.now,
+                outcome,
+              ),
+            ),
+          );
+
+          return {
+            claimed: false,
+            completed: true,
+            conversation:
+              cloneConversation(
+                conversation,
+              ),
+            message:
+              cloneMessage(message),
+            channelMessageId:
+              receipt.channelMessageId,
+            completionOutcome:
+              outcome,
+          };
+        }
+
+        const processingToken =
+          createProcessingToken();
+        const claimedReceipt: InboundMessageReceipt =
+          {
+            ...receipt,
+            processingToken,
+            leaseExpiresAt:
+              getLeaseExpiresAt(
+                input.now,
+              ),
+            processingAttempts:
+              receipt.processingAttempts +
+              1,
+          };
+
+        transaction.set(
+          receiptRef,
+          serialize(claimedReceipt),
+        );
+
+        return {
+          claimed: true,
+          completed: false,
+          conversation:
+            cloneConversation(
+              conversation,
+            ),
+          message:
+            cloneMessage(message),
+          channelMessageId:
+            receipt.channelMessageId,
+          processingToken,
         };
       },
     );
@@ -1445,6 +1680,76 @@ export class FirestoreAIPlatformConversationWorkflowRepository
       completedAt,
       completionOutcome,
     };
+  }
+
+  private assertRecoverableReceiptState(
+    receiptId: string,
+    receipt: InboundMessageReceipt,
+  ): asserts receipt is InboundMessageReceipt &
+    Required<
+      Pick<
+        InboundMessageReceipt,
+        | "processingToken"
+        | "leaseExpiresAt"
+        | "processingAttempts"
+        | "messageId"
+      >
+    > {
+    if (
+      typeof receipt.processingToken !==
+        "string" ||
+      typeof receipt.leaseExpiresAt !==
+        "string" ||
+      typeof receipt.processingAttempts !==
+        "number" ||
+      typeof receipt.messageId !==
+        "string"
+    ) {
+      throw new ConversationInvariantError(
+        `Inbound receipt ${receiptId} is processing without complete lease state`,
+      );
+    }
+  }
+
+  private assertOriginalMessageMatchesReceipt(
+    receiptId: string,
+    receipt: InboundMessageReceipt,
+    message: ConversationMessage,
+  ): void {
+    if (
+      message.senderType !== "user"
+    ) {
+      throw new ConversationInvariantError(
+        `Original inbound message for receipt ${receiptId} is not a user message`,
+      );
+    }
+
+    if (
+      message.conversationId !==
+      receipt.conversationId
+    ) {
+      throw new ConversationInvariantError(
+        `Original inbound message for receipt ${receiptId} has mismatched conversation`,
+      );
+    }
+
+    if (
+      message.channelMessageId !==
+      receipt.channelMessageId
+    ) {
+      throw new ConversationInvariantError(
+        `Original inbound message for receipt ${receiptId} has mismatched channel message id`,
+      );
+    }
+
+    if (
+      sha256(message.text) !==
+      receipt.textSha256
+    ) {
+      throw new ConversationInvariantError(
+        `Original inbound message for receipt ${receiptId} has mismatched text hash`,
+      );
+    }
   }
 
   private async getRequiredConversation(

@@ -9419,6 +9419,128 @@ async function testConversationRecoveryEndpointAuthAndLimitValidation() {
   );
 }
 
+async function testConversationRecoveryCronEndpointAuthenticationAndInvocation() {
+  const route =
+    await import(
+      "@/app/api/cron/conversations/recovery/route"
+    );
+  const originalCronSecret =
+    process.env.CRON_SECRET;
+  const summary = {
+    scanned: 3,
+    claimed: 2,
+    processed: 2,
+    aiReplied: 1,
+    handoffRequested: 1,
+    completedWithoutProcessing: 0,
+    skippedRace: 1,
+    failed: 0,
+  };
+  const calls: Array<{
+    limit: number;
+  }> = [];
+  const handler =
+    route.createConversationRecoveryCronHandler(
+      async (input) => {
+        calls.push(input);
+        return summary;
+      },
+    );
+
+  try {
+    delete process.env.CRON_SECRET;
+
+    const unconfigured =
+      await handler(
+        new Request(
+          "http://localhost/api/cron/conversations/recovery",
+          {
+            headers: {
+              authorization:
+                "Bearer test-cron-secret",
+            },
+          },
+        ),
+      );
+
+    assert.equal(
+      unconfigured.status,
+      401,
+    );
+
+    process.env.CRON_SECRET =
+      "test-cron-secret";
+
+    const missingAuthorization =
+      await handler(
+        new Request(
+          "http://localhost/api/cron/conversations/recovery",
+        ),
+      );
+
+    assert.equal(
+      missingAuthorization.status,
+      401,
+    );
+
+    const wrongSecret =
+      await handler(
+        new Request(
+          "http://localhost/api/cron/conversations/recovery",
+          {
+            headers: {
+              authorization:
+                "Bearer wrong-test-secret",
+            },
+          },
+        ),
+      );
+
+    assert.equal(
+      wrongSecret.status,
+      401,
+    );
+    assert.equal(calls.length, 0);
+
+    const authorized =
+      await handler(
+        new Request(
+          "http://localhost/api/cron/conversations/recovery",
+          {
+            headers: {
+              authorization:
+                "Bearer test-cron-secret",
+            },
+          },
+        ),
+      );
+
+    assert.equal(authorized.status, 200);
+    assert.deepEqual(
+      await authorized.json(),
+      {
+        ok: true,
+        ...summary,
+      },
+    );
+    assert.deepEqual(calls, [
+      {
+        limit: 10,
+      },
+    ]);
+  } finally {
+    if (
+      originalCronSecret ===
+      undefined
+    ) {
+      delete process.env.CRON_SECRET;
+    } else {
+      process.env.CRON_SECRET =
+        originalCronSecret;
+    }
+  }
+}
+
 async function testConversationServiceGroundedAnswer() {
   const provider =
     new CountingProvider({
@@ -10337,6 +10459,7 @@ async function main() {
   await testInboundRecoveryOriginalMessageInvariants();
   await testInboundRecoveryProviderFailureIsolation();
   await testConversationRecoveryEndpointAuthAndLimitValidation();
+  await testConversationRecoveryCronEndpointAuthenticationAndInvocation();
   await testConversationServiceGroundedAnswer();
   await testConversationServiceUnsupportedHandoff();
   await testConversationServiceMissingCitationHandoff();

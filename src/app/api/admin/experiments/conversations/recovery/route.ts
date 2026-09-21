@@ -1,6 +1,6 @@
 import {
-  createProductionConversationEnvironment,
-} from "@/core/ai-platform/conversations/production-conversation-environment";
+  runConversationRecovery,
+} from "@/core/ai-platform/conversations/run-conversation-recovery";
 
 import {
   conversationRouteError,
@@ -50,12 +50,8 @@ export async function POST(
       );
     }
 
-    const {
-      service,
-    } =
-      createProductionConversationEnvironment();
     const summary =
-      await service.recoverExpiredInboundProcessing(
+      await runConversationRecovery(
         {
           limit: requestedLimit,
         },

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   createHash,
+  createHmac,
 } from "node:crypto";
 import {
   mkdir,
@@ -80,6 +81,21 @@ import {
   parsePowerAutomatePublicationPayload,
   parseRawPowerAutomatePublicationRequest,
 } from "../integrations/sharepoint/power-automate-http-adapter";
+
+import {
+  LineMessageService,
+  type LineTextInboundEvent,
+} from "../integrations/line/line-message-service";
+
+import {
+  LineMessagingApiReplyClient,
+  type LineReplyClient,
+} from "../integrations/line/line-reply-client";
+
+import {
+  processLineWebhook,
+  verifyLineWebhookSignature,
+} from "../integrations/line/line-webhook-adapter";
 
 import {
   assertConversationTransition,
@@ -1036,6 +1052,25 @@ class ScriptedProvider
   }
 }
 
+class RecordingLineReplyClient
+  implements LineReplyClient
+{
+  readonly replies: Array<{
+    replyToken: string;
+    text: string;
+  }> = [];
+
+  async replyText(
+    replyToken: string,
+    text: string,
+  ): Promise<void> {
+    this.replies.push({
+      replyToken,
+      text,
+    });
+  }
+}
+
 class MockOpenAIKnowledgePublisherClient
   implements OpenAIKnowledgePublisherClient
 {
@@ -1302,6 +1337,93 @@ function createAtomicTestService(
     handoffRepository,
     conversationWorkflowRepository,
     provider,
+  };
+}
+
+async function createLineTestEnvironment(
+  result: GroundedQAResult,
+  responseMode?:
+    | "off"
+    | "draft"
+    | "auto",
+) {
+  const provider =
+    new CountingProvider(result);
+  const atomic =
+    createAtomicTestService(provider);
+  const configRepository =
+    new InMemoryChannelResponseConfigRepository();
+  const configService =
+    new ChannelResponseConfigService(
+      configRepository,
+      () =>
+        "2027-01-01T00:00:00.000Z",
+    );
+  const draftRepository =
+    new InMemorySuggestedReplyDraftRepository();
+  const replyClient =
+    new RecordingLineReplyClient();
+  let nextId = 1;
+  const lineMessageService =
+    new LineMessageService({
+      configService,
+      conversationService:
+        atomic.service,
+      conversationRepository:
+        atomic.conversationRepository,
+      conversationWorkflowRepository:
+        atomic.conversationWorkflowRepository,
+      answerService:
+        new AnswerService(provider),
+      draftRepository,
+      replyClient,
+      now: () =>
+        "2027-01-01T00:00:10.000Z",
+      nextId: (prefix) => {
+        const id = `${prefix}-line-${nextId}`;
+        nextId += 1;
+        return id;
+      },
+    });
+
+  if (responseMode) {
+    await configRepository.upsertConfig({
+      channel: "line",
+      channelAccountId:
+        "line-destination",
+      responseMode,
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  }
+
+  return {
+    ...atomic,
+    provider,
+    configRepository,
+    configService,
+    draftRepository,
+    replyClient,
+    lineMessageService,
+  };
+}
+
+function lineTextEvent(
+  overrides: Partial<
+    LineTextInboundEvent
+  > = {},
+): LineTextInboundEvent {
+  return {
+    channelAccountId:
+      "line-destination",
+    channelUserId: "line-user-1",
+    channelMessageId:
+      "webhook-event-1",
+    lineMessageId:
+      "line-message-1",
+    replyToken: "reply-token-1",
+    text: "Admission question",
+    ...overrides,
   };
 }
 
@@ -4940,6 +5062,631 @@ function testConversationTransitions() {
   );
 }
 
+function lineSignature(
+  rawBody: string,
+  secret: string,
+): string {
+  return createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("base64");
+}
+
+async function testLineWebhookSignatureAndParsing() {
+  const route = await import(
+    "@/app/api/integrations/line/webhook/route"
+  );
+  const secret = "line-test-secret";
+  const emptyBody = JSON.stringify({
+    events: [],
+  });
+  let serviceCreations = 0;
+  let processCalls = 0;
+  const handler =
+    route.createLineWebhookHandler({
+      channelSecret: secret,
+      createLineMessageService: () => {
+        serviceCreations += 1;
+        return {
+          processTextEvent: async () => {
+            processCalls += 1;
+            return {
+              conversationId:
+                "conversation-1",
+              responseMode:
+                "off" as const,
+              duplicate: false,
+              replied: false,
+            };
+          },
+        };
+      },
+    });
+
+  const missingSignature =
+    await handler(
+      new Request(
+        "http://localhost/api/integrations/line/webhook",
+        {
+          method: "POST",
+          body: emptyBody,
+        },
+      ),
+    );
+
+  assert.equal(
+    missingSignature.status,
+    401,
+  );
+  assert.equal(serviceCreations, 0);
+
+  const invalidJson = "not-json";
+  const wrongSignature =
+    await handler(
+      new Request(
+        "http://localhost/api/integrations/line/webhook",
+        {
+          method: "POST",
+          headers: {
+            "x-line-signature":
+              "invalid-signature",
+          },
+          body: invalidJson,
+        },
+      ),
+    );
+
+  assert.equal(wrongSignature.status, 401);
+  assert.equal(serviceCreations, 0);
+
+  const malformed =
+    await handler(
+      new Request(
+        "http://localhost/api/integrations/line/webhook",
+        {
+          method: "POST",
+          headers: {
+            "x-line-signature":
+              lineSignature(
+                invalidJson,
+                secret,
+              ),
+          },
+          body: invalidJson,
+        },
+      ),
+    );
+
+  assert.equal(malformed.status, 400);
+  assert.equal(serviceCreations, 1);
+
+  const accepted =
+    await handler(
+      new Request(
+        "http://localhost/api/integrations/line/webhook",
+        {
+          method: "POST",
+          headers: {
+            "x-line-signature":
+              lineSignature(
+                emptyBody,
+                secret,
+              ),
+          },
+          body: emptyBody,
+        },
+      ),
+    );
+
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(
+    await accepted.json(),
+    {
+      ok: true,
+      processed: 0,
+      ignored: 0,
+    },
+  );
+  assert.equal(processCalls, 0);
+  assert.equal(
+    verifyLineWebhookSignature(
+      Buffer.from(emptyBody),
+      lineSignature(emptyBody, secret),
+      secret,
+    ),
+    true,
+  );
+}
+
+async function testLineWebhookEventFilteringAndAccountMapping() {
+  const captured: LineTextInboundEvent[] =
+    [];
+  const body = Buffer.from(
+    JSON.stringify({
+      destination:
+        "destination-from-root",
+      events: [
+        {
+          type: "follow",
+        },
+        {
+          type: "message",
+          webhookEventId:
+            "webhook-supported-1",
+          replyToken: "reply-1",
+          source: {
+            type: "user",
+            userId: "user-1",
+          },
+          message: {
+            type: "text",
+            id: "message-1",
+            text: "first",
+          },
+        },
+        {
+          type: "message",
+          replyToken: "reply-2",
+          source: {
+            type: "user",
+            userId: "user-2",
+          },
+          message: {
+            type: "text",
+            id: "message-2",
+            text: "second",
+          },
+        },
+        {
+          type: "message",
+          message: {
+            type: "image",
+          },
+        },
+      ],
+    }),
+  );
+
+  const summary = await processLineWebhook(
+    body,
+    {
+      processTextEvent: async (event) => {
+        captured.push(event);
+        return {
+          conversationId:
+            `conversation-${captured.length}`,
+          responseMode: "off",
+          duplicate: false,
+          replied: false,
+        };
+      },
+    },
+  );
+
+  assert.deepEqual(summary, {
+    processed: 2,
+    ignored: 2,
+  });
+  assert.deepEqual(
+    captured.map((event) => ({
+      account:
+        event.channelAccountId,
+      inboundId:
+        event.channelMessageId,
+    })),
+    [
+      {
+        account:
+          "destination-from-root",
+        inboundId:
+          "webhook-supported-1",
+      },
+      {
+        account:
+          "destination-from-root",
+        inboundId:
+          "line-message:message-2",
+      },
+    ],
+  );
+}
+
+async function testLineResponseModesAndRedelivery() {
+  const off =
+    await createLineTestEnvironment(
+      groundedResult(),
+    );
+  const offEvent = lineTextEvent();
+  const offFirst =
+    await off.lineMessageService
+      .processTextEvent(offEvent);
+  const offDuplicate =
+    await off.lineMessageService
+      .processTextEvent(offEvent);
+  await off.configRepository.upsertConfig({
+    channel: "line",
+    channelAccountId:
+      "line-destination",
+    responseMode: "auto",
+    updatedAt:
+      "2027-01-01T00:01:00.000Z",
+  });
+  const offDuplicateAfterModeChange =
+    await off.lineMessageService
+      .processTextEvent(offEvent);
+  const offConversation =
+    await off.conversationRepository
+      .getConversation(
+        offFirst.conversationId,
+      );
+
+  assert.equal(offFirst.responseMode, "off");
+  assert.equal(offDuplicate.duplicate, true);
+  assert.equal(
+    offDuplicateAfterModeChange
+      .duplicate,
+    true,
+  );
+  assert.equal(off.provider.calls, 0);
+  assert.equal(off.replyClient.replies.length, 0);
+  assert.equal(
+    (
+      await off.conversationRepository
+        .listMessages(
+          offFirst.conversationId,
+        )
+    ).length,
+    1,
+  );
+  assert.equal(
+    await off.draftRepository.getDraft(
+      offFirst.conversationId,
+      "message-line-1",
+    ),
+    null,
+  );
+  assert.equal(
+    offConversation?.lastStaffReadAt,
+    undefined,
+  );
+
+  const draft =
+    await createLineTestEnvironment(
+      groundedResult(
+        "Grounded draft",
+      ),
+      "draft",
+    );
+  const draftEvent = lineTextEvent();
+  const draftFirst =
+    await draft.lineMessageService
+      .processTextEvent(draftEvent);
+  const draftDuplicate =
+    await draft.lineMessageService
+      .processTextEvent(draftEvent);
+  const draftMessages =
+    await draft.conversationRepository
+      .listMessages(
+        draftFirst.conversationId,
+      );
+  const storedDraft =
+    await draft.draftRepository
+      .getDraft(
+        draftFirst.conversationId,
+        draftMessages[0].id,
+      );
+
+  assert.equal(draft.provider.calls, 1);
+  assert.equal(draftFirst.draftStatus, "ready");
+  assert.equal(draftDuplicate.duplicate, true);
+  assert.equal(storedDraft?.text, "Grounded draft");
+  assert.equal(draftMessages.length, 1);
+  assert.equal(
+    draftMessages[0].senderType,
+    "user",
+  );
+  assert.equal(
+    draft.replyClient.replies.length,
+    0,
+  );
+  assert.equal(
+    draft.provider.requests[0]
+      .audience,
+    "public",
+  );
+  assert.equal(
+    (
+      await draft.conversationRepository
+        .getConversation(
+          draftFirst.conversationId,
+        )
+    )?.lastStaffReadAt,
+    undefined,
+  );
+
+  const auto =
+    await createLineTestEnvironment(
+      groundedResult(
+        "Grounded automatic reply",
+      ),
+      "auto",
+    );
+  const autoEvent = lineTextEvent();
+  const autoFirst =
+    await auto.lineMessageService
+      .processTextEvent(autoEvent);
+  const autoDuplicate =
+    await auto.lineMessageService
+      .processTextEvent(autoEvent);
+
+  assert.equal(autoFirst.replied, true);
+  assert.equal(autoDuplicate.duplicate, true);
+  assert.equal(auto.provider.calls, 1);
+  assert.deepEqual(
+    auto.replyClient.replies,
+    [
+      {
+        replyToken: "reply-token-1",
+        text:
+          "Grounded automatic reply",
+      },
+    ],
+  );
+  assert.equal(
+    auto.provider.requests[0]
+      .audience,
+    "public",
+  );
+  assert.equal(
+    (
+      await auto.conversationRepository
+        .listMessages(
+          autoFirst.conversationId,
+        )
+    ).length,
+    2,
+  );
+  assert.equal(
+    (
+      await auto.conversationRepository
+        .getConversation(
+          autoFirst.conversationId,
+        )
+    )?.lastStaffReadAt,
+    undefined,
+  );
+
+  const unsupported =
+    await createLineTestEnvironment(
+      unsupportedResult(),
+      "auto",
+    );
+  const unsupportedResultValue =
+    await unsupported.lineMessageService
+      .processTextEvent(lineTextEvent());
+
+  assert.equal(
+    unsupportedResultValue.replied,
+    false,
+  );
+  assert.equal(
+    unsupported.replyClient.replies
+      .length,
+    0,
+  );
+  assert.equal(
+    (
+      await unsupported.handoffRepository
+        .getActiveHandoff(
+          unsupportedResultValue
+            .conversationId,
+        )
+    )?.status,
+    "waiting",
+  );
+
+  const unsafeDraft =
+    await createLineTestEnvironment(
+      unsupportedResult(),
+      "draft",
+    );
+  const unsafeDraftResult =
+    await unsafeDraft.lineMessageService
+      .processTextEvent(lineTextEvent());
+  const unsafeDraftMessages =
+    await unsafeDraft
+      .conversationRepository
+      .listMessages(
+        unsafeDraftResult
+          .conversationId,
+      );
+  const failedDraft =
+    await unsafeDraft.draftRepository
+      .getDraft(
+        unsafeDraftResult
+          .conversationId,
+        unsafeDraftMessages[0].id,
+      );
+
+  assert.equal(
+    unsafeDraftResult.draftStatus,
+    "failed",
+  );
+  assert.equal(failedDraft?.text, "");
+  assert.equal(
+    unsafeDraft.replyClient.replies
+      .length,
+    0,
+  );
+  assert.equal(
+    await unsafeDraft.handoffRepository
+      .getActiveHandoff(
+        unsafeDraftResult
+          .conversationId,
+      ),
+    null,
+  );
+}
+
+async function testLineConversationResolution() {
+  const environment =
+    await createLineTestEnvironment(
+      groundedResult(),
+    );
+  const first =
+    await environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId: "event-1",
+        }),
+      );
+  const second =
+    await environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId: "event-2",
+          lineMessageId: "message-2",
+          replyToken: "reply-2",
+        }),
+      );
+  const otherUser =
+    await environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelUserId: "line-user-2",
+          channelMessageId: "event-3",
+          lineMessageId: "message-3",
+          replyToken: "reply-3",
+        }),
+      );
+  const otherAccount =
+    await environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelAccountId:
+            "line-destination-2",
+          channelMessageId: "event-4",
+          lineMessageId: "message-4",
+          replyToken: "reply-4",
+        }),
+      );
+
+  assert.equal(
+    second.conversationId,
+    first.conversationId,
+  );
+  assert.notEqual(
+    otherUser.conversationId,
+    first.conversationId,
+  );
+  assert.notEqual(
+    otherAccount.conversationId,
+    first.conversationId,
+  );
+  assert.equal(
+    (
+      await environment
+        .conversationRepository
+        .getConversation(
+          first.conversationId,
+        )
+    )?.channelAccountId,
+    "line-destination",
+  );
+  assert.equal(
+    (
+      await environment
+        .conversationRepository
+        .getConversation(
+          otherAccount.conversationId,
+        )
+    )?.channelAccountId,
+    "line-destination-2",
+  );
+
+  await environment
+    .conversationRepository
+    .updateConversation({
+      id: first.conversationId,
+      mode: "resolved",
+      updatedAt:
+        "2027-01-01T00:00:20.000Z",
+    });
+
+  const afterResolved =
+    await environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId: "event-5",
+          lineMessageId: "message-5",
+          replyToken: "reply-5",
+        }),
+      );
+
+  assert.notEqual(
+    afterResolved.conversationId,
+    first.conversationId,
+  );
+}
+
+async function testLineReplyClientContract() {
+  const requests: Array<{
+    url: string;
+    init?: RequestInit;
+  }> = [];
+  const client =
+    new LineMessagingApiReplyClient({
+      channelAccessToken:
+        "line-access-token",
+      fetchImplementation: async (
+        input,
+        init,
+      ) => {
+        requests.push({
+          url: String(input),
+          init,
+        });
+        return new Response(null, {
+          status: 200,
+        });
+      },
+    });
+
+  await client.replyText(
+    "reply-token",
+    "plain text",
+  );
+
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0].url,
+    "https://api.line.me/v2/bot/message/reply",
+  );
+  assert.equal(
+    (
+      requests[0].init
+        ?.headers as Record<
+        string,
+        string
+      >
+    ).authorization,
+    "Bearer line-access-token",
+  );
+  assert.deepEqual(
+    JSON.parse(
+      String(requests[0].init?.body),
+    ),
+    {
+      replyToken: "reply-token",
+      messages: [
+        {
+          type: "text",
+          text: "plain text",
+        },
+      ],
+    },
+  );
+}
+
 function testResponseModePolicy() {
   assert.deepEqual(
     getResponseModeDecision("off"),
@@ -5323,6 +6070,14 @@ async function testConversationStaffReadPersistenceFoundation() {
   assert.equal(
     (
       await firestoreRepository.getConversation(
+        "legacy-conversation",
+      )
+    )?.channelAccountId,
+    undefined,
+  );
+  assert.equal(
+    (
+      await firestoreRepository.getConversation(
         "read-firestore-conversation",
       )
     )?.lastStaffReadAt,
@@ -5529,6 +6284,66 @@ async function testInMemoryRepositories() {
         )
     )?.mode,
     "ai_active",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .findActiveConversation(
+          "web",
+          "user-1",
+        )
+    )?.id,
+    "conversation-1",
+  );
+
+  await conversationRepository
+    .createConversation({
+      id: "line-account-a",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId: "account-a",
+      channelUserId: "shared-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  await conversationRepository
+    .createConversation({
+      id: "line-account-b",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId: "account-b",
+      channelUserId: "shared-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:01.000Z",
+    });
+
+  assert.equal(
+    (
+      await conversationRepository
+        .findActiveConversation(
+          "line",
+          "shared-user",
+          "account-a",
+        )
+    )?.id,
+    "line-account-a",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .findActiveConversation(
+          "line",
+          "shared-user",
+          "account-b",
+        )
+    )?.id,
+    "line-account-b",
   );
 
   await conversationRepository
@@ -10869,6 +11684,11 @@ async function main() {
   await testProductionDefaultAvoidsLocalVectorStoreFiles();
   await testOneDriveQueueAdapter();
   testAudiencePolicy();
+  await testLineWebhookSignatureAndParsing();
+  await testLineWebhookEventFilteringAndAccountMapping();
+  await testLineResponseModesAndRedelivery();
+  await testLineConversationResolution();
+  await testLineReplyClientContract();
   testResponseModePolicy();
   await testChannelResponseConfigRepositoriesAndResolver();
   await testSuggestedReplyDraftRepositoriesAndConversationSeparation();

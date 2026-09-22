@@ -100,6 +100,36 @@ export class InMemoryConversationRepository
       : null;
   }
 
+  async findActiveConversation(
+    channel: Conversation["channel"],
+    channelUserId: string,
+    channelAccountId?: string,
+  ): Promise<Conversation | null> {
+    const conversation = [
+      ...this.conversations.values(),
+    ]
+      .filter(
+        (item) =>
+          item.channel === channel &&
+          item.channelUserId ===
+            channelUserId &&
+          (channelAccountId ===
+            undefined ||
+            item.channelAccountId ===
+              channelAccountId) &&
+          item.mode !== "resolved",
+      )
+      .sort((left, right) =>
+        right.updatedAt.localeCompare(
+          left.updatedAt,
+        ),
+      )[0];
+
+    return conversation
+      ? cloneConversation(conversation)
+      : null;
+  }
+
   async updateConversation(
     input: UpdateConversationInput,
   ): Promise<Conversation> {

@@ -24,7 +24,13 @@ export interface AppendUserMessageInput {
   conversationId: string;
   message: ConversationMessage;
   updatedAt: string;
+  processingDisposition?: InboundProcessingDisposition;
 }
+
+export type InboundProcessingDisposition =
+  | "off"
+  | "draft"
+  | "auto";
 
 export interface AppendUserMessageWorkflowResult {
   conversation: Conversation;
@@ -91,6 +97,12 @@ export interface InboundProcessingOwnershipInput {
   conversationId: string;
   channelMessageId: string;
   processingToken: string;
+}
+
+export interface CompleteInboundProcessingIfOwnedInput
+  extends InboundProcessingOwnershipInput {
+  completedAt: string;
+  completionOutcome: string;
 }
 
 export interface PersistAiMessageForInboundIfOwnedInput
@@ -163,6 +175,10 @@ export interface ConversationWorkflowRepository {
   persistAiMessageForInboundIfOwned(
     input: PersistAiMessageForInboundIfOwnedInput,
   ): Promise<PersistAiMessageForInboundIfOwnedResult>;
+
+  completeInboundProcessingIfOwned(
+    input: CompleteInboundProcessingIfOwnedInput,
+  ): Promise<boolean>;
 
   persistHumanMessageIfOwned(
     input: PersistHumanMessageIfOwnedInput,

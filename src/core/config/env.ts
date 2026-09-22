@@ -7,6 +7,14 @@ const schema = z.object({
 
   APP_API_KEY: z.string().min(16),
 
+  LINE_CHANNEL_SECRET: z
+    .string()
+    .min(1),
+
+  LINE_CHANNEL_ACCESS_TOKEN: z
+    .string()
+    .min(1),
+
   DEFAULT_AI_PROVIDER: z
     .string()
     .default("typhoon"),
@@ -50,6 +58,12 @@ const result = schema.safeParse({
 
   APP_API_KEY:
     process.env.APP_API_KEY,
+
+  LINE_CHANNEL_SECRET:
+    process.env.LINE_CHANNEL_SECRET,
+
+  LINE_CHANNEL_ACCESS_TOKEN:
+    process.env.LINE_CHANNEL_ACCESS_TOKEN,
 
   DEFAULT_AI_PROVIDER:
     process.env.DEFAULT_AI_PROVIDER,

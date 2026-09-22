@@ -358,3 +358,23 @@ An external account without configuration resolves to `off`. Response mode is se
 `SuggestedReplyDraft` is a separate domain record, not an outbound `ConversationMessage`. Saving or editing a draft does not append an AI message, change conversation ownership, or imply delivery.
 
 Human read state is also independent. `lastStaffReadAt` changes only through a future explicit staff-read action. AI processing, draft generation, RAG, recovery, and webhook ingestion must never mark a conversation as read by staff.
+
+## 14. LINE Messaging Adapter
+
+The LINE webhook verifies the HMAC-SHA256 signature over the exact raw request body before parsing JSON. The webhook root `destination` selects the LINE account response configuration; payload data cannot select another channel or knowledge audience.
+
+An active LINE conversation is resolved by `channel`, `channelAccountId` (the webhook `destination`), and `channelUserId`. This prevents the same LINE user identifier from reusing a conversation across different Official Accounts. The account field is optional on the provider-neutral conversation record so older and non-account-scoped records remain readable.
+
+```text
+LINE webhook
+    -> verify signature
+    -> resolve destination config
+    -> persist inbound message
+    -> off   : stop
+    -> draft : generate and store SuggestedReplyDraft, never send
+    -> auto  : existing grounded conversation flow, send only safe AI output
+```
+
+All LINE modes use public knowledge only. `off` still persists inbound messages for staff, `draft` never creates a sent AI conversation message, and unsupported auto answers retain existing handoff behavior without a fabricated LINE reply. Webhook ingestion, draft generation, and auto replies never update `lastStaffReadAt`.
+
+F5.1 processes supported webhook events sequentially and synchronously as an MVP. A future phase may move work behind asynchronous infrastructure, but F5.1 adds no queue, retry worker, or scheduled job.

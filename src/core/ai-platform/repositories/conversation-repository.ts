@@ -13,6 +13,7 @@ export interface CreateConversationInput {
   id: string;
   channel: Channel;
   channelAudience: ChannelAudience;
+  channelAccountId?: string;
   channelUserId: string;
   mode: ConversationMode;
   createdAt: string;
@@ -44,6 +45,12 @@ export interface ConversationRepository {
 
   getConversation(
     id: string,
+  ): Promise<Conversation | null>;
+
+  findActiveConversation(
+    channel: Channel,
+    channelUserId: string,
+    channelAccountId?: string,
   ): Promise<Conversation | null>;
 
   updateConversation(

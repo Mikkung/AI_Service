@@ -61,6 +61,7 @@ export interface ConversationServiceDependencies {
 
 export interface CreateConversationInput {
   channel: Channel;
+  channelAccountId?: string;
   channelUserId: string;
   metadata?: Record<string, unknown>;
 }
@@ -215,6 +216,8 @@ export class ConversationService {
           input.channel,
         channelAudience:
           policy.channelAudience,
+        channelAccountId:
+          input.channelAccountId,
         channelUserId:
           input.channelUserId,
         mode: "ai_active",

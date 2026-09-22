@@ -50,6 +50,7 @@ export function createProductionConversationEnvironment() {
 
   return {
     service,
+    answerService,
     conversationRepository,
     handoffRepository,
     conversationWorkflowRepository,

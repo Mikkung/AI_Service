@@ -47,6 +47,11 @@ interface FirestoreDocumentReference {
 interface FirestoreCollectionReference {
   doc(id: string): FirestoreDocumentReference;
   get(): Promise<FirestoreCollectionSnapshot>;
+  where(
+    field: string,
+    operator: "==",
+    value: unknown,
+  ): FirestoreCollectionReference;
 }
 
 interface FirestoreLike {
@@ -173,6 +178,49 @@ export class FirestoreAIPlatformConversationRepository
 
     return mapConversationSnapshot(
       snapshot,
+    );
+  }
+
+  async findActiveConversation(
+    channel: Conversation["channel"],
+    channelUserId: string,
+    channelAccountId?: string,
+  ): Promise<Conversation | null> {
+    let query = this.db
+      .collection(
+        CONVERSATIONS_COLLECTION,
+      )
+      .where("channel", "==", channel)
+      .where(
+        "channelUserId",
+        "==",
+        channelUserId,
+      );
+
+    if (channelAccountId !== undefined) {
+      query = query.where(
+        "channelAccountId",
+        "==",
+        channelAccountId,
+      );
+    }
+
+    const snapshot = await query.get();
+
+    return (
+      snapshot.docs
+        .map(mapConversationSnapshot)
+        .filter(
+          (conversation) =>
+            conversation.mode !==
+            "resolved",
+        )
+        .sort((left, right) =>
+          right.updatedAt.localeCompare(
+            left.updatedAt,
+          ) ||
+          left.id.localeCompare(right.id),
+        )[0] ?? null
     );
   }
 

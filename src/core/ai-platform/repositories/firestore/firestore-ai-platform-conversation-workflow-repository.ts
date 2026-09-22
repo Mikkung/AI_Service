@@ -14,6 +14,7 @@ import {
   type AppendUserMessageInput,
   type ClaimExpiredInboundProcessingInput,
   type ClaimExpiredInboundProcessingResult,
+  type CompleteInboundProcessingIfOwnedInput,
   type ConditionalMessageWorkflowResult,
   type ConversationWorkflowRepository,
   type ExpiredInboundProcessingCandidate,
@@ -77,6 +78,10 @@ interface InboundMessageReceipt {
   processingAttempts?: number;
   completedAt?: string;
   completionOutcome?: string;
+  processingDisposition?:
+    | "off"
+    | "draft"
+    | "auto";
 }
 
 interface FirestoreDocumentSnapshot {
@@ -351,6 +356,10 @@ export class FirestoreAIPlatformConversationWorkflowRepository
   async appendUserMessage(
     input: AppendUserMessageInput,
   ): Promise<AppendUserMessageWorkflowResult> {
+    const processingDisposition =
+      input.processingDisposition ??
+      "auto";
+
     return this.db.runTransaction(
       async (transaction) => {
         const {
@@ -440,6 +449,34 @@ export class FirestoreAIPlatformConversationWorkflowRepository
                   input.updatedAt,
                 )
               ) {
+                return {
+                  conversation:
+                    cloneConversation(
+                      conversation,
+                    ),
+                  appended: false,
+                  shouldProcess: false,
+                  messageId:
+                    receipt.messageId,
+                };
+              }
+
+              if (
+                receipt.processingDisposition &&
+                receipt.processingDisposition !==
+                  processingDisposition
+              ) {
+                transaction.set(
+                  receiptRef,
+                  serialize(
+                    this.completeReceipt(
+                      receipt,
+                      input.updatedAt,
+                      "response_mode_changed_during_processing",
+                    ),
+                  ),
+                );
+
                 return {
                   conversation:
                     cloneConversation(
@@ -568,7 +605,9 @@ export class FirestoreAIPlatformConversationWorkflowRepository
             createProcessingToken();
           const shouldProcess =
             conversation.mode ===
-            "ai_active";
+              "ai_active" &&
+            processingDisposition !==
+              "off";
           const receipt: InboundMessageReceipt =
             {
               conversationId:
@@ -596,7 +635,11 @@ export class FirestoreAIPlatformConversationWorkflowRepository
               completionOutcome:
                 shouldProcess
                   ? undefined
-                  : `no_ai_processing_${conversation.mode}`,
+                  : processingDisposition ===
+                      "off"
+                    ? "response_mode_off"
+                    : `no_ai_processing_${conversation.mode}`,
+              processingDisposition,
             };
 
           transaction.create(
@@ -726,6 +769,31 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           receiptSnapshot.id,
           receipt,
         );
+
+        if (
+          receipt.processingDisposition ===
+          "draft"
+        ) {
+          const outcome =
+            "recovery_draft_processing_expired";
+          transaction.set(
+            receiptRef,
+            serialize(
+              this.completeReceipt(
+                receipt,
+                input.now,
+                outcome,
+              ),
+            ),
+          );
+
+          return {
+            claimed: false,
+            completed: true,
+            completionOutcome:
+              outcome,
+          };
+        }
 
         if (
           !isLeaseExpired(
@@ -894,6 +962,37 @@ export class FirestoreAIPlatformConversationWorkflowRepository
             ),
           persisted: true,
         };
+      },
+    );
+  }
+
+  async completeInboundProcessingIfOwned(
+    input: CompleteInboundProcessingIfOwnedInput,
+  ): Promise<boolean> {
+    return this.db.runTransaction(
+      async (transaction) => {
+        const ownership =
+          await this.getInboundProcessingOwnership(
+            transaction,
+            input,
+          );
+
+        if (!ownership.owned) {
+          return false;
+        }
+
+        transaction.set(
+          ownership.receiptRef,
+          serialize(
+            this.completeReceipt(
+              ownership.receipt,
+              input.completedAt,
+              input.completionOutcome,
+            ),
+          ),
+        );
+
+        return true;
       },
     );
   }

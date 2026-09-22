@@ -45,6 +45,7 @@ export interface Conversation {
   id: string;
   channel: Channel;
   channelAudience: ChannelAudience;
+  channelAccountId?: string;
   channelUserId: string;
   mode: ConversationMode;
   assignedAgentId?: string;

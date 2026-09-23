@@ -2,6 +2,7 @@ import type {
   ConversationRepository,
   CreateConversationInput,
   ListConversationsFilter,
+  ListInboxConversationsInput,
   UpdateConversationInput,
 } from "@/core/ai-platform/repositories/conversation-repository";
 
@@ -41,6 +42,9 @@ interface FirestoreDocumentReference {
   get(): Promise<FirestoreDocumentSnapshot>;
   set(
     data: Record<string, unknown>,
+    options?: {
+      merge: boolean;
+    },
   ): Promise<unknown>;
 }
 
@@ -49,8 +53,15 @@ interface FirestoreCollectionReference {
   get(): Promise<FirestoreCollectionSnapshot>;
   where(
     field: string,
-    operator: "==",
+    operator: "==" | "<",
     value: unknown,
+  ): FirestoreCollectionReference;
+  orderBy(
+    field: string,
+    direction: "asc" | "desc",
+  ): FirestoreCollectionReference;
+  limit(
+    limit: number,
   ): FirestoreCollectionReference;
 }
 
@@ -250,6 +261,15 @@ export class FirestoreAIPlatformConversationRepository
       lastMessageAt:
         input.lastMessageAt ??
         existing.lastMessageAt,
+      lastInboundAt:
+        input.lastInboundAt ??
+        existing.lastInboundAt,
+      lastInboundMessageId:
+        input.lastInboundMessageId ??
+        existing.lastInboundMessageId,
+      lastStaffReadAt:
+        input.lastStaffReadAt ??
+        existing.lastStaffReadAt,
       metadata:
         input.metadata ??
         existing.metadata,
@@ -316,6 +336,72 @@ export class FirestoreAIPlatformConversationRepository
       .map(cloneConversation);
   }
 
+  async listInboxConversations(
+    input: ListInboxConversationsInput,
+  ): Promise<Conversation[]> {
+    let query = this.db
+      .collection(CONVERSATIONS_COLLECTION)
+      .where(
+        "channel",
+        "==",
+        input.channel,
+      );
+
+    if (input.beforeUpdatedAt) {
+      query = query.where(
+        "updatedAt",
+        "<",
+        input.beforeUpdatedAt,
+      );
+    }
+
+    const snapshot = await query
+      .orderBy("updatedAt", "desc")
+      .limit(input.limit)
+      .get();
+
+    return snapshot.docs
+      .map(mapConversationSnapshot)
+      .sort((left, right) =>
+        right.updatedAt.localeCompare(
+          left.updatedAt,
+        ) || left.id.localeCompare(right.id),
+      );
+  }
+
+  async markStaffRead(
+    id: string,
+    readAt: string,
+  ): Promise<Conversation> {
+    const existing =
+      await this.getConversation(id);
+
+    if (!existing) {
+      throw new Error(
+        `Conversation not found: ${id}`,
+      );
+    }
+
+    const updated: Conversation = {
+      ...existing,
+      lastStaffReadAt: readAt,
+    };
+
+    await this.db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(id)
+      .set(
+        {
+          lastStaffReadAt: readAt,
+        },
+        {
+          merge: true,
+        },
+      );
+
+    return cloneConversation(updated);
+  }
+
   async appendMessage(
     message: ConversationMessage,
   ): Promise<void> {
@@ -341,15 +427,15 @@ export class FirestoreAIPlatformConversationRepository
     const snapshot =
       await this.db
         .collection(MESSAGES_COLLECTION)
+        .where(
+          "conversationId",
+          "==",
+          conversationId,
+        )
         .get();
 
     return snapshot.docs
       .map(mapMessageSnapshot)
-      .filter(
-        (message) =>
-          message.conversationId ===
-          conversationId,
-      )
       .sort((left, right) =>
         left.createdAt === right.createdAt
           ? left.id.localeCompare(

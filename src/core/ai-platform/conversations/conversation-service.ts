@@ -1423,6 +1423,10 @@ export class ConversationService {
           timestamp,
         lastMessageAt:
           timestamp,
+        lastInboundAt:
+          timestamp,
+        lastInboundMessageId:
+          message.id,
       });
   }
 

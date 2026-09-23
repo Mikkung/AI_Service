@@ -377,4 +377,12 @@ LINE webhook
 
 All LINE modes use public knowledge only. `off` still persists inbound messages for staff, `draft` never creates a sent AI conversation message, and unsupported auto answers retain existing handoff behavior without a fabricated LINE reply. Webhook ingestion, draft generation, and auto replies never update `lastStaffReadAt`.
 
+### Staff Inbox and assisted replies
+
+LINE draft mode follows: inbound message -> grounded AI suggestion -> Staff Inbox -> staff review/edit -> LINE Push API -> human conversation message. A suggested draft is not chat history and is never presented as sent. Delivery changes the linked draft to `sent` only after LINE accepts the push.
+
+An assisted staff reply is distinct from human takeover. It does not require or create a handoff, does not assign an agent, and does not change an `ai_active` conversation to `human_active`. Existing waiting, takeover, resolve, and return-to-AI transitions remain unchanged.
+
+Staff read state is also independent from AI processing. `lastInboundAt` changes only when a new user message is atomically persisted. `lastStaffReadAt` changes only through an explicit Inbox read action or a confirmed staff send. LINE Push is the delayed human-response transport and uses a durable client request ID as its stable LINE retry key.
+
 F5.1 processes supported webhook events sequentially and synchronously as an MVP. A future phase may move work behind asynchronous infrastructure, but F5.1 adds no queue, retry worker, or scheduled job.

@@ -1,6 +1,7 @@
 import type {
   ConversationRepository,
   CreateConversationInput,
+  ListInboxConversationsInput,
   ListConversationsFilter,
   UpdateConversationInput,
 } from "@/core/ai-platform/repositories/conversation-repository";
@@ -156,6 +157,15 @@ export class InMemoryConversationRepository
       lastMessageAt:
         input.lastMessageAt ??
         existing.lastMessageAt,
+      lastInboundAt:
+        input.lastInboundAt ??
+        existing.lastInboundAt,
+      lastInboundMessageId:
+        input.lastInboundMessageId ??
+        existing.lastInboundMessageId,
+      lastStaffReadAt:
+        input.lastStaffReadAt ??
+        existing.lastStaffReadAt,
       metadata:
         input.metadata ??
         existing.metadata,
@@ -193,6 +203,54 @@ export class InMemoryConversationRepository
         ),
       )
       .map(cloneConversation);
+  }
+
+  async listInboxConversations(
+    input: ListInboxConversationsInput,
+  ): Promise<Conversation[]> {
+    return [
+      ...this.conversations.values(),
+    ]
+      .filter(
+        (conversation) =>
+          conversation.channel ===
+            input.channel &&
+          (!input.beforeUpdatedAt ||
+            conversation.updatedAt <
+              input.beforeUpdatedAt),
+      )
+      .sort((left, right) =>
+        right.updatedAt.localeCompare(
+          left.updatedAt,
+        ) || left.id.localeCompare(right.id),
+      )
+      .slice(0, input.limit)
+      .map(cloneConversation);
+  }
+
+  async markStaffRead(
+    id: string,
+    readAt: string,
+  ): Promise<Conversation> {
+    const existing =
+      this.conversations.get(id);
+
+    if (!existing) {
+      throw new Error(
+        `Conversation not found: ${id}`,
+      );
+    }
+
+    const updated = {
+      ...existing,
+      lastStaffReadAt: readAt,
+    };
+    this.conversations.set(
+      id,
+      cloneConversation(updated),
+    );
+
+    return cloneConversation(updated);
   }
 
   async appendMessage(

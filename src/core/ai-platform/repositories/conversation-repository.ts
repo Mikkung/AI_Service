@@ -18,6 +18,8 @@ export interface CreateConversationInput {
   mode: ConversationMode;
   createdAt: string;
   updatedAt: string;
+  lastInboundAt?: string;
+  lastInboundMessageId?: string;
   lastStaffReadAt?: string;
   metadata?: Record<string, unknown>;
 }
@@ -29,7 +31,16 @@ export interface UpdateConversationInput {
   clearAssignedAgentId?: boolean;
   updatedAt: string;
   lastMessageAt?: string;
+  lastInboundAt?: string;
+  lastInboundMessageId?: string;
+  lastStaffReadAt?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface ListInboxConversationsInput {
+  channel: Channel;
+  limit: number;
+  beforeUpdatedAt?: string;
 }
 
 export interface ListConversationsFilter {
@@ -60,6 +71,15 @@ export interface ConversationRepository {
   listConversations(
     filter?: ListConversationsFilter,
   ): Promise<Conversation[]>;
+
+  listInboxConversations(
+    input: ListInboxConversationsInput,
+  ): Promise<Conversation[]>;
+
+  markStaffRead(
+    id: string,
+    readAt: string,
+  ): Promise<Conversation>;
 
   appendMessage(
     message: ConversationMessage,

@@ -575,11 +575,16 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           );
         }
 
-        const updated =
-          this.withMessageTimestamps(
+        const updated = {
+          ...this.withMessageTimestamps(
             conversation,
             input.updatedAt,
-          );
+          ),
+          lastInboundAt:
+            input.message.createdAt,
+          lastInboundMessageId:
+            input.message.id,
+        };
 
         transaction.set(
           conversationRef,

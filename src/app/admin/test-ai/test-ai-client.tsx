@@ -820,6 +820,14 @@ export function TestAiClient() {
             Knowledge
           </button>
 
+          <a
+            className={styles.navItem}
+            href="/admin/inbox"
+          >
+            <span>IN</span>
+            Staff Inbox
+          </a>
+
           <button
             className={
               styles.navItem

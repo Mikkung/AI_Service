@@ -97,6 +97,7 @@
 .navItem {
   background: transparent;
   color: #95a3c1;
+  text-decoration: none;
 }
 
 .navItem:disabled {

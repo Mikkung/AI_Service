@@ -89,8 +89,14 @@ import {
 
 import {
   LineMessagingApiReplyClient,
+  type LinePushClient,
   type LineReplyClient,
 } from "../integrations/line/line-reply-client";
+
+import {
+  StaffInboxService,
+  isConversationUnread,
+} from "../inbox/staff-inbox-service";
 
 import {
   processLineWebhook,
@@ -112,6 +118,19 @@ import {
 import {
   FirestoreAIPlatformConversationRepository,
 } from "../repositories/firestore/firestore-ai-platform-conversation-repository";
+
+import {
+  FirestoreAssistedStaffSendRepository,
+} from "../repositories/firestore/firestore-assisted-staff-send-repository";
+
+import {
+  AssistedStaffSendConflictError,
+} from "../repositories/assisted-staff-send-repository";
+
+import {
+  buildAdminUiSessionCookie,
+  createAdminUiSessionToken,
+} from "@/lib/http/admin-ui-session";
 
 import {
   ConversationConflictError,
@@ -357,10 +376,24 @@ class FakeFirestoreDocumentReference {
 
   async set(
     data: FakeFirestoreData,
+    options?: {
+      merge: boolean;
+    },
   ): Promise<void> {
     this.documents.set(
       this.id,
-      cloneFakeFirestoreData(data),
+      options?.merge
+        ? {
+            ...cloneFakeFirestoreData(
+              this.documents.get(
+                this.id,
+              ) ?? {},
+            ),
+            ...cloneFakeFirestoreData(
+              data,
+            ),
+          }
+        : cloneFakeFirestoreData(data),
     );
   }
 }
@@ -374,7 +407,7 @@ class FakeFirestoreCollectionReference {
     readonly collectionName: string,
     readonly filters: Array<{
       field: string;
-      operator: "==" | "<=";
+      operator: "==" | "<=" | "<";
       value: unknown;
     }> = [],
     readonly orderings: Array<{
@@ -382,6 +415,14 @@ class FakeFirestoreCollectionReference {
       direction: "asc" | "desc";
     }> = [],
     readonly resultLimit?: number,
+    private readonly recordQuery?: (
+      collectionName: string,
+      filters: Array<{
+        field: string;
+        operator: "==" | "<=" | "<";
+        value: unknown;
+      }>,
+    ) => void,
   ) {}
 
   doc(
@@ -396,7 +437,7 @@ class FakeFirestoreCollectionReference {
 
   where(
     field: string,
-    operator: "==" | "<=",
+    operator: "==" | "<=" | "<",
     value: unknown,
   ): FakeFirestoreCollectionReference {
     return new FakeFirestoreCollectionReference(
@@ -412,6 +453,7 @@ class FakeFirestoreCollectionReference {
       ],
       this.orderings,
       this.resultLimit,
+      this.recordQuery,
     );
   }
 
@@ -431,6 +473,7 @@ class FakeFirestoreCollectionReference {
         },
       ],
       this.resultLimit,
+      this.recordQuery,
     );
   }
 
@@ -443,12 +486,19 @@ class FakeFirestoreCollectionReference {
       this.filters,
       this.orderings,
       resultLimit,
+      this.recordQuery,
     );
   }
 
   async get(): Promise<{
     docs: FakeFirestoreDocumentSnapshot[];
   }> {
+    this.recordQuery?.(
+      this.collectionName,
+      this.filters.map(
+        (filter) => ({ ...filter }),
+      ),
+    );
     const entries = [
       ...this.documents.entries(),
     ]
@@ -502,6 +552,14 @@ class FakeFirestoreCollectionReference {
           );
         }
 
+        if (filter.operator === "<") {
+          return (
+            String(
+              data[filter.field],
+            ) < String(filter.value)
+          );
+        }
+
         return false;
       },
     );
@@ -543,6 +601,15 @@ class FakeFirestore {
   private versions =
     new Map<string, number>();
 
+  readonly queryReads: Array<{
+    collectionName: string;
+    filters: Array<{
+      field: string;
+      operator: "==" | "<=" | "<";
+      value: unknown;
+    }>;
+  }> = [];
+
   collection(
     name: string,
   ): FakeFirestoreCollectionReference {
@@ -564,6 +631,15 @@ class FakeFirestore {
     return new FakeFirestoreCollectionReference(
       collection,
       name,
+      [],
+      [],
+      undefined,
+      (collectionName, filters) => {
+        this.queryReads.push({
+          collectionName,
+          filters,
+        });
+      },
     );
   }
 
@@ -1068,6 +1144,43 @@ class RecordingLineReplyClient
       replyToken,
       text,
     });
+  }
+}
+
+class RecordingLinePushClient
+  implements LinePushClient
+{
+  readonly pushes: Array<{
+    channelUserId: string;
+    text: string;
+    retryKey: string;
+  }> = [];
+
+  failNext = false;
+
+  async pushText(
+    channelUserId: string,
+    text: string,
+    retryKey: string,
+  ): Promise<{
+    duplicateAccepted: boolean;
+  }> {
+    this.pushes.push({
+      channelUserId,
+      text,
+      retryKey,
+    });
+
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error(
+        "simulated LINE push failure",
+      );
+    }
+
+    return {
+      duplicateAccepted: false,
+    };
   }
 }
 
@@ -5684,6 +5797,724 @@ async function testLineReplyClientContract() {
         },
       ],
     },
+  );
+
+  await client.pushText(
+    "trusted-line-user",
+    "assisted reply",
+    "11111111-1111-4111-8111-111111111111",
+  );
+  assert.equal(
+    requests[1].url,
+    "https://api.line.me/v2/bot/message/push",
+  );
+  assert.equal(
+    (
+      requests[1].init
+        ?.headers as Record<
+        string,
+        string
+      >
+    )["x-line-retry-key"],
+    "11111111-1111-4111-8111-111111111111",
+  );
+  assert.deepEqual(
+    JSON.parse(
+      String(requests[1].init?.body),
+    ),
+    {
+      to: "trusted-line-user",
+      messages: [
+        {
+          type: "text",
+          text: "assisted reply",
+        },
+      ],
+    },
+  );
+
+  const duplicateClient =
+    new LineMessagingApiReplyClient({
+      channelAccessToken:
+        "line-access-token",
+      fetchImplementation: async () =>
+        new Response(null, {
+          status: 409,
+          headers: {
+            "x-line-accepted-request-id":
+              "accepted-request",
+          },
+        }),
+    });
+  const duplicateResult =
+    await duplicateClient.pushText(
+      "trusted-line-user",
+      "assisted reply",
+      "11111111-1111-4111-8111-111111111111",
+    );
+
+  assert.equal(
+    duplicateResult.duplicateAccepted,
+    true,
+  );
+
+  const unrelatedConflictClient =
+    new LineMessagingApiReplyClient({
+      channelAccessToken:
+        "line-access-token",
+      fetchImplementation: async () =>
+        new Response(null, {
+          status: 409,
+        }),
+    });
+
+  await assert.rejects(
+    () =>
+      unrelatedConflictClient.pushText(
+        "trusted-line-user",
+        "assisted reply",
+        "11111111-1111-4111-8111-111111111111",
+      ),
+    /status 409/,
+  );
+}
+
+async function testStaffInboxMvp() {
+  const db = new FakeFirestore();
+  const conversationRepository =
+    new FirestoreAIPlatformConversationRepository(
+      db,
+    );
+  const workflow =
+    new FirestoreAIPlatformConversationWorkflowRepository(
+      db,
+    );
+  const draftRepository =
+    new FirestoreSuggestedReplyDraftRepository(
+      db,
+    );
+  const configRepository =
+    new FirestoreChannelResponseConfigRepository(
+      db,
+    );
+  const configService =
+    new ChannelResponseConfigService(
+      configRepository,
+      () =>
+        "2027-01-01T00:00:20.000Z",
+    );
+  const sendRepository =
+    new FirestoreAssistedStaffSendRepository(
+      db as never,
+    );
+  const pushClient =
+    new RecordingLinePushClient();
+  let nowIndex = 20;
+  const service = new StaffInboxService({
+    conversationRepository,
+    draftRepository,
+    configService,
+    sendRepository,
+    linePushClient: pushClient,
+    now: () => {
+      const timestamp =
+        `2027-01-01T00:00:${String(nowIndex).padStart(2, "0")}.000Z`;
+      nowIndex += 1;
+      return timestamp;
+    },
+  });
+
+  await conversationRepository
+    .createConversation({
+      id: "inbox-line-conversation",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId:
+        "line-account-1",
+      channelUserId:
+        "trusted-line-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  await conversationRepository
+    .createConversation({
+      id: "inbox-web-conversation",
+      channel: "web",
+      channelAudience: "external",
+      channelUserId: "web-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:09.000Z",
+    });
+  await workflow.appendUserMessage({
+    conversationId:
+      "inbox-line-conversation",
+    message: {
+      id: "inbox-user-message",
+      conversationId:
+        "inbox-line-conversation",
+      senderType: "user",
+      senderId: "trusted-line-user",
+      text: "Please help",
+      createdAt:
+        "2027-01-01T00:00:10.000Z",
+      channelMessageId:
+        "line-inbox-event-1",
+    },
+    updatedAt:
+      "2027-01-01T00:00:10.000Z",
+    processingDisposition: "draft",
+  });
+  await draftRepository.saveDraft({
+    conversationId:
+      "inbox-line-conversation",
+    sourceMessageId:
+      "inbox-user-message",
+    text: "Suggested answer",
+    status: "ready",
+    createdAt:
+      "2027-01-01T00:00:11.000Z",
+    updatedAt:
+      "2027-01-01T00:00:11.000Z",
+  });
+
+  const listed =
+    await service.listConversations();
+  assert.deepEqual(
+    listed.map(
+      (conversation) =>
+        conversation.id,
+    ),
+    ["inbox-line-conversation"],
+  );
+  assert.equal(listed[0].unread, true);
+  assert.equal(
+    listed[0].draftStatus,
+    "ready",
+  );
+  assert.equal(
+    isConversationUnread({
+      lastInboundAt:
+        "2027-01-01T00:00:10.000Z",
+      lastStaffReadAt:
+        "2027-01-01T00:00:09.000Z",
+    }),
+    true,
+  );
+  assert.equal(
+    isConversationUnread({}),
+    false,
+  );
+  assert.ok(
+    db.queryReads.some(
+      (query) =>
+        query.collectionName ===
+          "ai_platform_conversations" &&
+        query.filters.some(
+          (filter) =>
+            filter.field === "channel" &&
+            filter.value === "line",
+        ),
+    ),
+  );
+
+  const detail =
+    await service.getConversationDetail(
+      "inbox-line-conversation",
+    );
+  assert.equal(
+    detail.draft?.sourceMessageId,
+    "inbox-user-message",
+  );
+  assert.equal(
+    detail.draft?.status,
+    "ready",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "inbox-line-conversation",
+        )
+    )?.lastStaffReadAt,
+    undefined,
+  );
+  await service.getConversationDetail(
+    "inbox-line-conversation",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "inbox-line-conversation",
+        )
+    )?.lastStaffReadAt,
+    undefined,
+  );
+  assert.ok(
+    db.queryReads.some(
+      (query) =>
+        query.collectionName ===
+          "ai_platform_conversation_messages" &&
+        query.filters.some(
+          (filter) =>
+            filter.field ===
+              "conversationId" &&
+            filter.value ===
+              "inbox-line-conversation",
+        ),
+    ),
+  );
+
+  const edited = await service.editDraft({
+    conversationId:
+      "inbox-line-conversation",
+    sourceMessageId:
+      "inbox-user-message",
+    text: "Edited staff reply",
+  });
+  assert.equal(edited.status, "ready");
+  assert.equal(
+    pushClient.pushes.length,
+    0,
+  );
+  assert.deepEqual(
+    (
+      await conversationRepository
+        .listMessages(
+          "inbox-line-conversation",
+        )
+    ).map((message) =>
+      message.senderType,
+    ),
+    ["user"],
+  );
+
+  const readConversation =
+    await service.markRead(
+      "inbox-line-conversation",
+    );
+  assert.equal(
+    readConversation.unread,
+    false,
+  );
+
+  const requestId =
+    "11111111-1111-4111-8111-111111111111";
+  pushClient.failNext = true;
+  await assert.rejects(
+    () =>
+      service.sendAssistedReply({
+        conversationId:
+          "inbox-line-conversation",
+        text: "Edited staff reply",
+        clientRequestId: requestId,
+        sourceMessageId:
+          "inbox-user-message",
+      }),
+    /LINE delivery failed/,
+  );
+  assert.equal(
+    (
+      await draftRepository.getDraft(
+        "inbox-line-conversation",
+        "inbox-user-message",
+      )
+    )?.status,
+    "ready",
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(
+          "inbox-line-conversation",
+        )
+    ).filter(
+      (message) =>
+        message.senderType === "human",
+    ).length,
+    0,
+  );
+
+  const delivered =
+    await service.sendAssistedReply({
+      conversationId:
+        "inbox-line-conversation",
+      text: "Edited staff reply",
+      clientRequestId: requestId,
+      sourceMessageId:
+        "inbox-user-message",
+    });
+  assert.equal(delivered.delivered, true);
+  assert.equal(delivered.duplicate, false);
+  assert.equal(
+    pushClient.pushes[0].channelUserId,
+    "trusted-line-user",
+  );
+  assert.equal(
+    pushClient.pushes[0].retryKey,
+    pushClient.pushes[1].retryKey,
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "inbox-line-conversation",
+        )
+    )?.mode,
+    "ai_active",
+  );
+  assert.equal(
+    (
+      await draftRepository.getDraft(
+        "inbox-line-conversation",
+        "inbox-user-message",
+      )
+    )?.status,
+    "sent",
+  );
+
+  const duplicate =
+    await service.sendAssistedReply({
+      conversationId:
+        "inbox-line-conversation",
+      text: "Edited staff reply",
+      clientRequestId: requestId,
+      sourceMessageId:
+        "inbox-user-message",
+    });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(pushClient.pushes.length, 2);
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(
+          "inbox-line-conversation",
+        )
+    ).filter(
+      (message) =>
+        message.senderType === "human",
+    ).length,
+    1,
+  );
+
+  await assert.rejects(
+    () =>
+      service.sendAssistedReply({
+        conversationId:
+          "inbox-line-conversation",
+        text: "Different text",
+        clientRequestId: requestId,
+      }),
+    AssistedStaffSendConflictError,
+  );
+  assert.equal(pushClient.pushes.length, 2);
+
+  await conversationRepository
+    .createConversation({
+      id: "expired-send-conversation",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId:
+        "line-account-1",
+      channelUserId:
+        "expired-send-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  const expiredPushClient =
+    new RecordingLinePushClient();
+  let retryNow =
+    "2027-01-01T00:00:00.000Z";
+  const retryWindowService =
+    new StaffInboxService({
+      conversationRepository,
+      draftRepository,
+      configService,
+      sendRepository,
+      linePushClient:
+        expiredPushClient,
+      now: () => retryNow,
+    });
+  const expiredRequestId =
+    "22222222-2222-4222-8222-222222222222";
+  expiredPushClient.failNext = true;
+  await assert.rejects(
+    () =>
+      retryWindowService
+        .sendAssistedReply({
+          conversationId:
+            "expired-send-conversation",
+          text: "Ambiguous delivery",
+          clientRequestId:
+            expiredRequestId,
+        }),
+    /LINE delivery failed/,
+  );
+  retryNow =
+    "2027-01-02T00:00:00.000Z";
+  await assert.rejects(
+    () =>
+      retryWindowService
+        .sendAssistedReply({
+          conversationId:
+            "expired-send-conversation",
+          text: "Ambiguous delivery",
+          clientRequestId:
+            expiredRequestId,
+        }),
+    /manual reconciliation/,
+  );
+  assert.equal(
+    expiredPushClient.pushes.length,
+    1,
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(
+          "expired-send-conversation",
+        )
+    ).filter(
+      (message) =>
+        message.senderType === "human",
+    ).length,
+    0,
+  );
+
+  const acceptedRetryClient =
+    new LineMessagingApiReplyClient({
+      channelAccessToken:
+        "line-access-token",
+      fetchImplementation: async () =>
+        new Response(null, {
+          status: 409,
+          headers: {
+            "x-line-accepted-request-id":
+              "accepted-request",
+          },
+        }),
+    });
+  const acceptedRetryService =
+    new StaffInboxService({
+      conversationRepository,
+      draftRepository,
+      configService,
+      sendRepository,
+      linePushClient:
+        acceptedRetryClient,
+      now: () =>
+        "2027-01-01T00:01:00.000Z",
+    });
+  const acceptedRetryResult =
+    await acceptedRetryService
+      .sendAssistedReply({
+        conversationId:
+          "inbox-line-conversation",
+        text:
+          "Accepted retry response",
+        clientRequestId:
+          "33333333-3333-4333-8333-333333333333",
+      });
+  assert.equal(
+    acceptedRetryResult.delivered,
+    true,
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(
+          "inbox-line-conversation",
+        )
+    ).filter(
+      (message) =>
+        message.senderType === "human",
+    ).length,
+    2,
+  );
+
+  for (const responseMode of [
+    "off",
+    "draft",
+    "auto",
+  ] as const) {
+    const config =
+      await service.updateResponseMode({
+        channelAccountId:
+          "line-account-1",
+        responseMode,
+      });
+    assert.equal(
+      config.responseMode,
+      responseMode,
+    );
+  }
+
+  await conversationRepository
+    .createConversation({
+      id: "legacy-inbox-conversation",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId:
+        "line-account-1",
+      channelUserId: "legacy-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:00.000Z",
+    });
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "legacy-inbox-conversation",
+        )
+    )?.lastInboundAt,
+    undefined,
+  );
+
+  await conversationRepository
+    .createConversation({
+      id: "failed-draft-conversation",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId:
+        "line-account-1",
+      channelUserId: "failed-user",
+      mode: "ai_active",
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      updatedAt:
+        "2027-01-01T00:00:01.000Z",
+    });
+  await conversationRepository.appendMessage({
+    id: "failed-source-message",
+    conversationId:
+      "failed-draft-conversation",
+    senderType: "user",
+    text: "Unsupported question",
+    createdAt:
+      "2027-01-01T00:00:01.000Z",
+  });
+  await draftRepository.saveDraft({
+    conversationId:
+      "failed-draft-conversation",
+    sourceMessageId:
+      "failed-source-message",
+    text: "",
+    status: "failed",
+    createdAt:
+      "2027-01-01T00:00:02.000Z",
+    updatedAt:
+      "2027-01-01T00:00:02.000Z",
+  });
+  assert.equal(
+    (
+      await service.getConversationDetail(
+        "failed-draft-conversation",
+      )
+    ).draft?.status,
+    "failed",
+  );
+
+  const listRoute = await import(
+    "@/app/api/admin/ui/inbox/conversations/route"
+  );
+  const unauthenticated =
+    await listRoute
+      .createInboxConversationListHandler(
+        () => service,
+      )(
+        new Request(
+          "http://localhost/api/admin/ui/inbox/conversations",
+        ),
+      );
+  assert.equal(
+    unauthenticated.status,
+    401,
+  );
+
+  const cookie =
+    buildAdminUiSessionCookie(
+      createAdminUiSessionToken(),
+    );
+  const authenticated =
+    await listRoute
+      .createInboxConversationListHandler(
+        () => service,
+      )(
+        new Request(
+          "http://localhost/api/admin/ui/inbox/conversations",
+          {
+            headers: {
+              cookie,
+            },
+          },
+        ),
+      );
+  assert.equal(authenticated.status, 200);
+
+  const modeRoute = await import(
+    "@/app/api/admin/ui/inbox/channel-response-configs/[channel]/[channelAccountId]/route"
+  );
+  const modeHandler =
+    modeRoute.createInboxModeHandler(
+      () => service,
+    );
+  const modeContext = {
+    params: Promise.resolve({
+      channel: "line",
+      channelAccountId:
+        "line-account-1",
+    }),
+  };
+  assert.equal(
+    (
+      await modeHandler(
+        new Request(
+          "http://localhost/mode",
+          {
+            method: "PUT",
+            body: JSON.stringify({
+              responseMode: "draft",
+            }),
+          },
+        ),
+        modeContext,
+      )
+    ).status,
+    401,
+  );
+  assert.equal(
+    (
+      await modeHandler(
+        new Request(
+          "http://localhost/mode",
+          {
+            method: "PUT",
+            headers: {
+              cookie,
+              "content-type":
+                "application/json",
+            },
+            body: JSON.stringify({
+              responseMode: "draft",
+            }),
+          },
+        ),
+        modeContext,
+      )
+    ).status,
+    200,
   );
 }
 
@@ -11689,6 +12520,7 @@ async function main() {
   await testLineResponseModesAndRedelivery();
   await testLineConversationResolution();
   await testLineReplyClientContract();
+  await testStaffInboxMvp();
   testResponseModePolicy();
   await testChannelResponseConfigRepositoriesAndResolver();
   await testSuggestedReplyDraftRepositoriesAndConversationSeparation();

@@ -8,6 +8,14 @@ import {
   useState,
 } from "react";
 
+import {
+  editStaffInboxComposer,
+  emptyStaffInboxComposer,
+  markStaffInboxComposerSaved,
+  synchronizeStaffInboxComposer,
+  type StaffInboxComposerState,
+} from "@/core/ai-platform/inbox/staff-inbox-composer-state";
+
 import styles from "./staff-inbox.module.css";
 
 type ResponseMode =
@@ -137,8 +145,11 @@ export function StaffInboxClient() {
     useState<string>();
   const [detail, setDetail] =
     useState<Detail>();
-  const [composerText, setComposerText] =
-    useState("");
+  const [composer, setComposer] =
+    useState<StaffInboxComposerState>(
+      emptyStaffInboxComposer(),
+    );
+  const composerText = composer.text;
   const [loading, setLoading] =
     useState(false);
   const [sending, setSending] =
@@ -225,7 +236,6 @@ export function StaffInboxClient() {
     async (
       conversationId: string,
       markRead: boolean,
-      preserveComposer = false,
     ) => {
       if (detailPollingRef.current) {
         return;
@@ -249,14 +259,15 @@ export function StaffInboxClient() {
         const body =
           await readJson<Detail>(response);
         setDetail(body);
-        if (!preserveComposer) {
-          setComposerText(
-            body.draft?.status === "ready"
-              ? body.draft.text
-              : "",
-          );
-          setSendRequestId(undefined);
-        }
+        setComposer((current) =>
+          synchronizeStaffInboxComposer(
+            current,
+            {
+              conversationId,
+              draft: body.draft,
+            },
+          ),
+        );
         setError("");
       } catch (failure) {
         setError(
@@ -309,7 +320,6 @@ export function StaffInboxClient() {
         void loadDetail(
           selectedId,
           false,
-          true,
         ),
       8000,
     );
@@ -380,6 +390,12 @@ export function StaffInboxClient() {
         ...detail,
         draft: body.draft,
       });
+      setComposer((current) =>
+        markStaffInboxComposerSaved(
+          current,
+          body.draft.sourceMessageId,
+        ),
+      );
       setNotice("Draft saved.");
     } catch (failure) {
       setError(
@@ -435,7 +451,11 @@ export function StaffInboxClient() {
           ? "Reply sent and AI resumed."
           : "Reply sent to LINE.",
       );
-      setComposerText("");
+      setComposer(
+        emptyStaffInboxComposer(
+          detail.conversation.id,
+        ),
+      );
       setSendRequestId(undefined);
       await loadDetail(
         detail.conversation.id,
@@ -473,7 +493,6 @@ export function StaffInboxClient() {
       await loadDetail(
         detail.conversation.id,
         false,
-        true,
       );
       await loadList(true);
     } catch (failure) {
@@ -695,6 +714,12 @@ export function StaffInboxClient() {
 
                       explicitSelectionRef.current =
                         true;
+                      setComposer(
+                        emptyStaffInboxComposer(
+                          conversation.id,
+                        ),
+                      );
+                      setSendRequestId(undefined);
                       setSelectedId(
                         conversation.id,
                       );
@@ -843,8 +868,11 @@ export function StaffInboxClient() {
                   rows={5}
                   placeholder="Write a reply to the LINE user"
                   onChange={(event) => {
-                    setComposerText(
-                      event.target.value,
+                    setComposer((current) =>
+                      editStaffInboxComposer(
+                        current,
+                        event.target.value,
+                      ),
                     );
                     setSendRequestId(undefined);
                   }}

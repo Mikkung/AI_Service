@@ -100,6 +100,13 @@ import {
 } from "../inbox/staff-inbox-service";
 
 import {
+  editStaffInboxComposer,
+  emptyStaffInboxComposer,
+  markStaffInboxComposerSaved,
+  synchronizeStaffInboxComposer,
+} from "../inbox/staff-inbox-composer-state";
+
+import {
   processLineWebhook,
   verifyLineWebhookSignature,
 } from "../integrations/line/line-webhook-adapter";
@@ -6523,6 +6530,177 @@ async function testStaffInboxMvp() {
     ).status,
     200,
   );
+}
+
+function testStaffInboxComposerSynchronization() {
+  const readyDraft = {
+    sourceMessageId: "message-1",
+    text: "AI suggested reply",
+    status: "ready" as const,
+  };
+  const beforeDraftIsReady =
+    synchronizeStaffInboxComposer(
+      emptyStaffInboxComposer(
+        "conversation-1",
+      ),
+      {
+        conversationId:
+          "conversation-1",
+        draft: null,
+      },
+    );
+  assert.deepEqual(
+    beforeDraftIsReady,
+    {
+      conversationId:
+        "conversation-1",
+      text: "",
+      dirty: false,
+    },
+  );
+
+  const populated =
+    synchronizeStaffInboxComposer(
+      beforeDraftIsReady,
+      {
+        conversationId:
+          "conversation-1",
+        draft: readyDraft,
+      },
+    );
+
+  assert.deepEqual(populated, {
+    conversationId: "conversation-1",
+    text: "AI suggested reply",
+    dirty: false,
+    sourceMessageId: "message-1",
+  });
+
+  const edited = editStaffInboxComposer(
+    populated,
+    "Staff-edited reply",
+  );
+  const sameDraftPoll =
+    synchronizeStaffInboxComposer(
+      edited,
+      {
+        conversationId:
+          "conversation-1",
+        draft: readyDraft,
+      },
+    );
+  assert.equal(
+    sameDraftPoll.text,
+    "Staff-edited reply",
+  );
+  assert.equal(
+    sameDraftPoll.dirty,
+    true,
+  );
+
+  const newerDraftPoll =
+    synchronizeStaffInboxComposer(
+      edited,
+      {
+        conversationId:
+          "conversation-1",
+        draft: {
+          sourceMessageId:
+            "message-2",
+          text: "New AI suggestion",
+          status: "ready",
+        },
+      },
+    );
+  assert.equal(
+    newerDraftPoll.text,
+    "Staff-edited reply",
+  );
+  assert.equal(
+    newerDraftPoll.sourceMessageId,
+    "message-1",
+  );
+
+  const switchedConversation =
+    synchronizeStaffInboxComposer(
+      edited,
+      {
+        conversationId:
+          "conversation-2",
+        draft: {
+          sourceMessageId:
+            "message-3",
+          text:
+            "Other conversation draft",
+          status: "ready",
+        },
+      },
+    );
+  assert.deepEqual(
+    switchedConversation,
+    {
+      conversationId:
+        "conversation-2",
+      text:
+        "Other conversation draft",
+      dirty: false,
+      sourceMessageId: "message-3",
+    },
+  );
+
+  const afterSend =
+    emptyStaffInboxComposer(
+      "conversation-2",
+    );
+  assert.deepEqual(afterSend, {
+    conversationId: "conversation-2",
+    text: "",
+    dirty: false,
+  });
+
+  const afterSave =
+    markStaffInboxComposerSaved(
+      editStaffInboxComposer(
+        switchedConversation,
+        "Saved staff text",
+      ),
+      "message-3",
+    );
+  assert.deepEqual(afterSave, {
+    conversationId: "conversation-2",
+    text: "Saved staff text",
+    dirty: false,
+    sourceMessageId: "message-3",
+  });
+
+  for (const status of [
+    "failed",
+    "sent",
+    "dismissed",
+  ] as const) {
+    const nonReady =
+      synchronizeStaffInboxComposer(
+        emptyStaffInboxComposer(
+          "conversation-3",
+        ),
+        {
+          conversationId:
+            "conversation-3",
+          draft: {
+            sourceMessageId:
+              `message-${status}`,
+            text:
+              "Must not populate",
+            status,
+          },
+        },
+      );
+    assert.equal(nonReady.text, "");
+    assert.equal(
+      nonReady.sourceMessageId,
+      undefined,
+    );
+  }
 }
 
 async function testStaffInboxResumeAI() {
@@ -12998,6 +13176,7 @@ async function main() {
   await testLineResponseModesAndRedelivery();
   await testLineConversationResolution();
   await testLineReplyClientContract();
+  testStaffInboxComposerSynchronization();
   await testStaffInboxMvp();
   await testStaffInboxResumeAI();
   await testLineProcessingAfterStaffResume();

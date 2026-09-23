@@ -29,6 +29,8 @@ import {
   type RequestHandoffWorkflowInput,
   type RequestHandoffWorkflowResult,
   type ResolveConversationWorkflowInput,
+  type ResolveHandoffAndResumeAIWorkflowInput,
+  type ResolveHandoffAndResumeAIWorkflowResult,
   type ReturnConversationToAIWorkflowInput,
   type TakeOverConversationWorkflowInput,
 } from "@/core/ai-platform/repositories/conversation-workflow-repository";
@@ -1704,6 +1706,111 @@ export class FirestoreAIPlatformConversationWorkflowRepository
         return cloneConversation(
           sanitized,
         );
+      },
+    );
+  }
+
+  async resolveHandoffAndResumeAI(
+    input: ResolveHandoffAndResumeAIWorkflowInput,
+  ): Promise<ResolveHandoffAndResumeAIWorkflowResult> {
+    return this.db.runTransaction(
+      async (transaction) => {
+        const {
+          conversation,
+          conversationRef,
+        } = await this.getRequiredConversation(
+          transaction,
+          input.conversationId,
+        );
+        const activeHandoff =
+          await this.getActiveHandoff(
+            transaction,
+            input.conversationId,
+          );
+
+        if (conversation.mode === "ai_active") {
+          if (activeHandoff) {
+            throw new ConversationInvariantError(
+              `AI-active conversation has active handoff: ${conversation.id}`,
+            );
+          }
+
+          return {
+            conversation:
+              cloneConversation(
+                conversation,
+              ),
+            resumed: false,
+          };
+        }
+
+        if (
+          conversation.mode !==
+            "waiting_human" &&
+          conversation.mode !==
+            "human_active"
+        ) {
+          throw new ConversationConflictError(
+            "Only active human handoff conversations can resume AI",
+          );
+        }
+
+        if (!activeHandoff) {
+          throw new ConversationInvariantError(
+            `Handoff conversation has no active handoff: ${conversation.id}`,
+          );
+        }
+
+        assertConversationTransition({
+          from: conversation.mode,
+          to: "resolved",
+        });
+        assertConversationTransition({
+          from: "resolved",
+          to: "ai_active",
+        });
+
+        const updatedConversation =
+          removeUndefinedFirestoreValues({
+            ...conversation,
+            mode: "ai_active" as const,
+            assignedAgentId:
+              undefined,
+            updatedAt:
+              input.resolvedAt,
+          });
+        const resolvedHandoff =
+          removeUndefinedFirestoreValues({
+            ...activeHandoff,
+            status: "resolved" as const,
+            resolvedAt:
+              input.resolvedAt,
+            resolutionNote:
+              input.resolutionNote,
+          });
+
+        transaction.set(
+          conversationRef,
+          serialize(updatedConversation),
+        );
+        transaction.set(
+          this.handoffRef(
+            activeHandoff.id,
+          ),
+          serialize(resolvedHandoff),
+        );
+
+        return {
+          conversation:
+            cloneConversation(
+              updatedConversation,
+            ),
+          handoff:
+            cloneHandoff(
+              resolvedHandoff,
+            ),
+          resumed: true,
+        };
       },
     );
   }

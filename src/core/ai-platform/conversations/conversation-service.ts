@@ -102,6 +102,11 @@ export interface ReturnConversationToAIInput {
   conversationId: string;
 }
 
+export interface ResolveHandoffAndResumeAIInput {
+  conversationId: string;
+  resolutionNote?: string;
+}
+
 export interface OutboundConversationMessage {
   text: string;
   senderType:
@@ -1099,6 +1104,38 @@ export class ConversationService {
     return {
       conversation:
         updated,
+      events: [],
+    };
+  }
+
+  async resolveHandoffAndResumeAI(
+    input: ResolveHandoffAndResumeAIInput,
+  ): Promise<ConversationServiceResult> {
+    const workflow =
+      this.dependencies
+        .conversationWorkflowRepository;
+
+    if (!workflow) {
+      throw new Error(
+        "Atomic conversation workflow repository is required to resume AI",
+      );
+    }
+
+    const result =
+      await workflow
+        .resolveHandoffAndResumeAI({
+          conversationId:
+            input.conversationId,
+          resolvedAt: this.now(),
+          resolutionNote:
+            input.resolutionNote ??
+            "returned_to_ai_by_staff",
+        });
+
+    return {
+      conversation:
+        result.conversation,
+      handoff: result.handoff,
       events: [],
     };
   }

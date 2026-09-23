@@ -9,6 +9,11 @@ import {
 } from "@/core/ai-platform/inbox/staff-inbox-service";
 
 import {
+  ConversationConflictError,
+  ConversationInvariantError,
+} from "@/core/ai-platform/repositories/conversation-workflow-repository";
+
+import {
   hasValidAdminUiSession,
 } from "@/lib/http/admin-ui-session";
 
@@ -60,7 +65,9 @@ export function inboxRouteError(
 
   if (
     error instanceof
-    AssistedStaffSendConflictError
+      AssistedStaffSendConflictError ||
+    error instanceof
+      ConversationConflictError
   ) {
     return Response.json(
       {
@@ -75,7 +82,9 @@ export function inboxRouteError(
 
   if (
     error instanceof
-    AssistedStaffSendInvariantError ||
+      AssistedStaffSendInvariantError ||
+    error instanceof
+      ConversationInvariantError ||
     (error instanceof Error &&
       /not found/i.test(error.message))
   ) {

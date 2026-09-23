@@ -150,6 +150,18 @@ export interface ReturnConversationToAIWorkflowInput {
   updatedAt: string;
 }
 
+export interface ResolveHandoffAndResumeAIWorkflowInput {
+  conversationId: string;
+  resolvedAt: string;
+  resolutionNote: string;
+}
+
+export interface ResolveHandoffAndResumeAIWorkflowResult {
+  conversation: Conversation;
+  handoff?: HumanHandoff;
+  resumed: boolean;
+}
+
 export interface ConditionalMessageWorkflowResult {
   conversation: Conversation;
   persisted: boolean;
@@ -209,4 +221,8 @@ export interface ConversationWorkflowRepository {
   returnConversationToAI(
     input: ReturnConversationToAIWorkflowInput,
   ): Promise<Conversation>;
+
+  resolveHandoffAndResumeAI(
+    input: ResolveHandoffAndResumeAIWorkflowInput,
+  ): Promise<ResolveHandoffAndResumeAIWorkflowResult>;
 }

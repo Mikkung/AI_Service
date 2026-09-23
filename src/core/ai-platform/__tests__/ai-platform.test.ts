@@ -94,6 +94,7 @@ import {
 } from "../integrations/line/line-reply-client";
 
 import {
+  LinePushDeliveryError,
   StaffInboxService,
   isConversationUnread,
 } from "../inbox/staff-inbox-service";
@@ -5912,6 +5913,8 @@ async function testStaffInboxMvp() {
   let nowIndex = 20;
   const service = new StaffInboxService({
     conversationRepository,
+    conversationWorkflowRepository:
+      workflow,
     draftRepository,
     configService,
     sendRepository,
@@ -6237,6 +6240,8 @@ async function testStaffInboxMvp() {
   const retryWindowService =
     new StaffInboxService({
       conversationRepository,
+      conversationWorkflowRepository:
+        workflow,
       draftRepository,
       configService,
       sendRepository,
@@ -6306,6 +6311,8 @@ async function testStaffInboxMvp() {
   const acceptedRetryService =
     new StaffInboxService({
       conversationRepository,
+      conversationWorkflowRepository:
+        workflow,
       draftRepository,
       configService,
       sendRepository,
@@ -6515,6 +6522,477 @@ async function testStaffInboxMvp() {
       )
     ).status,
     200,
+  );
+}
+
+async function testStaffInboxResumeAI() {
+  const provider = groundedCountingProvider(
+    "grounded resumed answer",
+  );
+  const {
+    db,
+    service: conversationService,
+    conversationRepository,
+    handoffRepository,
+    conversationWorkflowRepository,
+  } = createAtomicTestService(provider, {
+    now: () =>
+      "2027-01-01T00:10:00.000Z",
+  });
+  const configService =
+    new ChannelResponseConfigService(
+      new InMemoryChannelResponseConfigRepository(),
+      () =>
+        "2027-01-01T00:10:00.000Z",
+    );
+  const draftRepository =
+    new InMemorySuggestedReplyDraftRepository();
+  const sendRepository =
+    new FirestoreAssistedStaffSendRepository(
+      db as never,
+    );
+  const pushClient =
+    new RecordingLinePushClient();
+  const inboxService =
+    new StaffInboxService({
+      conversationRepository,
+      conversationWorkflowRepository,
+      draftRepository,
+      sendRepository,
+      configService,
+      linePushClient: pushClient,
+      now: () =>
+        "2027-01-01T00:10:00.000Z",
+    });
+
+  const waitingConversation =
+    await conversationService
+      .createConversation({
+        channel: "line",
+        channelAccountId:
+          "line-destination",
+        channelUserId:
+          "waiting-resume-user",
+      });
+  await conversationService
+    .requestHumanHandoff({
+      conversationId:
+        waitingConversation.id,
+      requestedBy: "ai",
+      reason:
+        "knowledge_not_found",
+    });
+
+  const waitingResume =
+    await inboxService.resumeAI(
+      waitingConversation.id,
+    );
+  assert.equal(
+    waitingResume.resumed,
+    true,
+  );
+  assert.equal(
+    waitingResume.conversation.mode,
+    "ai_active",
+  );
+  assert.equal(
+    waitingResume.conversation
+      .assignedAgentId,
+    undefined,
+  );
+  assert.equal(
+    waitingResume.handoff?.status,
+    "resolved",
+  );
+  assert.equal(
+    waitingResume.handoff?.resolvedAt,
+    "2027-01-01T00:10:00.000Z",
+  );
+  assert.equal(
+    waitingResume.handoff
+      ?.resolutionNote,
+    "returned_to_ai_by_staff",
+  );
+  assert.equal(
+    await handoffRepository
+      .getActiveHandoff(
+        waitingConversation.id,
+      ),
+    null,
+  );
+
+  const repeatedResume =
+    await inboxService.resumeAI(
+      waitingConversation.id,
+    );
+  assert.equal(
+    repeatedResume.resumed,
+    false,
+  );
+  assert.equal(
+    repeatedResume.conversation.mode,
+    "ai_active",
+  );
+
+  const activeConversation =
+    await conversationService
+      .createConversation({
+        channel: "line",
+        channelAccountId:
+          "line-destination",
+        channelUserId:
+          "active-resume-user",
+      });
+  await conversationService
+    .requestHumanHandoff({
+      conversationId:
+        activeConversation.id,
+      requestedBy: "staff",
+      reason: "staff_requested",
+    });
+  await conversationService
+    .takeOverConversation({
+      conversationId:
+        activeConversation.id,
+      agentId: "staff-agent",
+    });
+
+  const activeResume =
+    await inboxService.resumeAI(
+      activeConversation.id,
+    );
+  assert.equal(
+    activeResume.conversation.mode,
+    "ai_active",
+  );
+  assert.equal(
+    activeResume.conversation
+      .assignedAgentId,
+    undefined,
+  );
+  assert.equal(
+    activeResume.handoff
+      ?.assignedAgentId,
+    "staff-agent",
+  );
+  assert.equal(
+    activeResume.handoff?.status,
+    "resolved",
+  );
+
+  const sendOnlyConversation =
+    await conversationService
+      .createConversation({
+        channel: "line",
+        channelAccountId:
+          "line-destination",
+        channelUserId:
+          "send-only-user",
+      });
+  await conversationService
+    .requestHumanHandoff({
+      conversationId:
+        sendOnlyConversation.id,
+      requestedBy: "ai",
+      reason:
+        "knowledge_not_found",
+    });
+  await inboxService.sendAssistedReply({
+    conversationId:
+      sendOnlyConversation.id,
+    text: "Staff answer only",
+    clientRequestId:
+      "44444444-4444-4444-8444-444444444444",
+  });
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          sendOnlyConversation.id,
+        )
+    )?.mode,
+    "waiting_human",
+  );
+  assert.ok(
+    await handoffRepository
+      .getActiveHandoff(
+        sendOnlyConversation.id,
+      ),
+  );
+
+  const sendResumeConversation =
+    await conversationService
+      .createConversation({
+        channel: "line",
+        channelAccountId:
+          "line-destination",
+        channelUserId:
+          "send-resume-user",
+      });
+  await conversationService
+    .requestHumanHandoff({
+      conversationId:
+        sendResumeConversation.id,
+      requestedBy: "ai",
+      reason:
+        "knowledge_not_found",
+    });
+  const sendAndResume =
+    await inboxService
+      .sendAssistedReplyAndResumeAI({
+        conversationId:
+          sendResumeConversation.id,
+        text:
+          "Delivered before resume",
+        clientRequestId:
+          "55555555-5555-4555-8555-555555555555",
+      });
+  assert.equal(
+    sendAndResume.delivered,
+    true,
+  );
+  assert.equal(
+    sendAndResume.resumed,
+    true,
+  );
+  assert.equal(
+    sendAndResume.conversation.mode,
+    "ai_active",
+  );
+  const sendAndResumeRetry =
+    await inboxService
+      .sendAssistedReplyAndResumeAI({
+        conversationId:
+          sendResumeConversation.id,
+        text:
+          "Delivered before resume",
+        clientRequestId:
+          "55555555-5555-4555-8555-555555555555",
+      });
+  assert.equal(
+    sendAndResumeRetry.duplicate,
+    true,
+  );
+  assert.equal(
+    sendAndResumeRetry.resumed,
+    false,
+  );
+  assert.equal(
+    pushClient.pushes.filter(
+      (push) =>
+        push.text ===
+        "Delivered before resume",
+    ).length,
+    1,
+  );
+
+  const failedSendConversation =
+    await conversationService
+      .createConversation({
+        channel: "line",
+        channelAccountId:
+          "line-destination",
+        channelUserId:
+          "failed-send-resume-user",
+      });
+  await conversationService
+    .requestHumanHandoff({
+      conversationId:
+        failedSendConversation.id,
+      requestedBy: "ai",
+      reason:
+        "knowledge_not_found",
+    });
+  pushClient.failNext = true;
+  await assert.rejects(
+    () =>
+      inboxService
+        .sendAssistedReplyAndResumeAI({
+          conversationId:
+            failedSendConversation.id,
+          text: "Delivery fails",
+          clientRequestId:
+            "66666666-6666-4666-8666-666666666666",
+        }),
+    LinePushDeliveryError,
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          failedSendConversation.id,
+        )
+    )?.mode,
+    "waiting_human",
+  );
+  assert.ok(
+    await handoffRepository
+      .getActiveHandoff(
+        failedSendConversation.id,
+      ),
+  );
+
+  const resumeRoute = await import(
+    "@/app/api/admin/ui/inbox/conversations/[id]/resume-ai/route"
+  );
+  const handler =
+    resumeRoute.createInboxResumeAIHandler(
+      () => inboxService,
+    );
+  const routeConversation =
+    await conversationService
+      .createConversation({
+        channel: "line",
+        channelAccountId:
+          "line-destination",
+        channelUserId: "route-user",
+      });
+  await conversationService
+    .requestHumanHandoff({
+      conversationId:
+        routeConversation.id,
+      requestedBy: "staff",
+      reason: "staff_requested",
+    });
+  const routeContext = {
+    params: Promise.resolve({
+      id: routeConversation.id,
+    }),
+  };
+  assert.equal(
+    (
+      await handler(
+        new Request(
+          "http://localhost/resume-ai",
+          { method: "POST" },
+        ),
+        routeContext,
+      )
+    ).status,
+    401,
+  );
+  const routeResponse = await handler(
+    new Request(
+      "http://localhost/resume-ai",
+      {
+        method: "POST",
+        headers: {
+          cookie:
+            buildAdminUiSessionCookie(
+              createAdminUiSessionToken(),
+            ),
+        },
+      },
+    ),
+    routeContext,
+  );
+  assert.equal(routeResponse.status, 200);
+  assert.equal(
+    (
+      (await routeResponse.json()) as {
+        resumed: boolean;
+      }
+    ).resumed,
+    true,
+  );
+}
+
+async function testLineProcessingAfterStaffResume() {
+  const draftEnvironment =
+    await createLineTestEnvironment(
+      groundedResult("draft answer"),
+      "draft",
+    );
+  const firstDraft =
+    await draftEnvironment
+      .lineMessageService
+      .processTextEvent(lineTextEvent());
+  await draftEnvironment.service
+    .requestHumanHandoff({
+      conversationId:
+        firstDraft.conversationId,
+      requestedBy: "staff",
+      reason: "staff_requested",
+    });
+  await draftEnvironment.service
+    .resolveHandoffAndResumeAI({
+      conversationId:
+        firstDraft.conversationId,
+    });
+  const resumedDraft =
+    await draftEnvironment
+      .lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId:
+            "webhook-event-draft-2",
+          lineMessageId:
+            "line-message-draft-2",
+          replyToken:
+            "reply-token-draft-2",
+          text:
+            "Question after draft resume",
+        }),
+      );
+  assert.equal(
+    resumedDraft.draftStatus,
+    "ready",
+  );
+  assert.equal(
+    draftEnvironment.provider.calls,
+    2,
+  );
+  assert.equal(
+    draftEnvironment.replyClient
+      .replies.length,
+    0,
+  );
+
+  const autoEnvironment =
+    await createLineTestEnvironment(
+      groundedResult("auto answer"),
+      "auto",
+    );
+  const firstAuto =
+    await autoEnvironment
+      .lineMessageService
+      .processTextEvent(lineTextEvent());
+  await autoEnvironment.service
+    .requestHumanHandoff({
+      conversationId:
+        firstAuto.conversationId,
+      requestedBy: "staff",
+      reason: "staff_requested",
+    });
+  await autoEnvironment.service
+    .resolveHandoffAndResumeAI({
+      conversationId:
+        firstAuto.conversationId,
+    });
+  const resumedAuto =
+    await autoEnvironment
+      .lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId:
+            "webhook-event-auto-2",
+          lineMessageId:
+            "line-message-auto-2",
+          replyToken:
+            "reply-token-auto-2",
+          text:
+            "Question after auto resume",
+        }),
+      );
+  assert.equal(resumedAuto.replied, true);
+  assert.equal(
+    autoEnvironment.provider.calls,
+    2,
+  );
+  assert.equal(
+    autoEnvironment.replyClient
+      .replies.length,
+    2,
   );
 }
 
@@ -12521,6 +12999,8 @@ async function main() {
   await testLineConversationResolution();
   await testLineReplyClientContract();
   await testStaffInboxMvp();
+  await testStaffInboxResumeAI();
+  await testLineProcessingAfterStaffResume();
   testResponseModePolicy();
   await testChannelResponseConfigRepositoriesAndResolver();
   await testSuggestedReplyDraftRepositoriesAndConversationSeparation();

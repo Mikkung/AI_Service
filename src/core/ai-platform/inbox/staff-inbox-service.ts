@@ -15,6 +15,10 @@ import type {
 } from "@/core/ai-platform/repositories/conversation-repository";
 
 import type {
+  ConversationWorkflowRepository,
+} from "@/core/ai-platform/repositories/conversation-workflow-repository";
+
+import type {
   SuggestedReplyDraftRepository,
 } from "@/core/ai-platform/repositories/suggested-reply-draft-repository";
 
@@ -83,6 +87,10 @@ export interface StaffInboxServiceDependencies {
     "resolveResponseMode" | "updateResponseMode"
   >;
   linePushClient: LinePushClient;
+  conversationWorkflowRepository: Pick<
+    ConversationWorkflowRepository,
+    "resolveHandoffAndResumeAI"
+  >;
   now?: () => string;
 }
 
@@ -429,6 +437,42 @@ export class StaffInboxService {
         toInboxConversation(
           completed.conversation,
         ),
+    };
+  }
+
+  async resumeAI(
+    conversationId: string,
+  ) {
+    await this.requireLineConversation(
+      conversationId,
+    );
+
+    return this.dependencies
+      .conversationWorkflowRepository
+      .resolveHandoffAndResumeAI({
+        conversationId,
+        resolvedAt: this.now(),
+        resolutionNote:
+          "returned_to_ai_by_staff",
+      });
+  }
+
+  async sendAssistedReplyAndResumeAI(
+    input: SendAssistedReplyInput,
+  ) {
+    const delivery =
+      await this.sendAssistedReply(input);
+    const resume = await this.resumeAI(
+      input.conversationId,
+    );
+
+    return {
+      ...delivery,
+      conversation:
+        toInboxConversation(
+          resume.conversation,
+        ),
+      resumed: resume.resumed,
     };
   }
 

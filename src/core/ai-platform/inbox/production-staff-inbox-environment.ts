@@ -19,6 +19,10 @@ import {
 } from "@/core/ai-platform/repositories/firestore/firestore-ai-platform-conversation-repository";
 
 import {
+  FirestoreAIPlatformConversationWorkflowRepository,
+} from "@/core/ai-platform/repositories/firestore/firestore-ai-platform-conversation-workflow-repository";
+
+import {
   FirestoreChannelResponseConfigRepository,
 } from "@/core/ai-platform/repositories/firestore/firestore-channel-response-config-repository";
 
@@ -46,12 +50,15 @@ export function createProductionStaffInboxEnvironment() {
     });
   const sendRepository =
     new FirestoreAssistedStaffSendRepository();
+  const conversationWorkflowRepository =
+    new FirestoreAIPlatformConversationWorkflowRepository();
   const service = new StaffInboxService({
     conversationRepository,
     draftRepository,
     configService,
     linePushClient,
     sendRepository,
+    conversationWorkflowRepository,
   });
 
   return {
@@ -61,5 +68,6 @@ export function createProductionStaffInboxEnvironment() {
     configService,
     linePushClient,
     sendRepository,
+    conversationWorkflowRepository,
   };
 }

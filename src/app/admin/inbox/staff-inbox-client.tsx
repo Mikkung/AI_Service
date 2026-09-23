@@ -143,6 +143,8 @@ export function StaffInboxClient() {
     useState(false);
   const [sending, setSending] =
     useState(false);
+  const [resuming, setResuming] =
+    useState(false);
   const [saving, setSaving] =
     useState(false);
   const [modeSaving, setModeSaving] =
@@ -390,7 +392,9 @@ export function StaffInboxClient() {
     }
   }
 
-  async function sendReply() {
+  async function sendReply(
+    resumeAI = false,
+  ) {
     if (!detail || !composerText.trim()) {
       return;
     }
@@ -421,11 +425,16 @@ export function StaffInboxClient() {
                   ? detail.draft
                       .sourceMessageId
                   : undefined,
+              resumeAI,
             }),
           },
         ),
       );
-      setNotice("Reply sent to LINE.");
+      setNotice(
+        resumeAI
+          ? "Reply sent and AI resumed."
+          : "Reply sent to LINE.",
+      );
       setComposerText("");
       setSendRequestId(undefined);
       await loadDetail(
@@ -441,6 +450,40 @@ export function StaffInboxClient() {
       );
     } finally {
       setSending(false);
+    }
+  }
+
+  async function resumeAI() {
+    if (!detail) {
+      return;
+    }
+
+    setResuming(true);
+    setError("");
+    setNotice("");
+
+    try {
+      await readJson(
+        await fetch(
+          `/api/admin/ui/inbox/conversations/${encodeURIComponent(detail.conversation.id)}/resume-ai`,
+          { method: "POST" },
+        ),
+      );
+      setNotice("AI processing resumed.");
+      await loadDetail(
+        detail.conversation.id,
+        false,
+        true,
+      );
+      await loadList(true);
+    } catch (failure) {
+      setError(
+        failure instanceof Error
+          ? failure.message
+          : "Could not resume AI.",
+      );
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -722,6 +765,25 @@ export function StaffInboxClient() {
                 </span>
               </div>
 
+              {(detail.conversation.mode ===
+                "waiting_human" ||
+                detail.conversation.mode ===
+                  "human_active") && (
+                <div className={styles.resumePanel}>
+                  <p>
+                    Close the current human handoff and allow AI processing again.
+                  </p>
+                  <button
+                    type="button"
+                    className={styles.secondaryButton}
+                    disabled={resuming || sending}
+                    onClick={() => void resumeAI()}
+                  >
+                    {resuming ? "Resuming..." : "Resume AI"}
+                  </button>
+                </div>
+              )}
+
               <div className={styles.messages}>
                 {detail.messages.length === 0 ? (
                   <p className={styles.emptyList}>
@@ -806,11 +868,24 @@ export function StaffInboxClient() {
                     <button
                       type="button"
                       className={styles.sendButton}
-                      disabled={sending || !composerText.trim()}
-                      onClick={() => void sendReply()}
+                      disabled={sending || resuming || !composerText.trim()}
+                      onClick={() => void sendReply(false)}
                     >
                       {sending ? "Sending..." : "Send to LINE"}
                     </button>
+                    {(detail.conversation.mode ===
+                      "waiting_human" ||
+                      detail.conversation.mode ===
+                        "human_active") && (
+                      <button
+                        type="button"
+                        className={styles.sendAndResumeButton}
+                        disabled={sending || resuming || !composerText.trim()}
+                        onClick={() => void sendReply(true)}
+                      >
+                        {sending ? "Sending..." : "Send & Resume AI"}
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>

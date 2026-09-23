@@ -23,6 +23,7 @@ const bodySchema = z.object({
   clientRequestId: z.string().uuid(),
   sourceMessageId:
     z.string().trim().min(1).max(300).optional(),
+  resumeAI: z.boolean().optional().default(false),
 }).strict();
 
 interface Context {
@@ -31,7 +32,8 @@ interface Context {
 
 type ServiceFactory = () => Pick<
   StaffInboxService,
-  "sendAssistedReply"
+  | "sendAssistedReply"
+  | "sendAssistedReplyAndResumeAI"
 >;
 
 export function createInboxSendHandler(
@@ -68,12 +70,20 @@ export function createInboxSendHandler(
 
     try {
       const { id } = await context.params;
-      const result =
-        await serviceFactory()
-          .sendAssistedReply({
-            conversationId: id,
-            ...body.data,
-          });
+      const service = serviceFactory();
+      const { resumeAI, ...sendInput } =
+        body.data;
+      const result = resumeAI
+        ? await service
+            .sendAssistedReplyAndResumeAI({
+              conversationId: id,
+              ...sendInput,
+            })
+        : await service
+            .sendAssistedReply({
+              conversationId: id,
+              ...sendInput,
+            });
       return Response.json({
         ok: true,
         ...result,

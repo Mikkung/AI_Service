@@ -30,6 +30,18 @@ function cloneMessage(
 ): ConversationMessage {
   return {
     ...message,
+    attachments:
+      message.attachments?.map(
+        (attachment) => ({
+          ...attachment,
+          metadata:
+            attachment.metadata
+              ? {
+                  ...attachment.metadata,
+                }
+              : undefined,
+        }),
+      ),
     citations:
       message.citations?.map(
         (citation) => ({

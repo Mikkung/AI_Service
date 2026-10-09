@@ -320,6 +320,66 @@
   font-size: 9px;
 }
 
+.attachmentCard {
+  width: min(360px, 100%);
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 10px;
+  margin: 9px 0;
+  padding: 9px;
+  border: 1px solid #d8dee8;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.attachmentPreview {
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid #e2e6ec;
+  border-radius: 4px;
+  background: #f4f6f8;
+  color: #788499;
+  font-size: 10px;
+  text-align: center;
+}
+
+.attachmentPreview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.attachmentBody {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.attachmentBody strong {
+  color: #263249;
+  font-size: 11px;
+}
+
+.attachmentBody span,
+.attachmentBody small {
+  color: #758198;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.attachmentBody p {
+  margin: 3px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.attachmentBody .sensitiveLabel {
+  color: #a05d16;
+}
+
 .message.ai,
 .message.human {
   align-self: flex-end;

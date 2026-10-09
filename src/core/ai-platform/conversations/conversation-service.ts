@@ -18,6 +18,10 @@ import {
   assertConversationTransition,
 } from "@/core/ai-platform/conversations/conversation-transitions";
 
+import {
+  getConversationContextText,
+} from "@/core/ai-platform/conversations/conversation-context";
+
 import type {
   ConversationDomainEvent,
 } from "@/core/ai-platform/events/conversation-events";
@@ -26,8 +30,9 @@ import type {
   ConversationRepository,
 } from "@/core/ai-platform/repositories/conversation-repository";
 
-import type {
-  ConversationWorkflowRepository,
+import {
+  ConversationInvariantError,
+  type ConversationWorkflowRepository,
 } from "@/core/ai-platform/repositories/conversation-workflow-repository";
 
 import type {
@@ -1154,6 +1159,62 @@ export class ConversationService {
       message,
     } = input;
 
+    const recoveringImageAttachment =
+      input.recoveredInbound &&
+      message.attachments?.find(
+        (attachment) =>
+          attachment.type === "image" &&
+          attachment.analysisStatus ===
+            "processing",
+      );
+
+    if (recoveringImageAttachment) {
+      if (
+        !input.channelMessageId ||
+        !input.processingToken
+      ) {
+        throw new ConversationInvariantError(
+          "Recovered image processing is missing ownership",
+        );
+      }
+
+      const completed =
+        await this.dependencies
+          .conversationWorkflowRepository
+          ?.completeImageAnalysisIfOwned({
+            conversationId:
+              conversation.id,
+            channelMessageId:
+              input.channelMessageId,
+            processingToken:
+              input.processingToken,
+            attachment: {
+              ...recoveringImageAttachment,
+              analysisStatus: "failed",
+              requiresHumanReview: true,
+              metadata: {
+                failureCode:
+                  "image_processing_recovery_required",
+              },
+            },
+            completedAt: this.now(),
+            completionOutcome:
+              "image_analysis_recovery_required",
+          });
+
+      if (!completed) {
+        throw new ConversationInvariantError(
+          "Recovered image processing ownership was lost",
+        );
+      }
+
+      return {
+        conversation,
+        events: [],
+        recoveredInbound: true,
+      };
+    }
+
     if (conversation.mode !== "ai_active") {
       return {
         conversation,
@@ -1507,7 +1568,9 @@ export class ConversationService {
             ? ("user" as const)
             : ("assistant" as const),
         text:
-          message.text,
+          getConversationContextText(
+            message,
+          ),
       }))
       .filter(
         (message) =>

@@ -4,6 +4,10 @@ import type {
   HumanHandoff,
 } from "@/core/ai-platform/types/conversations";
 
+import type {
+  MessageAttachment,
+} from "@/core/ai-platform/types/media";
+
 export class ConversationConflictError extends Error {
   constructor(message: string) {
     super(message);
@@ -105,6 +109,13 @@ export interface CompleteInboundProcessingIfOwnedInput
   completionOutcome: string;
 }
 
+export interface CompleteImageAnalysisIfOwnedInput
+  extends InboundProcessingOwnershipInput {
+  attachment: MessageAttachment;
+  completedAt: string;
+  completionOutcome: string;
+}
+
 export interface PersistAiMessageForInboundIfOwnedInput
   extends InboundProcessingOwnershipInput {
   message: ConversationMessage;
@@ -190,6 +201,10 @@ export interface ConversationWorkflowRepository {
 
   completeInboundProcessingIfOwned(
     input: CompleteInboundProcessingIfOwnedInput,
+  ): Promise<boolean>;
+
+  completeImageAnalysisIfOwned(
+    input: CompleteImageAnalysisIfOwnedInput,
   ): Promise<boolean>;
 
   persistHumanMessageIfOwned(

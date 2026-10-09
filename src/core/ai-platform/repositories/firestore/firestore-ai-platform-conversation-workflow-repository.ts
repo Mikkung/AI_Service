@@ -14,6 +14,7 @@ import {
   type AppendUserMessageInput,
   type ClaimExpiredInboundProcessingInput,
   type ClaimExpiredInboundProcessingResult,
+  type CompleteImageAnalysisIfOwnedInput,
   type CompleteInboundProcessingIfOwnedInput,
   type ConditionalMessageWorkflowResult,
   type ConversationWorkflowRepository,
@@ -183,6 +184,18 @@ function cloneMessage(
 ): ConversationMessage {
   return {
     ...message,
+    attachments:
+      message.attachments?.map(
+        (attachment) => ({
+          ...attachment,
+          metadata:
+            attachment.metadata
+              ? {
+                  ...attachment.metadata,
+                }
+              : undefined,
+        }),
+      ),
     citations:
       message.citations?.map(
         (citation) => ({
@@ -988,6 +1001,90 @@ export class FirestoreAIPlatformConversationWorkflowRepository
           return false;
         }
 
+        transaction.set(
+          ownership.receiptRef,
+          serialize(
+            this.completeReceipt(
+              ownership.receipt,
+              input.completedAt,
+              input.completionOutcome,
+            ),
+          ),
+        );
+
+        return true;
+      },
+    );
+  }
+
+  async completeImageAnalysisIfOwned(
+    input: CompleteImageAnalysisIfOwnedInput,
+  ): Promise<boolean> {
+    return this.db.runTransaction(
+      async (transaction) => {
+        const ownership =
+          await this.getInboundProcessingOwnership(
+            transaction,
+            input,
+          );
+
+        if (!ownership.owned) {
+          return false;
+        }
+
+        const messageRef = this.messageRef(
+          ownership.receipt.messageId,
+        );
+        const messageSnapshot =
+          assertDocumentSnapshot(
+            await transaction.get(
+              messageRef,
+            ),
+          );
+
+        if (!messageSnapshot.exists) {
+          throw new ConversationInvariantError(
+            `Inbound image message is missing: ${ownership.receipt.messageId}`,
+          );
+        }
+
+        const message =
+          mapMessageSnapshot(
+            messageSnapshot,
+          );
+        const attachmentIndex =
+          message.attachments?.findIndex(
+            (attachment) =>
+              attachment.id ===
+              input.attachment.id,
+          ) ?? -1;
+
+        if (attachmentIndex < 0) {
+          throw new ConversationInvariantError(
+            `Inbound image attachment is missing: ${input.attachment.id}`,
+          );
+        }
+
+        const attachments = [
+          ...(message.attachments ?? []),
+        ];
+        attachments[attachmentIndex] = {
+          ...input.attachment,
+          metadata:
+            input.attachment.metadata
+              ? {
+                  ...input.attachment.metadata,
+                }
+              : undefined,
+        };
+
+        transaction.set(
+          messageRef,
+          serialize({
+            ...message,
+            attachments,
+          }),
+        );
         transaction.set(
           ownership.receiptRef,
           serialize(

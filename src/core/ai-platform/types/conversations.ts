@@ -7,6 +7,10 @@ import type {
   Citation,
 } from "@/core/ai-platform/types/citations";
 
+import type {
+  MessageAttachment,
+} from "@/core/ai-platform/types/media";
+
 export type ConversationMode =
   | "ai_active"
   | "waiting_human"
@@ -66,6 +70,7 @@ export interface ConversationMessage {
   text: string;
   createdAt: string;
   channelMessageId?: string;
+  attachments?: MessageAttachment[];
   citations?: Citation[];
   metadata?: Record<string, unknown>;
 }

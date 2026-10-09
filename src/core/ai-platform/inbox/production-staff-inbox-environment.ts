@@ -7,6 +7,10 @@ import {
 } from "@/core/ai-platform/integrations/line/line-reply-client";
 
 import {
+  LineMessagingApiMediaClient,
+} from "@/core/ai-platform/integrations/line/line-media-client";
+
+import {
   StaffInboxService,
 } from "@/core/ai-platform/inbox/staff-inbox-service";
 
@@ -48,6 +52,11 @@ export function createProductionStaffInboxEnvironment() {
       channelAccessToken:
         env.LINE_CHANNEL_ACCESS_TOKEN,
     });
+  const lineMediaClient =
+    new LineMessagingApiMediaClient({
+      channelAccessToken:
+        env.LINE_CHANNEL_ACCESS_TOKEN,
+    });
   const sendRepository =
     new FirestoreAssistedStaffSendRepository();
   const conversationWorkflowRepository =
@@ -57,6 +66,7 @@ export function createProductionStaffInboxEnvironment() {
     draftRepository,
     configService,
     linePushClient,
+    lineMediaClient,
     sendRepository,
     conversationWorkflowRepository,
   });
@@ -67,6 +77,7 @@ export function createProductionStaffInboxEnvironment() {
     draftRepository,
     configService,
     linePushClient,
+    lineMediaClient,
     sendRepository,
     conversationWorkflowRepository,
   };

@@ -7,6 +7,11 @@ import type {
 } from "@/core/ai-platform/integrations/line/line-reply-client";
 
 import type {
+  LineMediaClient,
+  LineMediaContent,
+} from "@/core/ai-platform/integrations/line/line-media-client";
+
+import type {
   AssistedStaffSendRepository,
 } from "@/core/ai-platform/repositories/assisted-staff-send-repository";
 
@@ -68,6 +73,7 @@ export type StaffInboxMessage = Pick<
   | "senderId"
   | "text"
   | "createdAt"
+  | "attachments"
   | "citations"
 >;
 
@@ -87,6 +93,7 @@ export interface StaffInboxServiceDependencies {
     "resolveResponseMode" | "updateResponseMode"
   >;
   linePushClient: LinePushClient;
+  lineMediaClient: LineMediaClient;
   conversationWorkflowRepository: Pick<
     ConversationWorkflowRepository,
     "resolveHandoffAndResumeAI"
@@ -265,6 +272,8 @@ export class StaffInboxService {
           text: message.text,
           createdAt:
             message.createdAt,
+          attachments:
+            message.attachments,
           citations:
             message.citations,
         }),
@@ -274,6 +283,52 @@ export class StaffInboxService {
       latestInboundMessageId:
         latestInbound?.id,
     };
+  }
+
+  async getImagePreview(input: {
+    conversationId: string;
+    messageId: string;
+  }): Promise<LineMediaContent> {
+    await this.requireLineConversation(
+      input.conversationId,
+    );
+    const messages =
+      await this.dependencies
+        .conversationRepository
+        .listMessages(
+          input.conversationId,
+        );
+    const message = messages.find(
+      (candidate) =>
+        candidate.id ===
+        input.messageId,
+    );
+
+    if (!message) {
+      throw new Error(
+        `Conversation message not found: ${input.messageId}`,
+      );
+    }
+
+    const attachment =
+      message.attachments?.find(
+        (candidate) =>
+          candidate.type === "image" &&
+          candidate.source === "line" &&
+          candidate.sourceMediaId,
+      );
+
+    if (!attachment?.sourceMediaId) {
+      throw new Error(
+        "LINE image attachment not found",
+      );
+    }
+
+    return this.dependencies
+      .lineMediaClient
+      .getImagePreview(
+        attachment.sourceMediaId,
+      );
   }
 
   async markRead(

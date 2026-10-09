@@ -54,6 +54,22 @@ type Message = {
     | "system";
   text: string;
   createdAt: string;
+  attachments?: Array<{
+    id: string;
+    type: "image";
+    analysisStatus?:
+      | "not_requested"
+      | "processing"
+      | "ready"
+      | "failed"
+      | "blocked";
+    safeContextText?: string;
+    category?: string;
+    sensitivity?:
+      | "none"
+      | "personal"
+      | "sensitive";
+  }>;
 };
 
 type Draft = {
@@ -162,6 +178,10 @@ export function StaffInboxClient() {
     useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [expiredPreviews, setExpiredPreviews] =
+    useState<Set<string>>(
+      () => new Set(),
+    );
   const [sendRequestId, setSendRequestId] =
     useState<string>();
   const pollingRef = useRef(false);
@@ -830,6 +850,67 @@ export function StaffInboxClient() {
                               : "System"}
                       </span>
                       <p>{message.text}</p>
+                      {message.attachments?.map(
+                        (attachment) => (
+                          <div
+                            key={attachment.id}
+                            className={styles.attachmentCard}
+                          >
+                            <div className={styles.attachmentPreview}>
+                              {expiredPreviews.has(
+                                message.id,
+                              ) ? (
+                                <span>
+                                  Preview expired
+                                </span>
+                              ) : (
+                                <img
+                                  src={`/api/admin/ui/inbox/conversations/${encodeURIComponent(detail.conversation.id)}/messages/${encodeURIComponent(message.id)}/media-preview`}
+                                  alt="Temporary LINE image preview"
+                                  loading="lazy"
+                                  onError={() =>
+                                    setExpiredPreviews(
+                                      (current) => {
+                                        const next =
+                                          new Set(
+                                            current,
+                                          );
+                                        next.add(
+                                          message.id,
+                                        );
+                                        return next;
+                                      },
+                                    )
+                                  }
+                                />
+                              )}
+                            </div>
+                            <div className={styles.attachmentBody}>
+                              <strong>Image</strong>
+                              <span>
+                                {attachment.analysisStatus?.replaceAll("_", " ") ?? "received"}
+                              </span>
+                              {attachment.category && (
+                                <small>
+                                  {attachment.category.replaceAll("_", " ")}
+                                </small>
+                              )}
+                              {attachment.sensitivity &&
+                                attachment.sensitivity !==
+                                  "none" && (
+                                  <small className={styles.sensitiveLabel}>
+                                    Sensitive content protected
+                                  </small>
+                                )}
+                              {attachment.safeContextText && (
+                                <p>
+                                  {attachment.safeContextText}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        ),
+                      )}
                       <time>
                         {formatTime(message.createdAt)}
                       </time>

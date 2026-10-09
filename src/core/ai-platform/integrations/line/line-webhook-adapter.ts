@@ -4,6 +4,7 @@ import {
 } from "node:crypto";
 
 import type {
+  LineImageInboundEvent,
   LineMessageService,
   LineTextInboundEvent,
 } from "@/core/ai-platform/integrations/line/line-message-service";
@@ -11,6 +12,24 @@ import type {
 interface ParsedLineWebhook {
   destination?: string;
   events: unknown[];
+}
+
+function getChannelMessageId(
+  event: Record<string, unknown>,
+  lineMessageId: unknown,
+): string | undefined {
+  const webhookEventId =
+    event.webhookEventId;
+
+  return typeof webhookEventId ===
+    "string" &&
+    webhookEventId.length > 0
+    ? webhookEventId
+    : typeof lineMessageId ===
+          "string" &&
+        lineMessageId.length > 0
+      ? `line-message:${lineMessageId}`
+      : undefined;
 }
 
 export interface LineWebhookSummary {
@@ -126,19 +145,12 @@ function normalizeTextEvent(
     return null;
   }
 
-  const webhookEventId =
-    event.webhookEventId;
   const lineMessageId = message.id;
   const channelMessageId =
-    typeof webhookEventId ===
-      "string" &&
-    webhookEventId.length > 0
-      ? webhookEventId
-      : typeof lineMessageId ===
-            "string" &&
-          lineMessageId.length > 0
-        ? `line-message:${lineMessageId}`
-        : undefined;
+    getChannelMessageId(
+      event,
+      lineMessageId,
+    );
 
   if (
     !destination ||
@@ -171,11 +183,78 @@ function normalizeTextEvent(
   };
 }
 
+function normalizeImageEvent(
+  event: unknown,
+  destination: string | undefined,
+): LineImageInboundEvent | null {
+  if (
+    !isRecord(event) ||
+    event.type !== "message"
+  ) {
+    return null;
+  }
+
+  const message = event.message;
+  const source = event.source;
+
+  if (
+    !isRecord(message) ||
+    message.type !== "image"
+  ) {
+    return null;
+  }
+
+  if (
+    !isRecord(source) ||
+    source.type !== "user"
+  ) {
+    return null;
+  }
+
+  const contentProvider =
+    message.contentProvider;
+  const lineMessageId = message.id;
+  const channelMessageId =
+    getChannelMessageId(
+      event,
+      lineMessageId,
+    );
+
+  if (
+    !destination ||
+    typeof source.userId !== "string" ||
+    !source.userId ||
+    typeof event.replyToken !== "string" ||
+    !event.replyToken ||
+    typeof lineMessageId !== "string" ||
+    !lineMessageId ||
+    !channelMessageId ||
+    !isRecord(contentProvider) ||
+    typeof contentProvider.type !==
+      "string"
+  ) {
+    throw new Error(
+      "Malformed LINE image message event",
+    );
+  }
+
+  return {
+    channelAccountId: destination,
+    channelUserId: source.userId,
+    channelMessageId,
+    lineMessageId,
+    replyToken: event.replyToken,
+    contentProviderType:
+      contentProvider.type,
+  };
+}
+
 export async function processLineWebhook(
   rawBody: Uint8Array,
   lineMessageService: Pick<
     LineMessageService,
-    "processTextEvent"
+    | "processTextEvent"
+    | "processImageEvent"
   >,
 ): Promise<LineWebhookSummary> {
   const webhook = parseWebhook(rawBody);
@@ -183,19 +262,36 @@ export async function processLineWebhook(
   let ignored = 0;
 
   for (const event of webhook.events) {
-    const normalized =
+    const normalizedText =
       normalizeTextEvent(
         event,
         webhook.destination,
       );
 
-    if (!normalized) {
+    if (normalizedText) {
+      await lineMessageService
+        .processTextEvent(
+          normalizedText,
+        );
+      processed += 1;
+      continue;
+    }
+
+    const normalizedImage =
+      normalizeImageEvent(
+        event,
+        webhook.destination,
+      );
+
+    if (!normalizedImage) {
       ignored += 1;
       continue;
     }
 
     await lineMessageService
-      .processTextEvent(normalized);
+      .processImageEvent(
+        normalizedImage,
+      );
     processed += 1;
   }
 

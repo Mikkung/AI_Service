@@ -22,7 +22,8 @@ interface LineWebhookRouteDependencies {
   channelSecret: string;
   createLineMessageService(): Pick<
     LineMessageService,
-    "processTextEvent"
+    | "processTextEvent"
+    | "processImageEvent"
   >;
 }
 

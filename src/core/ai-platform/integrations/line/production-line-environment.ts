@@ -11,6 +11,10 @@ import {
 } from "@/core/ai-platform/integrations/line/line-message-service";
 
 import {
+  LineMessagingApiMediaClient,
+} from "@/core/ai-platform/integrations/line/line-media-client";
+
+import {
   LineMessagingApiReplyClient,
 } from "@/core/ai-platform/integrations/line/line-reply-client";
 
@@ -21,6 +25,10 @@ import {
 import {
   FirestoreSuggestedReplyDraftRepository,
 } from "@/core/ai-platform/repositories/firestore/firestore-suggested-reply-draft-repository";
+
+import {
+  OpenAIImageUnderstandingProvider,
+} from "@/core/ai-platform/providers/openai/openai-image-understanding-provider";
 
 import {
   env,
@@ -40,6 +48,13 @@ export function createProductionLineEnvironment() {
       channelAccessToken:
         env.LINE_CHANNEL_ACCESS_TOKEN,
     });
+  const mediaClient =
+    new LineMessagingApiMediaClient({
+      channelAccessToken:
+        env.LINE_CHANNEL_ACCESS_TOKEN,
+    });
+  const imageUnderstandingProvider =
+    new OpenAIImageUnderstandingProvider();
   const lineMessageService =
     new LineMessageService({
       configService,
@@ -56,9 +71,12 @@ export function createProductionLineEnvironment() {
           .answerService,
       draftRepository,
       replyClient,
+      mediaClient,
+      imageUnderstandingProvider,
     });
 
   return {
     lineMessageService,
+    mediaClient,
   };
 }

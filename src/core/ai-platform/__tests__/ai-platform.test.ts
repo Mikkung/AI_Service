@@ -84,8 +84,31 @@ import {
 
 import {
   LineMessageService,
+  type LineImageInboundEvent,
   type LineTextInboundEvent,
 } from "../integrations/line/line-message-service";
+
+import {
+  LineMediaBlockedError,
+  LineMediaUnavailableError,
+  LineMessagingApiMediaClient,
+  type LineMediaClient,
+  type LineMediaContent,
+} from "../integrations/line/line-media-client";
+
+import type {
+  ImageUnderstandingProvider,
+  ImageUnderstandingRequest,
+  ImageUnderstandingResult,
+} from "../media/image-understanding-provider";
+
+import {
+  sanitizeImageUnderstandingResult,
+} from "../media/media-privacy-policy";
+
+import {
+  OpenAIImageUnderstandingProvider,
+} from "../providers/openai/openai-image-understanding-provider";
 
 import {
   LineMessagingApiReplyClient,
@@ -1192,6 +1215,122 @@ class RecordingLinePushClient
   }
 }
 
+class RecordingLineMediaClient
+  implements LineMediaClient
+{
+  contentCalls: string[] = [];
+
+  previewCalls: string[] = [];
+
+  content: LineMediaContent = {
+    bytes: new Uint8Array([
+      1,
+      2,
+      3,
+    ]),
+    contentType: "image/jpeg",
+  };
+
+  contentError?: Error;
+
+  async getImageContent(
+    messageId: string,
+  ): Promise<LineMediaContent> {
+    this.contentCalls.push(messageId);
+    if (this.contentError) {
+      throw this.contentError;
+    }
+    return this.content;
+  }
+
+  async getImagePreview(
+    messageId: string,
+  ): Promise<LineMediaContent> {
+    this.previewCalls.push(messageId);
+    if (this.contentError) {
+      throw this.contentError;
+    }
+    return this.content;
+  }
+}
+
+class RecordingImageUnderstandingProvider
+  implements ImageUnderstandingProvider
+{
+  readonly name = "recording-vision";
+
+  calls = 0;
+
+  requests: ImageUnderstandingRequest[] = [];
+
+  error?: Error;
+
+  private resolveCalled:
+    | (() => void)
+    | undefined;
+
+  private resolveDeferredResult:
+    | ((result: ImageUnderstandingResult) => void)
+    | undefined;
+
+  private deferredResult?: Promise<ImageUnderstandingResult>;
+
+  readonly called =
+    new Promise<void>((resolve) => {
+      this.resolveCalled = resolve;
+    });
+
+  result: ImageUnderstandingResult = {
+    category: "score_report",
+    sensitivity: "personal",
+    safeContextText:
+      "Score report. SAT Math: 720.",
+    requiresHumanReview: false,
+    provider: "recording-vision",
+    model: "vision-test",
+  };
+
+  defer(): void {
+    this.deferredResult =
+      new Promise<ImageUnderstandingResult>(
+        (resolve) => {
+          this.resolveDeferredResult =
+            resolve;
+        },
+      );
+  }
+
+  resolveDeferred(): void {
+    if (!this.resolveDeferredResult) {
+      throw new Error(
+        "Image provider was not deferred",
+      );
+    }
+
+    this.resolveDeferredResult(
+      this.result,
+    );
+  }
+
+  async analyze(
+    request: ImageUnderstandingRequest,
+  ): Promise<ImageUnderstandingResult> {
+    this.calls += 1;
+    this.requests.push({
+      ...request,
+      bytes: new Uint8Array(
+        request.bytes,
+      ),
+    });
+    if (this.error) {
+      throw this.error;
+    }
+    this.resolveCalled?.();
+    return this.deferredResult ??
+      this.result;
+  }
+}
+
 class MockOpenAIKnowledgePublisherClient
   implements OpenAIKnowledgePublisherClient
 {
@@ -1467,6 +1606,11 @@ async function createLineTestEnvironment(
     | "off"
     | "draft"
     | "auto",
+  options: {
+    wait?: (durationMs: number) => Promise<void>;
+    imageContextWaitTimeoutMs?: number;
+    imageContextPollIntervalMs?: number;
+  } = {},
 ) {
   const provider =
     new CountingProvider(result);
@@ -1484,6 +1628,10 @@ async function createLineTestEnvironment(
     new InMemorySuggestedReplyDraftRepository();
   const replyClient =
     new RecordingLineReplyClient();
+  const mediaClient =
+    new RecordingLineMediaClient();
+  const imageUnderstandingProvider =
+    new RecordingImageUnderstandingProvider();
   let nextId = 1;
   const lineMessageService =
     new LineMessageService({
@@ -1498,6 +1646,13 @@ async function createLineTestEnvironment(
         new AnswerService(provider),
       draftRepository,
       replyClient,
+      mediaClient,
+      imageUnderstandingProvider,
+      wait: options.wait,
+      imageContextWaitTimeoutMs:
+        options.imageContextWaitTimeoutMs,
+      imageContextPollIntervalMs:
+        options.imageContextPollIntervalMs,
       now: () =>
         "2027-01-01T00:00:10.000Z",
       nextId: (prefix) => {
@@ -1525,6 +1680,8 @@ async function createLineTestEnvironment(
     configService,
     draftRepository,
     replyClient,
+    mediaClient,
+    imageUnderstandingProvider,
     lineMessageService,
   };
 }
@@ -1544,6 +1701,26 @@ function lineTextEvent(
       "line-message-1",
     replyToken: "reply-token-1",
     text: "Admission question",
+    ...overrides,
+  };
+}
+
+function lineImageEvent(
+  overrides: Partial<
+    LineImageInboundEvent
+  > = {},
+): LineImageInboundEvent {
+  return {
+    channelAccountId:
+      "line-destination",
+    channelUserId: "line-user-1",
+    channelMessageId:
+      "webhook-image-event-1",
+    lineMessageId:
+      "line-image-message-1",
+    replyToken:
+      "reply-token-image-1",
+    contentProviderType: "line",
     ...overrides,
   };
 }
@@ -5219,6 +5396,16 @@ async function testLineWebhookSignatureAndParsing() {
               replied: false,
             };
           },
+          processImageEvent: async () => ({
+            conversationId:
+              "conversation-image-1",
+            responseMode:
+              "off" as const,
+            duplicate: false,
+            analysisStatus:
+              "not_requested" as const,
+            replied: false as const,
+          }),
         };
       },
     });
@@ -5380,6 +5567,15 @@ async function testLineWebhookEventFilteringAndAccountMapping() {
           replied: false,
         };
       },
+      processImageEvent: async () => ({
+        conversationId:
+          "conversation-image",
+        responseMode: "off",
+        duplicate: false,
+        analysisStatus:
+          "not_requested",
+        replied: false,
+      }),
     },
   );
 
@@ -5409,6 +5605,1145 @@ async function testLineWebhookEventFilteringAndAccountMapping() {
       },
     ],
   );
+}
+
+async function testLineImageWebhookNormalization() {
+  const images: LineImageInboundEvent[] = [];
+  const body = Buffer.from(
+    JSON.stringify({
+      destination: "line-account",
+      events: [
+        {
+          type: "message",
+          webhookEventId:
+            "image-webhook-1",
+          replyToken: "reply-image-1",
+          source: {
+            type: "user",
+            userId: "line-user",
+          },
+          message: {
+            type: "image",
+            id: "image-message-1",
+            contentProvider: {
+              type: "line",
+            },
+          },
+        },
+        {
+          type: "message",
+          replyToken: "reply-image-2",
+          source: {
+            type: "user",
+            userId: "line-user",
+          },
+          message: {
+            type: "image",
+            id: "image-message-2",
+            contentProvider: {
+              type: "external",
+            },
+          },
+        },
+        {
+          type: "message",
+          source: {
+            type: "user",
+            userId: "line-user",
+          },
+          message: {
+            type: "sticker",
+            id: "sticker-1",
+          },
+        },
+      ],
+    }),
+  );
+
+  const summary = await processLineWebhook(
+    body,
+    {
+      processTextEvent: async () => {
+        throw new Error(
+          "Unexpected text event",
+        );
+      },
+      processImageEvent: async (event) => {
+        images.push(event);
+        return {
+          conversationId:
+            "conversation-image",
+          responseMode: "off",
+          duplicate: false,
+          analysisStatus:
+            "not_requested",
+          replied: false,
+        };
+      },
+    },
+  );
+
+  assert.deepEqual(summary, {
+    processed: 2,
+    ignored: 1,
+  });
+  assert.deepEqual(
+    images.map((event) => ({
+      channelMessageId:
+        event.channelMessageId,
+      lineMessageId:
+        event.lineMessageId,
+      contentProviderType:
+        event.contentProviderType,
+    })),
+    [
+      {
+        channelMessageId:
+          "image-webhook-1",
+        lineMessageId:
+          "image-message-1",
+        contentProviderType: "line",
+      },
+      {
+        channelMessageId:
+          "line-message:image-message-2",
+        lineMessageId:
+          "image-message-2",
+        contentProviderType:
+          "external",
+      },
+    ],
+  );
+}
+
+async function testLineMediaClientPolicy() {
+  const requests: Array<{
+    url: string;
+    authorization?: string;
+    hasAbortSignal: boolean;
+  }> = [];
+  const client =
+    new LineMessagingApiMediaClient({
+      channelAccessToken:
+        "line-media-token",
+      fetchImplementation: async (
+        input,
+        init,
+      ) => {
+        requests.push({
+          url: String(input),
+          authorization:
+            (
+              init?.headers as Record<
+                string,
+                string
+              >
+            ).authorization,
+          hasAbortSignal:
+            init?.signal instanceof
+            AbortSignal,
+        });
+        return new Response(
+          Buffer.from([1, 2, 3]),
+          {
+            status: 200,
+            headers: {
+              "content-type":
+                "image/png",
+            },
+          },
+        );
+      },
+    });
+
+  const content =
+    await client.getImageContent(
+      "line-image-id",
+    );
+  await client.getImagePreview(
+    "line-image-id",
+  );
+  assert.equal(
+    content.contentType,
+    "image/png",
+  );
+  assert.equal(content.bytes.length, 3);
+  assert.equal(
+    requests[0].url,
+    "https://api-data.line.me/v2/bot/message/line-image-id/content",
+  );
+  assert.equal(
+    requests[1].url,
+    "https://api-data.line.me/v2/bot/message/line-image-id/content/preview",
+  );
+  assert.equal(
+    requests[0].authorization,
+    "Bearer line-media-token",
+  );
+  assert.equal(
+    requests[0].hasAbortSignal,
+    true,
+  );
+
+  const unsupported =
+    new LineMessagingApiMediaClient({
+      channelAccessToken: "token",
+      fetchImplementation: async () =>
+        new Response("not-image", {
+          headers: {
+            "content-type":
+              "application/pdf",
+          },
+        }),
+    });
+  await assert.rejects(
+    () =>
+      unsupported.getImageContent("id"),
+    LineMediaBlockedError,
+  );
+
+  const oversized =
+    new LineMessagingApiMediaClient({
+      channelAccessToken: "token",
+      maxImageBytes: 2,
+      fetchImplementation: async () =>
+        new Response(
+          Buffer.from([1, 2, 3]),
+          {
+            headers: {
+              "content-type":
+                "image/jpeg",
+            },
+          },
+        ),
+    });
+  await assert.rejects(
+    () => oversized.getImageContent("id"),
+    LineMediaBlockedError,
+  );
+
+  for (const status of [404, 410] as const) {
+    const unavailable =
+      new LineMessagingApiMediaClient({
+        channelAccessToken: "token",
+        fetchImplementation: async () =>
+          new Response(null, { status }),
+      });
+    await assert.rejects(
+      () =>
+        unavailable.getImageContent("id"),
+      (error: unknown) =>
+        error instanceof
+          LineMediaUnavailableError &&
+        error.status === status,
+    );
+  }
+}
+
+async function testOpenAIImageUnderstandingContract() {
+  let requestBody:
+    | Record<string, unknown>
+    | undefined;
+  let requestSignal:
+    | AbortSignal
+    | undefined;
+  const provider =
+    new OpenAIImageUnderstandingProvider({
+      model: "vision-test-model",
+      client: {
+        responses: {
+          create: async (
+            body,
+            options,
+          ) => {
+            requestBody = body;
+            requestSignal =
+              options?.signal;
+            return {
+              output_text:
+                JSON.stringify({
+                  category:
+                    "score_report",
+                  sensitivity:
+                    "personal",
+                  safeContextText:
+                    "SAT Math: 720",
+                  detectedLanguage:
+                    "en",
+                  requiresHumanReview:
+                    false,
+                }),
+            };
+          },
+        },
+      },
+    });
+  const result = await provider.analyze({
+    bytes: new Uint8Array([1, 2]),
+    contentType: "image/png",
+    purpose: "conversation_context",
+  });
+
+  assert.equal(result.safeContextText, "SAT Math: 720");
+  assert.equal(requestBody?.store, false);
+  assert.equal(
+    requestSignal instanceof AbortSignal,
+    true,
+  );
+  assert.equal(
+    requestBody?.model,
+    "vision-test-model",
+  );
+  assert.match(
+    JSON.stringify(requestBody?.input),
+    /data:image\/png;base64/,
+  );
+}
+
+async function testLineImageResponseModesAndContext() {
+  const off =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "off",
+    );
+  const offResult =
+    await off.lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  const offMessages =
+    await off.conversationRepository
+      .listMessages(
+        offResult.conversationId,
+      );
+  assert.equal(
+    offResult.analysisStatus,
+    "not_requested",
+  );
+  assert.equal(off.mediaClient.contentCalls.length, 0);
+  assert.equal(
+    off.imageUnderstandingProvider.calls,
+    0,
+  );
+  assert.equal(offMessages.length, 1);
+  assert.equal(
+    offMessages[0].attachments?.[0]
+      .analysisStatus,
+    "not_requested",
+  );
+
+  const draft =
+    await createLineTestEnvironment(
+      groundedResult(
+        "Grounded follow-up",
+      ),
+      "draft",
+    );
+  const draftImage =
+    lineImageEvent();
+  const draftResult =
+    await draft.lineMessageService
+      .processImageEvent(draftImage);
+  const duplicate =
+    await draft.lineMessageService
+      .processImageEvent(draftImage);
+  const draftMessages =
+    await draft.conversationRepository
+      .listMessages(
+        draftResult.conversationId,
+      );
+  assert.equal(
+    draftResult.analysisStatus,
+    "ready",
+  );
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(draft.mediaClient.contentCalls.length, 1);
+  assert.equal(
+    draft.imageUnderstandingProvider.calls,
+    1,
+  );
+  assert.equal(draftMessages.length, 1);
+  assert.equal(
+    draftMessages[0].attachments?.[0]
+      .safeContextText,
+    "Score report. SAT Math: 720.",
+  );
+  assert.equal(
+    /"bytes"|base64|AQID/.test(
+      JSON.stringify(draftMessages),
+    ),
+    false,
+  );
+  const persistedImageDocument =
+    draft.db.getStoredDocument(
+      "ai_platform_conversation_messages",
+      draftMessages[0].id,
+    );
+  assert.equal(
+    /"bytes"|Buffer|base64|data:image|AQID/.test(
+      JSON.stringify(
+        persistedImageDocument,
+      ),
+    ),
+    false,
+  );
+  assert.equal(draft.replyClient.replies.length, 0);
+
+  await draft.lineMessageService
+    .processTextEvent(
+      lineTextEvent({
+        channelMessageId:
+          "follow-up-event",
+        lineMessageId:
+          "follow-up-message",
+        text: "อันนี้ใช้ได้ไหม",
+      }),
+    );
+  assert.equal(draft.provider.calls, 1);
+  assert.match(
+    draft.provider.requests[0]
+      .conversationContext?.[0]
+      .text ?? "",
+    /SAT Math: 720/,
+  );
+  assert.match(
+    draft.provider.requests[0]
+      .conversationContext?.[0]
+      .text ?? "",
+    /not approved institutional policy/,
+  );
+  assert.equal(
+    draft.provider.requests[0]
+      .audience,
+    "public",
+  );
+
+  const auto =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "auto",
+    );
+  const autoResult =
+    await auto.lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  assert.equal(
+    autoResult.analysisStatus,
+    "ready",
+  );
+  assert.equal(auto.provider.calls, 0);
+  assert.equal(auto.replyClient.replies.length, 0);
+  assert.equal(
+    await auto.handoffRepository
+      .getActiveHandoff(
+        autoResult.conversationId,
+      ),
+    null,
+  );
+
+  const external =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "draft",
+    );
+  const externalResult =
+    await external.lineMessageService
+      .processImageEvent(
+        lineImageEvent({
+          contentProviderType:
+            "external",
+        }),
+      );
+  assert.equal(
+    externalResult.analysisStatus,
+    "blocked",
+  );
+  assert.equal(
+    external.mediaClient.contentCalls.length,
+    0,
+  );
+}
+
+async function testExpiredImageProcessingDoesNotEnterTextAnswerPipeline() {
+  const provider =
+    groundedCountingProvider();
+  const {
+    db,
+    service,
+    conversationRepository,
+  } = createAtomicTestService(provider);
+  const conversation =
+    await service.createConversation({
+      channel: "line",
+      channelAccountId:
+        "line-destination",
+      channelUserId: "line-user-1",
+    });
+  const channelMessageId =
+    "expired-image-event";
+  const messageId =
+    "expired-image-message";
+  const text = "[User sent an image]";
+
+  await conversationRepository
+    .appendMessage({
+      id: messageId,
+      conversationId:
+        conversation.id,
+      senderType: "user",
+      senderId: "line-user-1",
+      text,
+      createdAt:
+        "2027-01-01T00:00:00.000Z",
+      channelMessageId,
+      attachments: [
+        {
+          id: "attachment-expired",
+          type: "image",
+          source: "line",
+          sourceMediaId:
+            "line-image-expired",
+          analysisStatus:
+            "processing",
+        },
+      ],
+    });
+  await seedInboundReceipt(db, {
+    conversationId:
+      conversation.id,
+    channelMessageId,
+    messageId,
+    text,
+    processingStatus: "processing",
+    processingToken: "token-old",
+    leaseExpiresAt:
+      "2026-12-31T23:59:59.000Z",
+    processingAttempts: 1,
+  });
+
+  const summary =
+    await service.recoverExpiredInboundProcessing({
+      limit: 1,
+    });
+  const recoveredMessage = (
+    await conversationRepository
+      .listMessages(conversation.id)
+  )[0];
+  const receipt = getInboundReceipt(
+    db,
+    conversation.id,
+    channelMessageId,
+  );
+
+  assert.equal(summary.claimed, 1);
+  assert.equal(summary.processed, 1);
+  assert.equal(provider.calls, 0);
+  assert.equal(
+    recoveredMessage.attachments?.[0]
+      .analysisStatus,
+    "failed",
+  );
+  assert.equal(
+    recoveredMessage.attachments?.[0]
+      .requiresHumanReview,
+    true,
+  );
+  assert.equal(
+    receipt?.processingStatus,
+    "completed",
+  );
+  assert.equal(
+    receipt?.completionOutcome,
+    "image_analysis_recovery_required",
+  );
+}
+
+async function testImmediateTextFollowUpWaitsForImageContext() {
+  let notifyPollStarted:
+    | (() => void)
+    | undefined;
+  let releasePoll:
+    | (() => void)
+    | undefined;
+  const pollStarted =
+    new Promise<void>((resolve) => {
+      notifyPollStarted = resolve;
+    });
+  const pollReleased =
+    new Promise<void>((resolve) => {
+      releasePoll = resolve;
+    });
+  const environment =
+    await createLineTestEnvironment(
+      groundedResult(
+        "The submitted score qualifies.",
+      ),
+      "auto",
+      {
+        wait: async () => {
+          notifyPollStarted?.();
+          await pollReleased;
+        },
+      },
+    );
+  environment.imageUnderstandingProvider.defer();
+
+  const imageProcessing =
+    environment.lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  await environment
+    .imageUnderstandingProvider.called;
+
+  const textProcessing =
+    environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId:
+            "follow-up-race-event",
+          lineMessageId:
+            "follow-up-race-message",
+          text: "อันนี้ใช้ได้ไหม",
+        }),
+      );
+  await pollStarted;
+
+  environment.imageUnderstandingProvider
+    .resolveDeferred();
+  const imageResult =
+    await imageProcessing;
+  releasePoll?.();
+  const textResult =
+    await textProcessing;
+  const messages =
+    await environment
+      .conversationRepository
+      .listMessages(
+        imageResult.conversationId,
+      );
+
+  assert.equal(textResult.replied, true);
+  assert.equal(
+    textResult.deferredForImageContext,
+    undefined,
+  );
+  assert.equal(
+    environment
+      .imageUnderstandingProvider.calls,
+    1,
+  );
+  assert.equal(environment.provider.calls, 1);
+  assert.equal(
+    environment.replyClient.replies.length,
+    1,
+  );
+  assert.equal(
+    messages.filter(
+      (message) =>
+        message.senderType === "user",
+    ).length,
+    2,
+  );
+  assert.equal(
+    messages.filter(
+      (message) =>
+        message.senderType === "ai",
+    ).length,
+    1,
+  );
+  assert.match(
+    environment.provider.requests[0]
+      .conversationContext?.[0]
+      .text ?? "",
+    /SAT Math: 720/,
+  );
+}
+
+async function testImageContextWaitTimeoutDefersTextSafely() {
+  const environment =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "auto",
+      {
+        wait: async () => {},
+        imageContextWaitTimeoutMs: 2,
+        imageContextPollIntervalMs: 1,
+      },
+    );
+  environment.imageUnderstandingProvider.defer();
+  const imageProcessing =
+    environment.lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  await environment
+    .imageUnderstandingProvider.called;
+
+  const textResult =
+    await environment.lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId:
+            "follow-up-timeout-event",
+          lineMessageId:
+            "follow-up-timeout-message",
+          text: "อันนี้ใช้ได้ไหม",
+        }),
+      );
+
+  assert.equal(
+    textResult.deferredForImageContext,
+    true,
+  );
+  assert.equal(textResult.replied, false);
+  assert.equal(environment.provider.calls, 0);
+  assert.equal(
+    getInboundReceipt(
+      environment.db,
+      textResult.conversationId,
+      "follow-up-timeout-event",
+    )?.processingStatus,
+    "processing",
+  );
+
+  environment.imageUnderstandingProvider
+    .resolveDeferred();
+  await imageProcessing;
+}
+
+async function testLineImageFailuresAndPrivacy() {
+  for (const error of [
+    new LineMediaBlockedError(
+      "unsupported mime",
+    ),
+    new LineMediaBlockedError(
+      "too large",
+    ),
+  ]) {
+    const environment =
+      await createLineTestEnvironment(
+        groundedResult(),
+        "draft",
+      );
+    environment.mediaClient.contentError =
+      error;
+    const result =
+      await environment.lineMessageService
+        .processImageEvent(
+          lineImageEvent(),
+        );
+    const message = (
+      await environment
+        .conversationRepository
+        .listMessages(
+          result.conversationId,
+        )
+    )[0];
+    assert.equal(
+      result.analysisStatus,
+      "blocked",
+    );
+    assert.equal(
+      environment
+        .imageUnderstandingProvider
+        .calls,
+      0,
+    );
+    assert.equal(
+      message.attachments?.[0]
+        .analysisStatus,
+      "blocked",
+    );
+  }
+
+  for (const status of [404, 410] as const) {
+    const environment =
+      await createLineTestEnvironment(
+        groundedResult(),
+        "draft",
+      );
+    environment.mediaClient.contentError =
+      new LineMediaUnavailableError(
+        status,
+      );
+    const result =
+      await environment.lineMessageService
+        .processImageEvent(
+          lineImageEvent(),
+        );
+    const messages =
+      await environment
+        .conversationRepository
+        .listMessages(
+          result.conversationId,
+        );
+    assert.equal(
+      result.analysisStatus,
+      "failed",
+    );
+    assert.equal(messages.length, 1);
+    assert.equal(
+      messages[0].attachments?.[0]
+        .metadata?.failureCode,
+      "line_media_unavailable",
+    );
+  }
+
+  const visionFailure =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "draft",
+    );
+  visionFailure.imageUnderstandingProvider.error =
+    new Error("vision unavailable");
+  const failedResult =
+    await visionFailure
+      .lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  assert.equal(
+    failedResult.analysisStatus,
+    "failed",
+  );
+  assert.equal(
+    (
+      await visionFailure
+        .conversationRepository
+        .listMessages(
+          failedResult.conversationId,
+        )
+    )[0].attachments?.[0]
+      .safeContextText,
+    undefined,
+  );
+
+  const identity =
+    sanitizeImageUnderstandingResult({
+      category: "identity_document",
+      sensitivity: "sensitive",
+      safeContextText:
+        "Citizen ID 1234567890123",
+      requiresHumanReview: false,
+      provider: "test",
+    });
+  assert.equal(
+    identity.safeContextText,
+    "User sent an identity document. Sensitive identifying fields were not retained.",
+  );
+  assert.doesNotMatch(
+    identity.safeContextText,
+    /1234567890123/,
+  );
+
+  const identityEnvironment =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "draft",
+    );
+  identityEnvironment
+    .imageUnderstandingProvider.result = {
+      category: "identity_document",
+      sensitivity: "sensitive",
+      safeContextText:
+        "Citizen ID 1234567890123",
+      requiresHumanReview: false,
+      provider: "recording-vision",
+    };
+  const identityResult =
+    await identityEnvironment
+      .lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  const persistedIdentity = (
+    await identityEnvironment
+      .conversationRepository
+      .listMessages(
+        identityResult.conversationId,
+      )
+  )[0].attachments?.[0];
+  assert.equal(
+    persistedIdentity?.safeContextText,
+    identity.safeContextText,
+  );
+  assert.doesNotMatch(
+    JSON.stringify(persistedIdentity),
+    /1234567890123/,
+  );
+
+  const score =
+    sanitizeImageUnderstandingResult({
+      category: "score_report",
+      sensitivity: "personal",
+      safeContextText:
+        "SAT Math: 720\nCandidate ID: 99887766\nEmail: user@example.com",
+      requiresHumanReview: false,
+      provider: "test",
+    });
+  assert.match(
+    score.safeContextText,
+    /SAT Math: 720/,
+  );
+  assert.doesNotMatch(
+    score.safeContextText,
+    /99887766|user@example\.com/,
+  );
+
+  const scoreEnvironment =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "draft",
+    );
+  scoreEnvironment
+    .imageUnderstandingProvider.result = {
+      category: "score_report",
+      sensitivity: "personal",
+      safeContextText:
+        "SAT Math: 720\nCandidate ID: 99887766\nEmail: user@example.com",
+      requiresHumanReview: false,
+      provider: "recording-vision",
+    };
+  const scoreResult =
+    await scoreEnvironment
+      .lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  const persistedScore = (
+    await scoreEnvironment
+      .conversationRepository
+      .listMessages(
+        scoreResult.conversationId,
+      )
+  )[0].attachments?.[0]
+    .safeContextText ?? "";
+  assert.match(
+    persistedScore,
+    /SAT Math: 720/,
+  );
+  assert.doesNotMatch(
+    persistedScore,
+    /99887766|user@example\.com/,
+  );
+
+  const adversarialEnvironment =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "draft",
+    );
+  adversarialEnvironment
+    .imageUnderstandingProvider.result = {
+      category: "score_report",
+      sensitivity: "sensitive",
+      safeContextText: [
+        "SAT Math: 720",
+        "Exam date: 2027-01-15",
+        "เลขบัตรประชาชน: 1-2345-67890-12-3",
+        "Passport No: AB1234567",
+        "Phone: 081-234-5678",
+        "Email: student@example.com",
+        "Card: 4111 1111 1111 1111",
+        "Password: secret-value",
+        "Candidate ID: CAND-998877",
+      ].join("\n"),
+      requiresHumanReview: false,
+      provider: "recording-vision",
+    };
+  const adversarialResult =
+    await adversarialEnvironment
+      .lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  const adversarialContext = (
+    await adversarialEnvironment
+      .conversationRepository
+      .listMessages(
+        adversarialResult.conversationId,
+      )
+  )[0].attachments?.[0]
+    .safeContextText ?? "";
+
+  assert.match(
+    adversarialContext,
+    /SAT Math: 720/,
+  );
+  assert.match(
+    adversarialContext,
+    /2027-01-15/,
+  );
+  assert.doesNotMatch(
+    adversarialContext,
+    /1-2345-67890-12-3|AB1234567|081-234-5678|student@example\.com|4111 1111 1111 1111|secret-value|CAND-998877/,
+  );
+}
+
+async function testStaffInboxImagePreview() {
+  const environment =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "draft",
+    );
+  const imageResult =
+    await environment
+      .lineMessageService
+      .processImageEvent(
+        lineImageEvent(),
+      );
+  const sendRepository =
+    new FirestoreAssistedStaffSendRepository(
+      environment.db as never,
+    );
+  const inboxService =
+    new StaffInboxService({
+      conversationRepository:
+        environment
+          .conversationRepository,
+      conversationWorkflowRepository:
+        environment
+          .conversationWorkflowRepository,
+      draftRepository:
+        environment.draftRepository,
+      configService:
+        environment.configService,
+      sendRepository,
+      linePushClient:
+        new RecordingLinePushClient(),
+      lineMediaClient:
+        environment.mediaClient,
+    });
+  const detail =
+    await inboxService
+      .getConversationDetail(
+        imageResult.conversationId,
+      );
+  assert.equal(
+    detail.messages[0]
+      .attachments?.[0]
+      .analysisStatus,
+    "ready",
+  );
+
+  const route = await import(
+    "@/app/api/admin/ui/inbox/conversations/[id]/messages/[messageId]/media-preview/route"
+  );
+  const handler =
+    route.createInboxMediaPreviewHandler(
+      () => inboxService,
+    );
+  const context = {
+    params: Promise.resolve({
+      id: imageResult.conversationId,
+      messageId:
+        detail.messages[0].id,
+    }),
+  };
+  const unauthorized =
+    await handler(
+      new Request(
+        "http://localhost/media-preview",
+      ),
+      context,
+    );
+  assert.equal(
+    unauthorized.status,
+    401,
+  );
+  assert.equal(
+    environment.mediaClient
+      .previewCalls.length,
+    0,
+  );
+
+  const cookie =
+    buildAdminUiSessionCookie(
+      createAdminUiSessionToken(),
+    );
+  const preview = await handler(
+    new Request(
+      "http://localhost/media-preview",
+      {
+        headers: { cookie },
+      },
+    ),
+    context,
+  );
+  assert.equal(preview.status, 200);
+  assert.equal(
+    preview.headers.get(
+      "cache-control",
+    ),
+    "private, no-store",
+  );
+  assert.equal(
+    preview.headers.get(
+      "content-type",
+    ),
+    "image/jpeg",
+  );
+  assert.deepEqual(
+    environment.mediaClient
+      .previewCalls,
+    ["line-image-message-1"],
+  );
+
+  const tamperedMediaId =
+    await handler(
+      new Request(
+        "http://localhost/media-preview?mediaId=attacker-controlled-id&url=https://attacker.example/image",
+        {
+          headers: { cookie },
+        },
+      ),
+      context,
+    );
+  assert.equal(tamperedMediaId.status, 200);
+  assert.deepEqual(
+    environment.mediaClient
+      .previewCalls,
+    [
+      "line-image-message-1",
+      "line-image-message-1",
+    ],
+  );
+
+  environment.mediaClient.contentError =
+    new LineMediaUnavailableError(410);
+  const expired = await handler(
+    new Request(
+      "http://localhost/media-preview",
+      {
+        headers: { cookie },
+      },
+    ),
+    context,
+  );
+  assert.equal(expired.status, 410);
+  assert.match(
+    JSON.stringify(
+      await expired.json(),
+    ),
+    /Preview expired/,
+  );
+
+  const wrongMessage = await handler(
+    new Request(
+      "http://localhost/media-preview?url=https://attacker.example/image",
+      {
+        headers: { cookie },
+      },
+    ),
+    {
+      params: Promise.resolve({
+        id: imageResult.conversationId,
+        messageId: "unknown-message",
+      }),
+    },
+  );
+  assert.equal(wrongMessage.status, 404);
 }
 
 async function testLineResponseModesAndRedelivery() {
@@ -5926,6 +7261,8 @@ async function testStaffInboxMvp() {
     configService,
     sendRepository,
     linePushClient: pushClient,
+    lineMediaClient:
+      new RecordingLineMediaClient(),
     now: () => {
       const timestamp =
         `2027-01-01T00:00:${String(nowIndex).padStart(2, "0")}.000Z`;
@@ -6254,6 +7591,8 @@ async function testStaffInboxMvp() {
       sendRepository,
       linePushClient:
         expiredPushClient,
+      lineMediaClient:
+        new RecordingLineMediaClient(),
       now: () => retryNow,
     });
   const expiredRequestId =
@@ -6325,6 +7664,8 @@ async function testStaffInboxMvp() {
       sendRepository,
       linePushClient:
         acceptedRetryClient,
+      lineMediaClient:
+        new RecordingLineMediaClient(),
       now: () =>
         "2027-01-01T00:01:00.000Z",
     });
@@ -6739,6 +8080,8 @@ async function testStaffInboxResumeAI() {
       sendRepository,
       configService,
       linePushClient: pushClient,
+      lineMediaClient:
+        new RecordingLineMediaClient(),
       now: () =>
         "2027-01-01T00:10:00.000Z",
     });
@@ -13173,6 +14516,15 @@ async function main() {
   testAudiencePolicy();
   await testLineWebhookSignatureAndParsing();
   await testLineWebhookEventFilteringAndAccountMapping();
+  await testLineImageWebhookNormalization();
+  await testLineMediaClientPolicy();
+  await testOpenAIImageUnderstandingContract();
+  await testLineImageResponseModesAndContext();
+  await testImmediateTextFollowUpWaitsForImageContext();
+  await testImageContextWaitTimeoutDefersTextSafely();
+  await testExpiredImageProcessingDoesNotEnterTextAnswerPipeline();
+  await testLineImageFailuresAndPrivacy();
+  await testStaffInboxImagePreview();
   await testLineResponseModesAndRedelivery();
   await testLineConversationResolution();
   await testLineReplyClientContract();

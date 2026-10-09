@@ -386,3 +386,43 @@ An assisted staff reply is distinct from human takeover. It does not require or 
 Staff read state is also independent from AI processing. `lastInboundAt` changes only when a new user message is atomically persisted. `lastStaffReadAt` changes only through an explicit Inbox read action or a confirmed staff send. LINE Push is the delayed human-response transport and uses a durable client request ID as its stable LINE retry key.
 
 F5.1 processes supported webhook events sequentially and synchronously as an MVP. A future phase may move work behind asynchronous infrastructure, but F5.1 adds no queue, retry worker, or scheduled job.
+
+## 15. Channel-Neutral Media and LINE Images
+
+F5.3A adds optional provider-neutral image attachments to conversation messages. Text-only records remain backward compatible. LINE image processing follows this transient path:
+
+```text
+LINE image webhook
+    -> verify exact raw-body signature
+    -> persist image message and attachment reference
+    -> fetch bytes from api-data.line.me
+    -> transient vision extraction
+    -> privacy sanitization
+    -> persist safe media context only
+    -> discard raw bytes
+```
+
+Raw image bytes and Base64 data are never stored in Firestore or uploaded to permanent object storage. Persisted attachment data is limited to the trusted LINE message ID, content type, analysis status, classification, sensitivity, redacted context, and minimal diagnostics.
+
+Response modes retain their existing meaning:
+
+- `off`: persist the image with `not_requested`; do not fetch or analyze it.
+- `draft`: analyze and persist safe context; do not create a generic draft or send a reply.
+- `auto`: analyze and persist safe context; do not make an image-only eligibility decision or send an unsupported reply.
+
+For a later text message, ready image context is added to conversation history as user-provided evidence:
+
+```text
+safe media context + subsequent user question
+    -> existing public File Search RAG
+    -> GroundingGate
+    -> off / draft / auto delivery policy
+```
+
+Image observations are not approved institutional knowledge. Admission criteria, eligibility decisions, and other institutional facts must still come from approved public knowledge and retain normal citation and grounding requirements.
+
+Image webhook processing remains synchronous in F5.3A. LINE media fetches have an 8-second abort deadline and vision inference has a 12-second abort deadline. The inbound receipt owns image processing, so a duplicate webhook cannot start a second analysis. Failures atomically finalize the attachment and receipt; an interrupted expired image lease is finalized as failed and marked for human review rather than entering the text-answer pipeline.
+
+An AI-enabled text message arriving while the latest image is still processing waits for persisted analysis for at most 8 seconds. When analysis becomes ready, its sanitized context is included in the normal grounded answer. If that wait expires, the text message is persisted once under the existing inbound lease and is not answered without the image context; the existing recovery path can safely resolve the deferred receipt after the image settles.
+
+The Staff Inbox shows image status and safe context. Its authenticated preview route resolves the trusted LINE media ID from the stored conversation message and proxies LINE's temporary preview with `Cache-Control: private, no-store`. Preview expiry is expected; F5.3A intentionally has no persistent media store.

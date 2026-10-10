@@ -3,8 +3,17 @@ import type {
 } from "@/core/ai-platform/channels/channel-response-config-service";
 
 import type {
+  ExternalChannelTextSenderRegistry,
+} from "@/core/ai-platform/integrations/external-channel-text-sender";
+
+import type {
   LinePushClient,
 } from "@/core/ai-platform/integrations/line/line-reply-client";
+
+import {
+  FacebookDeliveryUncertainError,
+  FacebookSendRejectedError,
+} from "@/core/ai-platform/integrations/facebook/facebook-send-client";
 
 import type {
   LineMediaClient,
@@ -28,6 +37,7 @@ import type {
 } from "@/core/ai-platform/repositories/suggested-reply-draft-repository";
 
 import type {
+  ExternalResponseChannel,
   ResponseMode,
   SuggestedReplyDraft,
 } from "@/core/ai-platform/types/channel-response";
@@ -41,12 +51,14 @@ const STAFF_ID = "admin-ui-staff";
 const MAX_REPLY_LENGTH = 5000;
 const LINE_RETRY_KEY_SAFE_WINDOW_MS =
   24 * 60 * 60 * 1000;
+const FACEBOOK_STANDARD_WINDOW_MS =
+  24 * 60 * 60 * 1000;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface StaffInboxConversation {
   id: string;
-  channel: "line";
+  channel: ExternalResponseChannel;
   channelAccountId?: string;
   channelUserId: string;
   mode: Conversation["mode"];
@@ -57,6 +69,10 @@ export interface StaffInboxConversation {
   unread: boolean;
   draftStatus?: SuggestedReplyDraft["status"];
 }
+
+type SupportedExternalConversation = Conversation & {
+  channel: ExternalResponseChannel;
+};
 
 export interface StaffInboxDetail {
   conversation: StaffInboxConversation;
@@ -92,7 +108,9 @@ export interface StaffInboxServiceDependencies {
     ChannelResponseConfigService,
     "resolveResponseMode" | "updateResponseMode"
   >;
-  linePushClient: LinePushClient;
+  textSenders?: ExternalChannelTextSenderRegistry;
+  /** @deprecated Test compatibility; production uses textSenders. */
+  linePushClient?: LinePushClient;
   lineMediaClient: LineMediaClient;
   conversationWorkflowRepository: Pick<
     ConversationWorkflowRepository,
@@ -113,12 +131,32 @@ export class LinePushDeliveryError extends Error {
 export class AssistedSendReconciliationRequiredError
   extends Error
 {
-  constructor() {
+  constructor(
+    message = "Pending LINE delivery is outside the 24-hour retry-key safety window and requires manual reconciliation.",
+  ) {
     super(
-      "Pending LINE delivery is outside the 24-hour retry-key safety window and requires manual reconciliation.",
+      message,
     );
     this.name =
       "AssistedSendReconciliationRequiredError";
+  }
+}
+
+export class FacebookMessagingWindowExpiredError extends Error {
+  constructor() {
+    super(
+      "Facebook's standard messaging window has expired. This conversation cannot be sent as a normal Messenger response.",
+    );
+    this.name = "FacebookMessagingWindowExpiredError";
+  }
+}
+
+export class FacebookSendDeliveryError extends Error {
+  constructor() {
+    super(
+      "Facebook Messenger delivery was rejected. No message was recorded as delivered.",
+    );
+    this.name = "FacebookSendDeliveryError";
   }
 }
 
@@ -139,15 +177,18 @@ export function isConversationUnread(
 function toInboxConversation(
   conversation: Conversation,
 ): StaffInboxConversation {
-  if (conversation.channel !== "line") {
+  if (
+    conversation.channel !== "line" &&
+    conversation.channel !== "facebook"
+  ) {
     throw new Error(
-      "Staff Inbox currently supports LINE conversations only",
+      "Staff Inbox supports LINE and Facebook conversations only",
     );
   }
 
   return {
     id: conversation.id,
-    channel: "line",
+    channel: conversation.channel,
     channelAccountId:
       conversation.channelAccountId,
     channelUserId:
@@ -182,17 +223,30 @@ export class StaffInboxService {
     limit = 50,
     beforeUpdatedAt?: string,
   ): Promise<StaffInboxConversation[]> {
-    const conversations =
-      await this.dependencies
-        .conversationRepository
+    const boundedLimit = Math.min(
+      50,
+      Math.max(1, limit),
+    );
+    const [line, facebook] = await Promise.all([
+      this.dependencies.conversationRepository
         .listInboxConversations({
           channel: "line",
-          limit: Math.min(
-            50,
-            Math.max(1, limit),
-          ),
+          limit: boundedLimit,
           beforeUpdatedAt,
-        });
+        }),
+      this.dependencies.conversationRepository
+        .listInboxConversations({
+          channel: "facebook",
+          limit: boundedLimit,
+          beforeUpdatedAt,
+        }),
+    ]);
+    const conversations = [...line, ...facebook]
+      .sort((left, right) =>
+        right.updatedAt.localeCompare(
+          left.updatedAt,
+        ))
+      .slice(0, boundedLimit);
 
     return Promise.all(
       conversations.map(
@@ -225,7 +279,7 @@ export class StaffInboxService {
     conversationId: string,
   ): Promise<StaffInboxDetail> {
     const conversation =
-      await this.requireLineConversation(
+      await this.requireSupportedExternalConversation(
         conversationId,
       );
     const messages =
@@ -252,7 +306,7 @@ export class StaffInboxService {
             await this.dependencies
               .configService
               .resolveResponseMode(
-                "line",
+                conversation.channel,
                 conversation.channelAccountId,
               )
           ).responseMode
@@ -334,7 +388,7 @@ export class StaffInboxService {
   async markRead(
     conversationId: string,
   ): Promise<StaffInboxConversation> {
-    await this.requireLineConversation(
+    await this.requireSupportedExternalConversation(
       conversationId,
     );
     const conversation =
@@ -354,7 +408,7 @@ export class StaffInboxService {
     sourceMessageId: string;
     text: string;
   }): Promise<SuggestedReplyDraft> {
-    await this.requireLineConversation(
+    await this.requireSupportedExternalConversation(
       input.conversationId,
     );
     const text = input.text.trim();
@@ -420,13 +474,13 @@ export class StaffInboxService {
     }
 
     const conversation =
-      await this.requireLineConversation(
+      await this.requireSupportedExternalConversation(
         input.conversationId,
       );
 
     if (!conversation.channelAccountId) {
       throw new Error(
-        "LINE conversation is missing channelAccountId",
+        "External conversation is missing channelAccountId",
       );
     }
 
@@ -445,6 +499,12 @@ export class StaffInboxService {
           createdAt: attemptedAt,
         });
 
+    if (receipt.status === "uncertain") {
+      throw new AssistedSendReconciliationRequiredError(
+        "Facebook delivery outcome is uncertain and requires manual reconciliation. The message was not retried.",
+      );
+    }
+
     if (receipt.status !== "delivered") {
       const receiptAge =
         new Date(attemptedAt).getTime() -
@@ -453,22 +513,84 @@ export class StaffInboxService {
         ).getTime();
 
       if (
-        !Number.isFinite(receiptAge) ||
-        receiptAge >=
-          LINE_RETRY_KEY_SAFE_WINDOW_MS
+        conversation.channel === "line" &&
+        (!Number.isFinite(receiptAge) ||
+          receiptAge >= LINE_RETRY_KEY_SAFE_WINDOW_MS)
       ) {
         throw new AssistedSendReconciliationRequiredError();
       }
 
+      if (conversation.channel === "facebook") {
+        const lastInboundAt = conversation.lastInboundAt
+          ? new Date(conversation.lastInboundAt).getTime()
+          : Number.NaN;
+        const attemptedAtMs = new Date(attemptedAt).getTime();
+        if (
+          !Number.isFinite(lastInboundAt) ||
+          !Number.isFinite(attemptedAtMs) ||
+          attemptedAtMs - lastInboundAt >= FACEBOOK_STANDARD_WINDOW_MS
+        ) {
+          throw new FacebookMessagingWindowExpiredError();
+        }
+      }
+
+      const sender =
+        this.dependencies.textSenders?.[
+          conversation.channel
+        ];
+      const legacyLineClient =
+        conversation.channel === "line"
+          ? this.dependencies.linePushClient
+          : undefined;
+      if (!sender && !legacyLineClient) {
+        throw new Error(`${conversation.channel} text sender is not configured`);
+      }
+
       try {
-        await this.dependencies
-          .linePushClient
-          .pushText(
+        if (sender) {
+          await sender.sendText({
+            channelAccountId: conversation.channelAccountId,
+            channelUserId: conversation.channelUserId,
+            text: receipt.text,
+            clientRequestId: receipt.retryKey,
+          });
+        } else {
+          await legacyLineClient!.pushText(
             conversation.channelUserId,
             receipt.text,
             receipt.retryKey,
           );
-      } catch {
+        }
+      } catch (error) {
+        if (
+          conversation.channel === "facebook" &&
+          error instanceof FacebookDeliveryUncertainError
+        ) {
+          await this.dependencies.sendRepository.markSendUncertain({
+            clientRequestId: input.clientRequestId,
+            uncertainAt: this.now(),
+            reason: "facebook_delivery_outcome_uncertain",
+          });
+          throw new AssistedSendReconciliationRequiredError(
+            "Facebook delivery outcome is uncertain and requires manual reconciliation. The message was not retried.",
+          );
+        }
+        if (
+          conversation.channel === "facebook" &&
+          error instanceof FacebookSendRejectedError
+        ) {
+          throw new FacebookSendDeliveryError();
+        }
+        if (conversation.channel === "facebook") {
+          await this.dependencies.sendRepository.markSendUncertain({
+            clientRequestId: input.clientRequestId,
+            uncertainAt: this.now(),
+            reason: "facebook_delivery_outcome_uncertain",
+          });
+          throw new AssistedSendReconciliationRequiredError(
+            "Facebook delivery outcome is uncertain and requires manual reconciliation. The message was not retried.",
+          );
+        }
         throw new LinePushDeliveryError();
       }
     }
@@ -498,7 +620,7 @@ export class StaffInboxService {
   async resumeAI(
     conversationId: string,
   ) {
-    await this.requireLineConversation(
+    await this.requireSupportedExternalConversation(
       conversationId,
     );
 
@@ -532,13 +654,14 @@ export class StaffInboxService {
   }
 
   async updateResponseMode(input: {
+    channel?: ExternalResponseChannel;
     channelAccountId: string;
     responseMode: ResponseMode;
   }) {
     return this.dependencies
       .configService
       .updateResponseMode({
-        channel: "line",
+        channel: input.channel ?? "line",
         channelAccountId:
           input.channelAccountId,
         responseMode:
@@ -569,5 +692,28 @@ export class StaffInboxService {
     }
 
     return conversation;
+  }
+
+  private async requireSupportedExternalConversation(
+    conversationId: string,
+  ): Promise<SupportedExternalConversation> {
+    const conversation =
+      await this.dependencies
+        .conversationRepository
+        .getConversation(
+          conversationId,
+        );
+    if (!conversation) {
+      throw new Error(`Conversation not found: ${conversationId}`);
+    }
+    if (
+      conversation.channel !== "line" &&
+      conversation.channel !== "facebook"
+    ) {
+      throw new Error(
+        "Staff Inbox supports LINE and Facebook conversations only",
+      );
+    }
+    return conversation as SupportedExternalConversation;
   }
 }

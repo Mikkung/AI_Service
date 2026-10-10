@@ -89,6 +89,25 @@ import {
 } from "../integrations/line/line-message-service";
 
 import {
+  FacebookMessageService,
+  type FacebookTextInboundEvent,
+} from "../integrations/facebook/facebook-message-service";
+
+import {
+  FacebookDeliveryUncertainError,
+  FacebookGraphApiSendClient,
+  type FacebookSendClient,
+  type FacebookTextSendInput,
+} from "../integrations/facebook/facebook-send-client";
+
+import {
+  processFacebookWebhook,
+  verifyFacebookWebhookSignature,
+} from "../integrations/facebook/facebook-webhook-adapter";
+
+import { FacebookExternalTextSender } from "../integrations/facebook/facebook-external-text-sender";
+
+import {
   LineMediaBlockedError,
   LineMediaUnavailableError,
   LineMessagingApiMediaClient,
@@ -118,6 +137,8 @@ import {
 
 import {
   LinePushDeliveryError,
+  AssistedSendReconciliationRequiredError,
+  FacebookMessagingWindowExpiredError,
   StaffInboxService,
   isConversationUnread,
 } from "../inbox/staff-inbox-service";
@@ -1215,6 +1236,24 @@ class RecordingLinePushClient
   }
 }
 
+class RecordingFacebookSendClient
+  implements FacebookSendClient
+{
+  readonly sends: FacebookTextSendInput[] = [];
+  error?: Error;
+
+  async sendText(
+    input: FacebookTextSendInput,
+  ) {
+    this.sends.push({ ...input });
+    if (this.error) throw this.error;
+    return {
+      recipientId: input.recipientId,
+      messageId: `facebook-out-${this.sends.length}`,
+    };
+  }
+}
+
 class RecordingLineMediaClient
   implements LineMediaClient
 {
@@ -1700,6 +1739,64 @@ function lineTextEvent(
     lineMessageId:
       "line-message-1",
     replyToken: "reply-token-1",
+    text: "Admission question",
+    ...overrides,
+  };
+}
+
+async function createFacebookTestEnvironment(
+  result: GroundedQAResult,
+  responseMode?: "off" | "draft" | "auto",
+) {
+  const provider = new CountingProvider(result);
+  const atomic = createAtomicTestService(provider);
+  const configRepository = new InMemoryChannelResponseConfigRepository();
+  const configService = new ChannelResponseConfigService(
+    configRepository,
+    () => "2027-01-01T00:00:00.000Z",
+  );
+  const draftRepository = new InMemorySuggestedReplyDraftRepository();
+  const sendClient = new RecordingFacebookSendClient();
+  let nextId = 1;
+  const facebookMessageService = new FacebookMessageService({
+    configService,
+    conversationService: atomic.service,
+    conversationRepository: atomic.conversationRepository,
+    conversationWorkflowRepository: atomic.conversationWorkflowRepository,
+    answerService: new AnswerService(provider),
+    draftRepository,
+    sendClient,
+    now: () => "2027-01-01T00:00:10.000Z",
+    nextId: (prefix) => `${prefix}-facebook-${nextId++}`,
+  });
+
+  if (responseMode) {
+    await configRepository.upsertConfig({
+      channel: "facebook",
+      channelAccountId: "facebook-page-1",
+      responseMode,
+      updatedAt: "2027-01-01T00:00:00.000Z",
+    });
+  }
+  return {
+    ...atomic,
+    provider,
+    configRepository,
+    configService,
+    draftRepository,
+    sendClient,
+    facebookMessageService,
+  };
+}
+
+function facebookTextEvent(
+  overrides: Partial<FacebookTextInboundEvent> = {},
+): FacebookTextInboundEvent {
+  return {
+    channelAccountId: "facebook-page-1",
+    channelUserId: "facebook-psid-1",
+    channelMessageId: "facebook-message:mid-1",
+    facebookMessageId: "mid-1",
     text: "Admission question",
     ...overrides,
   };
@@ -5369,6 +5466,201 @@ function lineSignature(
     .digest("base64");
 }
 
+async function testFacebookWebhookVerificationAndNormalization() {
+  const appSecret = "facebook-app-secret";
+  const pageId = "facebook-page-1";
+  const payload = {
+    object: "page",
+    entry: [{
+      id: pageId,
+      messaging: [
+        {
+          sender: { id: "psid-1" },
+          recipient: { id: pageId },
+          message: { mid: "mid-1", text: "Hello" },
+        },
+        {
+          sender: { id: pageId },
+          recipient: { id: "psid-1" },
+          message: { mid: "echo-1", text: "Echo", is_echo: true },
+        },
+        { sender: { id: "psid-1" }, recipient: { id: pageId }, delivery: {} },
+        { sender: { id: "psid-1" }, recipient: { id: pageId }, read: {} },
+        { sender: { id: "psid-1" }, recipient: { id: pageId }, message: { mid: "image-1", attachments: [{}] } },
+      ],
+    }],
+  };
+  const rawBody = Buffer.from(JSON.stringify(payload));
+  const signature = `sha256=${createHmac("sha256", appSecret).update(rawBody).digest("hex")}`;
+  assert.equal(verifyFacebookWebhookSignature(rawBody, signature, appSecret), true);
+  assert.equal(verifyFacebookWebhookSignature(rawBody, "sha256=00", appSecret), false);
+
+  const events: FacebookTextInboundEvent[] = [];
+  const summary = await processFacebookWebhook(rawBody, pageId, {
+    processTextEvent: async (event) => {
+      events.push(event);
+      return {
+        conversationId: "conversation-1",
+        responseMode: "off",
+        duplicate: false,
+        sent: false,
+      };
+    },
+  });
+  assert.deepEqual(summary, { processed: 1, ignored: 4 });
+  assert.deepEqual(events[0], {
+    channelAccountId: pageId,
+    channelUserId: "psid-1",
+    channelMessageId: "facebook-message:mid-1",
+    facebookMessageId: "mid-1",
+    text: "Hello",
+  });
+
+  const wrongPagePayload = Buffer.from(JSON.stringify({
+    object: "page",
+    entry: [{ id: "untrusted-page", messaging: payload.entry[0].messaging.slice(0, 1) }],
+  }));
+  assert.deepEqual(
+    await processFacebookWebhook(wrongPagePayload, pageId, { processTextEvent: async () => { throw new Error("must not process"); } }),
+    { processed: 0, ignored: 1 },
+  );
+
+  const route = await import("@/app/api/integrations/facebook/webhook/route");
+  const handlers = route.createFacebookWebhookHandlers({
+    getConfig: () => ({ appSecret, verifyToken: "verify-me", pageId }),
+    createFacebookMessageService: () => ({
+      processTextEvent: async () => ({
+        conversationId: "conversation-1",
+        responseMode: "off",
+        duplicate: false,
+        sent: false,
+      }),
+    }),
+  });
+  const verified = await handlers.GET(new Request(
+    "http://localhost/api/integrations/facebook/webhook?hub.mode=subscribe&hub.verify_token=verify-me&hub.challenge=raw-challenge",
+  ));
+  assert.equal(verified.status, 200);
+  assert.equal(await verified.text(), "raw-challenge");
+  const forbidden = await handlers.GET(new Request(
+    "http://localhost/api/integrations/facebook/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=x",
+  ));
+  assert.equal(forbidden.status, 403);
+  const accepted = await handlers.POST(new Request(
+    "http://localhost/api/integrations/facebook/webhook",
+    { method: "POST", body: rawBody, headers: { "x-hub-signature-256": signature } },
+  ));
+  assert.equal(accepted.status, 200);
+  const rejected = await handlers.POST(new Request(
+    "http://localhost/api/integrations/facebook/webhook",
+    { method: "POST", body: rawBody, headers: { "x-hub-signature-256": "sha256=" + "0".repeat(64) } },
+  ));
+  assert.equal(rejected.status, 401);
+}
+
+async function testFacebookResponseModesRedeliveryAndIdentity() {
+  const grounded: GroundedQAResult = {
+    answerable: true,
+    answer: "Grounded public answer",
+    citations: [{ documentId: "public-doc" }],
+    provider: "counting",
+  };
+
+  const off = await createFacebookTestEnvironment(grounded);
+  await off.facebookMessageService.processTextEvent(facebookTextEvent());
+  const offConversation = await off.conversationRepository.findActiveConversation("facebook", "facebook-psid-1", "facebook-page-1");
+  assert.ok(offConversation);
+  assert.equal((await off.conversationRepository.listMessages(offConversation.id)).length, 1);
+  assert.equal(off.provider.calls, 0);
+  assert.equal(off.sendClient.sends.length, 0);
+
+  const draft = await createFacebookTestEnvironment(grounded, "draft");
+  const draftResult = await draft.facebookMessageService.processTextEvent(facebookTextEvent());
+  assert.equal(draftResult.draftStatus, "ready");
+  const draftConversation = await draft.conversationRepository.getConversation(draftResult.conversationId);
+  assert.ok(draftConversation?.lastInboundMessageId);
+  assert.equal((await draft.conversationRepository.listMessages(draftResult.conversationId)).filter((message) => message.senderType === "ai").length, 0);
+  assert.equal(draft.sendClient.sends.length, 0);
+
+  const auto = await createFacebookTestEnvironment(grounded, "auto");
+  const first = await auto.facebookMessageService.processTextEvent(facebookTextEvent());
+  const duplicate = await auto.facebookMessageService.processTextEvent(facebookTextEvent());
+  assert.equal(first.sent, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(auto.sendClient.sends.length, 1);
+  assert.equal(
+    auto.provider.requests.every(
+      (request) => request.audience === "public",
+    ),
+    true,
+  );
+  let messages = await auto.conversationRepository.listMessages(first.conversationId);
+  assert.equal(messages.filter((message) => message.senderType === "user").length, 1);
+  assert.equal(messages.filter((message) => message.senderType === "ai").length, 1);
+  await auto.facebookMessageService.processTextEvent(facebookTextEvent({
+    channelMessageId: "facebook-message:mid-2",
+    facebookMessageId: "mid-2",
+  }));
+  messages = await auto.conversationRepository.listMessages(first.conversationId);
+  assert.equal(messages.filter((message) => message.senderType === "user").length, 2);
+  assert.equal(auto.sendClient.sends.length, 2);
+
+  await auto.configRepository.upsertConfig({
+    channel: "facebook",
+    channelAccountId: "facebook-page-2",
+    responseMode: "off",
+    updatedAt: "2027-01-01T00:00:00.000Z",
+  });
+  const otherPage = await auto.facebookMessageService.processTextEvent(facebookTextEvent({
+    channelAccountId: "facebook-page-2",
+    channelMessageId: "facebook-message:page-2-mid",
+    facebookMessageId: "page-2-mid",
+  }));
+  assert.notEqual(otherPage.conversationId, first.conversationId);
+
+  const unsafe = await createFacebookTestEnvironment({
+    answerable: false,
+    answer: "",
+    citations: [],
+    provider: "counting",
+  }, "auto");
+  const unsafeResult = await unsafe.facebookMessageService.processTextEvent(facebookTextEvent());
+  assert.equal(unsafeResult.sent, false);
+  assert.equal(unsafe.sendClient.sends.length, 0);
+  assert.equal(
+    (await unsafe.conversationRepository.listMessages(unsafeResult.conversationId)).some(
+      (message) => message.text === "Human handoff requested." && message.senderType === "system",
+    ),
+    true,
+  );
+}
+
+async function testFacebookSendClientContract() {
+  let capturedUrl = "";
+  let capturedAuthorization = "";
+  let capturedBody = "";
+  const client = new FacebookGraphApiSendClient({
+    pageAccessToken: "secret-page-token",
+    pageId: "page-1",
+    graphApiVersion: "v-test",
+    fetch: async (input, init) => {
+      capturedUrl = String(input);
+      capturedAuthorization = new Headers(init?.headers).get("authorization") ?? "";
+      capturedBody = String(init?.body);
+      return Response.json({ recipient_id: "psid-1", message_id: "mid-out-1" });
+    },
+  });
+  const result = await client.sendText({ pageId: "page-1", recipientId: "psid-1", text: "Hello" });
+  assert.equal(result.messageId, "mid-out-1");
+  assert.match(capturedUrl, /v-test\/page-1\/messages$/);
+  assert.equal(capturedAuthorization, "Bearer secret-page-token");
+  assert.deepEqual(JSON.parse(capturedBody), {
+    recipient: { id: "psid-1" },
+    messaging_type: "RESPONSE",
+    message: { text: "Hello" },
+  });
+}
+
 async function testLineWebhookSignatureAndParsing() {
   const route = await import(
     "@/app/api/integrations/line/webhook/route"
@@ -7873,6 +8165,213 @@ async function testStaffInboxMvp() {
   );
 }
 
+async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
+  const db = new FakeFirestore();
+  const conversationRepository = new FirestoreAIPlatformConversationRepository(db);
+  const workflow = new FirestoreAIPlatformConversationWorkflowRepository(db);
+  const draftRepository = new FirestoreSuggestedReplyDraftRepository(db);
+  const configService = new ChannelResponseConfigService(
+    new FirestoreChannelResponseConfigRepository(db),
+    () => "2027-01-01T00:00:20.000Z",
+  );
+  const sendRepository = new FirestoreAssistedStaffSendRepository(db as never);
+  const facebookClient = new RecordingFacebookSendClient();
+  let now = "2027-01-01T12:00:00.000Z";
+  const service = new StaffInboxService({
+    conversationRepository,
+    conversationWorkflowRepository: workflow,
+    draftRepository,
+    configService,
+    sendRepository,
+    textSenders: {
+      facebook: new FacebookExternalTextSender(facebookClient),
+    },
+    lineMediaClient: new RecordingLineMediaClient(),
+    now: () => now,
+  });
+
+  await conversationRepository.createConversation({
+    id: "unified-line",
+    channel: "line",
+    channelAudience: "external",
+    channelAccountId: "line-account",
+    channelUserId: "line-user",
+    mode: "ai_active",
+    createdAt: "2027-01-01T00:00:00.000Z",
+    updatedAt: "2027-01-01T10:00:00.000Z",
+  });
+  await conversationRepository.createConversation({
+    id: "unified-facebook",
+    channel: "facebook",
+    channelAudience: "external",
+    channelAccountId: "facebook-page-1",
+    channelUserId: "trusted-psid",
+    mode: "ai_active",
+    createdAt: "2027-01-01T00:00:00.000Z",
+    updatedAt: "2027-01-01T11:00:00.000Z",
+  });
+  await workflow.appendUserMessage({
+    conversationId: "unified-facebook",
+    message: {
+      id: "facebook-inbound-1",
+      conversationId: "unified-facebook",
+      senderType: "user",
+      senderId: "trusted-psid",
+      text: "Please help",
+      createdAt: "2027-01-01T11:30:00.000Z",
+      channelMessageId: "facebook-message:staff-1",
+    },
+    updatedAt: "2027-01-01T11:30:00.000Z",
+    processingDisposition: "off",
+  });
+  await draftRepository.saveDraft({
+    conversationId: "unified-facebook",
+    sourceMessageId: "facebook-inbound-1",
+    text: "Facebook draft",
+    status: "ready",
+    createdAt: "2027-01-01T11:31:00.000Z",
+    updatedAt: "2027-01-01T11:31:00.000Z",
+  });
+
+  const list = await service.listConversations();
+  assert.deepEqual(list.map((item) => item.id), ["unified-facebook", "unified-line"]);
+  assert.deepEqual(list.map((item) => item.channel), ["facebook", "line"]);
+  assert.ok(db.queryReads.some((query) => query.collectionName === "ai_platform_conversations" && query.filters.some((filter) => filter.field === "channel" && filter.value === "facebook")));
+
+  const config = await service.updateResponseMode({
+    channel: "facebook",
+    channelAccountId: "facebook-page-1",
+    responseMode: "draft",
+  });
+  assert.equal(config.channel, "facebook");
+  const edited = await service.editDraft({
+    conversationId: "unified-facebook",
+    sourceMessageId: "facebook-inbound-1",
+    text: "Edited Facebook reply",
+  });
+  assert.equal(edited.text, "Edited Facebook reply");
+
+  const requestId = "44444444-4444-4444-8444-444444444444";
+  const delivered = await service.sendAssistedReply({
+    conversationId: "unified-facebook",
+    text: "Edited Facebook reply",
+    sourceMessageId: "facebook-inbound-1",
+    clientRequestId: requestId,
+  });
+  assert.equal(delivered.delivered, true);
+  assert.equal(facebookClient.sends.length, 1);
+  assert.deepEqual(facebookClient.sends[0], {
+    pageId: "facebook-page-1",
+    recipientId: "trusted-psid",
+    text: "Edited Facebook reply",
+  });
+  const duplicate = await service.sendAssistedReply({
+    conversationId: "unified-facebook",
+    text: "Edited Facebook reply",
+    sourceMessageId: "facebook-inbound-1",
+    clientRequestId: requestId,
+  });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(facebookClient.sends.length, 1);
+  assert.equal((await conversationRepository.listMessages("unified-facebook")).filter((message) => message.senderType === "human").length, 1);
+  await assert.rejects(
+    () => service.sendAssistedReply({
+      conversationId: "unified-facebook",
+      text: "Conflicting text",
+      clientRequestId: requestId,
+    }),
+    AssistedStaffSendConflictError,
+  );
+
+  await conversationRepository.createConversation({
+    id: "facebook-window",
+    channel: "facebook",
+    channelAudience: "external",
+    channelAccountId: "facebook-page-1",
+    channelUserId: "window-psid",
+    mode: "ai_active",
+    createdAt: "2027-01-01T00:00:00.000Z",
+    updatedAt: "2027-01-01T00:00:00.000Z",
+  });
+  await workflow.appendUserMessage({
+    conversationId: "facebook-window",
+    message: {
+      id: "window-inbound",
+      conversationId: "facebook-window",
+      senderType: "user",
+      text: "Old inbound",
+      createdAt: "2027-01-01T00:00:00.000Z",
+      channelMessageId: "facebook-message:window",
+    },
+    updatedAt: "2027-01-01T00:00:00.000Z",
+    processingDisposition: "off",
+  });
+  now = "2027-01-01T23:59:59.999Z";
+  await service.sendAssistedReply({
+    conversationId: "facebook-window",
+    text: "Inside window",
+    clientRequestId: "55555555-5555-4555-8555-555555555555",
+  });
+  assert.equal(facebookClient.sends.length, 2);
+
+  await conversationRepository.createConversation({
+    id: "facebook-boundary",
+    channel: "facebook",
+    channelAudience: "external",
+    channelAccountId: "facebook-page-1",
+    channelUserId: "boundary-psid",
+    mode: "ai_active",
+    createdAt: "2027-01-01T00:00:00.000Z",
+    updatedAt: "2027-01-01T00:00:00.000Z",
+  });
+  await workflow.appendUserMessage({
+    conversationId: "facebook-boundary",
+    message: {
+      id: "boundary-inbound",
+      conversationId: "facebook-boundary",
+      senderType: "user",
+      text: "Boundary inbound",
+      createdAt: "2027-01-01T00:00:00.000Z",
+      channelMessageId: "facebook-message:boundary",
+    },
+    updatedAt: "2027-01-01T00:00:00.000Z",
+    processingDisposition: "off",
+  });
+  now = "2027-01-02T00:00:00.000Z";
+  await assert.rejects(
+    () => service.sendAssistedReply({
+      conversationId: "facebook-boundary",
+      text: "At boundary",
+      clientRequestId: "66666666-6666-4666-8666-666666666666",
+    }),
+    FacebookMessagingWindowExpiredError,
+  );
+  assert.equal(facebookClient.sends.length, 2);
+
+  now = "2027-01-01T12:00:00.000Z";
+  facebookClient.error = new FacebookDeliveryUncertainError();
+  await assert.rejects(
+    () => service.sendAssistedReply({
+      conversationId: "unified-facebook",
+      text: "Uncertain send",
+      clientRequestId: "77777777-7777-4777-8777-777777777777",
+    }),
+    AssistedSendReconciliationRequiredError,
+  );
+  assert.equal(facebookClient.sends.length, 3);
+  facebookClient.error = undefined;
+  await assert.rejects(
+    () => service.sendAssistedReply({
+      conversationId: "unified-facebook",
+      text: "Uncertain send",
+      clientRequestId: "77777777-7777-4777-8777-777777777777",
+    }),
+    AssistedSendReconciliationRequiredError,
+  );
+  assert.equal(facebookClient.sends.length, 3);
+  assert.equal((await conversationRepository.listMessages("unified-facebook")).filter((message) => message.text === "Uncertain send").length, 0);
+}
+
 function testStaffInboxComposerSynchronization() {
   const readyDraft = {
     sourceMessageId: "message-1",
@@ -8044,6 +8543,17 @@ function testStaffInboxComposerSynchronization() {
   }
 }
 
+async function testUnifiedStaffInboxUiSource() {
+  const source = await readFile(
+    path.join(process.cwd(), "src", "app", "admin", "inbox", "staff-inbox-client.tsx"),
+    "utf8",
+  );
+  assert.match(source, /\"all\" \| \"line\" \| \"facebook\"/);
+  assert.match(source, /\? \"LINE\" : \"MESSENGER\"/);
+  assert.match(source, /Send to Messenger/);
+  assert.match(source, /channel-response-configs\/\$\{detail\.conversation\.channel\}/);
+}
+
 async function testStaffInboxResumeAI() {
   const provider = groundedCountingProvider(
     "grounded resumed answer",
@@ -8072,6 +8582,8 @@ async function testStaffInboxResumeAI() {
     );
   const pushClient =
     new RecordingLinePushClient();
+  const facebookClient =
+    new RecordingFacebookSendClient();
   const inboxService =
     new StaffInboxService({
       conversationRepository,
@@ -8080,6 +8592,12 @@ async function testStaffInboxResumeAI() {
       sendRepository,
       configService,
       linePushClient: pushClient,
+      textSenders: {
+        facebook:
+          new FacebookExternalTextSender(
+            facebookClient,
+          ),
+      },
       lineMediaClient:
         new RecordingLineMediaClient(),
       now: () =>
@@ -8352,6 +8870,40 @@ async function testStaffInboxResumeAI() {
         failedSendConversation.id,
       ),
   );
+
+  const facebookResumeConversation =
+    await conversationService.createConversation({
+      channel: "facebook",
+      channelAccountId: "facebook-page-1",
+      channelUserId: "facebook-resume-user",
+    });
+  await conversationWorkflowRepository.appendUserMessage({
+    conversationId: facebookResumeConversation.id,
+    message: {
+      id: "facebook-resume-inbound",
+      conversationId: facebookResumeConversation.id,
+      senderType: "user",
+      text: "Need staff help",
+      createdAt: "2027-01-01T00:09:00.000Z",
+      channelMessageId: "facebook-message:resume",
+    },
+    updatedAt: "2027-01-01T00:09:00.000Z",
+    processingDisposition: "off",
+  });
+  await conversationService.requestHumanHandoff({
+    conversationId: facebookResumeConversation.id,
+    requestedBy: "staff",
+    reason: "staff_requested",
+  });
+  const facebookSendAndResume = await inboxService.sendAssistedReplyAndResumeAI({
+    conversationId: facebookResumeConversation.id,
+    text: "Confirmed Messenger reply",
+    clientRequestId: "88888888-8888-4888-8888-888888888888",
+  });
+  assert.equal(facebookSendAndResume.delivered, true);
+  assert.equal(facebookSendAndResume.resumed, true);
+  assert.equal(facebookSendAndResume.conversation.mode, "ai_active");
+  assert.equal(facebookClient.sends.length, 1);
 
   const resumeRoute = await import(
     "@/app/api/admin/ui/inbox/conversations/[id]/resume-ai/route"
@@ -14514,6 +15066,9 @@ async function main() {
   await testProductionDefaultAvoidsLocalVectorStoreFiles();
   await testOneDriveQueueAdapter();
   testAudiencePolicy();
+  await testFacebookWebhookVerificationAndNormalization();
+  await testFacebookResponseModesRedeliveryAndIdentity();
+  await testFacebookSendClientContract();
   await testLineWebhookSignatureAndParsing();
   await testLineWebhookEventFilteringAndAccountMapping();
   await testLineImageWebhookNormalization();
@@ -14529,7 +15084,9 @@ async function main() {
   await testLineConversationResolution();
   await testLineReplyClientContract();
   testStaffInboxComposerSynchronization();
+  await testUnifiedStaffInboxUiSource();
   await testStaffInboxMvp();
+  await testUnifiedFacebookStaffInboxAndDeliverySafety();
   await testStaffInboxResumeAI();
   await testLineProcessingAfterStaffResume();
   testResponseModePolicy();

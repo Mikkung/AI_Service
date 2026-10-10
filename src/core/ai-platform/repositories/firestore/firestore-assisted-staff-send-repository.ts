@@ -9,6 +9,7 @@ import {
   type AssistedStaffSendRepository,
   type CompleteAssistedStaffSendInput,
   type CompleteAssistedStaffSendResult,
+  type MarkAssistedStaffSendUncertainInput,
   type PrepareAssistedStaffSendInput,
 } from "@/core/ai-platform/repositories/assisted-staff-send-repository";
 
@@ -185,12 +186,13 @@ export class FirestoreAssistedStaffSendRepository
           );
 
         if (
-          conversation.channel !== "line" ||
+          (conversation.channel !== "line" &&
+            conversation.channel !== "facebook") ||
           !conversation.channelAccountId ||
           !conversation.channelUserId
         ) {
           throw new AssistedStaffSendInvariantError(
-            "Assisted send requires a LINE conversation with trusted account and user identity",
+            "Assisted send requires a supported external conversation with trusted account and user identity",
           );
         }
 
@@ -199,6 +201,7 @@ export class FirestoreAssistedStaffSendRepository
             input.clientRequestId,
           conversationId:
             input.conversationId,
+          channel: conversation.channel,
           text: input.text,
           textSha256: sha256(input.text),
           sourceMessageId:
@@ -306,6 +309,12 @@ export class FirestoreAssistedStaffSendRepository
           };
         }
 
+        if (receipt.status === "uncertain") {
+          throw new AssistedStaffSendInvariantError(
+            "Uncertain assisted send cannot be marked delivered without reconciliation",
+          );
+        }
+
         if (!messageSnapshot.exists) {
           transaction.create(
             messageRef,
@@ -380,6 +389,44 @@ export class FirestoreAssistedStaffSendRepository
         };
       },
     );
+  }
+
+  async markSendUncertain(
+    input: MarkAssistedStaffSendUncertainInput,
+  ): Promise<AssistedStaffSendReceipt> {
+    return this.db.runTransaction(async (transaction) => {
+      const receiptRef = this.receiptRef(
+        input.clientRequestId,
+      );
+      const snapshot =
+        await transaction.get(receiptRef);
+      if (!snapshot.exists) {
+        throw new AssistedStaffSendInvariantError(
+          "Assisted send receipt not found",
+        );
+      }
+      const receipt = mapReceipt(snapshot);
+      if (receipt.status === "delivered") {
+        throw new AssistedStaffSendInvariantError(
+          "Delivered assisted send cannot become uncertain",
+        );
+      }
+      if (receipt.status === "uncertain") {
+        return receipt;
+      }
+
+      const uncertainReceipt: AssistedStaffSendReceipt = {
+        ...receipt,
+        status: "uncertain",
+        uncertainAt: input.uncertainAt,
+        uncertaintyReason: input.reason,
+      };
+      transaction.set(
+        receiptRef,
+        serialize(uncertainReceipt),
+      );
+      return uncertainReceipt;
+    });
   }
 
   private receiptRef(

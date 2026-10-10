@@ -426,3 +426,17 @@ Image webhook processing remains synchronous in F5.3A. LINE media fetches have a
 An AI-enabled text message arriving while the latest image is still processing waits for persisted analysis for at most 8 seconds. When analysis becomes ready, its sanitized context is included in the normal grounded answer. If that wait expires, the text message is persisted once under the existing inbound lease and is not answered without the image context; the existing recovery path can safely resolve the deferred receipt after the image settles.
 
 The Staff Inbox shows image status and safe context. Its authenticated preview route resolves the trusted LINE media ID from the stored conversation message and proxies LINE's temporary preview with `Cache-Control: private, no-store`. Preview expiry is expected; F5.3A intentionally has no persistent media store.
+
+## Facebook Messenger Text (F5.4A)
+
+Facebook Messenger text follows the same external-channel core as LINE:
+
+`Meta webhook -> Facebook adapter -> Conversation / AnswerService / GroundingGate -> Draft, Auto, or Handoff`
+
+The webhook verifies `x-hub-signature-256` against the exact raw request body before parsing JSON. Page identity is trusted from server configuration, and conversation identity is the tuple `facebook + Page ID + PSID`. Facebook is an external channel and can retrieve public knowledge only.
+
+Response mode is account-scoped. `off` stores inbound text only, `draft` creates a staff-reviewable suggested reply, and `auto` sends only a safe AI message produced by the shared conversation pipeline. Echoes and unsupported Messenger event types are ignored.
+
+Staff Messenger replies are blocked at and beyond 24 hours after the latest inbound message. Facebook has no equivalent of LINE's retry key: an ambiguous network outcome is recorded as `uncertain` and requires manual reconciliation instead of an automatic resend. Confirmed sends alone create a human conversation message and mark a linked draft sent. LINE retry-key behavior is unchanged.
+
+The Staff Inbox queries recent LINE and Facebook conversations separately using the existing `channel + updatedAt` query, merges and sorts the bounded results, and offers All, LINE, and Facebook views. LINE media preview remains LINE-only. Facebook image/media support is deferred to F5.4B and will feed the shared image-understanding pipeline.

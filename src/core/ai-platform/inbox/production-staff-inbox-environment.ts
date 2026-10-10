@@ -6,6 +6,11 @@ import {
   LineMessagingApiReplyClient,
 } from "@/core/ai-platform/integrations/line/line-reply-client";
 
+import { LineExternalTextSender } from "@/core/ai-platform/integrations/line/line-external-text-sender";
+import { FacebookExternalTextSender } from "@/core/ai-platform/integrations/facebook/facebook-external-text-sender";
+import { getFacebookIntegrationConfigIfAvailable } from "@/core/ai-platform/integrations/facebook/facebook-config";
+import { FacebookGraphApiSendClient } from "@/core/ai-platform/integrations/facebook/facebook-send-client";
+
 import {
   LineMessagingApiMediaClient,
 } from "@/core/ai-platform/integrations/line/line-media-client";
@@ -57,6 +62,20 @@ export function createProductionStaffInboxEnvironment() {
       channelAccessToken:
         env.LINE_CHANNEL_ACCESS_TOKEN,
     });
+  const facebookConfig = getFacebookIntegrationConfigIfAvailable();
+  const facebookSendClient = facebookConfig
+    ? new FacebookGraphApiSendClient({
+        pageAccessToken: facebookConfig.pageAccessToken,
+        pageId: facebookConfig.pageId,
+        graphApiVersion: facebookConfig.graphApiVersion,
+      })
+    : undefined;
+  const textSenders = {
+    line: new LineExternalTextSender(linePushClient),
+    ...(facebookSendClient
+      ? { facebook: new FacebookExternalTextSender(facebookSendClient) }
+      : {}),
+  };
   const sendRepository =
     new FirestoreAssistedStaffSendRepository();
   const conversationWorkflowRepository =
@@ -65,7 +84,7 @@ export function createProductionStaffInboxEnvironment() {
     conversationRepository,
     draftRepository,
     configService,
-    linePushClient,
+    textSenders,
     lineMediaClient,
     sendRepository,
     conversationWorkflowRepository,
@@ -77,6 +96,8 @@ export function createProductionStaffInboxEnvironment() {
     draftRepository,
     configService,
     linePushClient,
+    facebookSendClient,
+    textSenders,
     lineMediaClient,
     sendRepository,
     conversationWorkflowRepository,

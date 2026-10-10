@@ -25,7 +25,7 @@ type ResponseMode =
 
 type InboxConversation = {
   id: string;
-  channel: "line";
+  channel: "line" | "facebook";
   channelAccountId?: string;
   channelUserId: string;
   mode:
@@ -162,6 +162,8 @@ export function StaffInboxClient() {
   const [apiKey, setApiKey] = useState("");
   const [conversations, setConversations] =
     useState<InboxConversation[]>([]);
+  const [channelFilter, setChannelFilter] =
+    useState<"all" | "line" | "facebook">("all");
   const [selectedId, setSelectedId] =
     useState<string>();
   const [detail, setDetail] =
@@ -191,6 +193,9 @@ export function StaffInboxClient() {
     useState<ImageLightbox>();
   const [sendRequestId, setSendRequestId] =
     useState<string>();
+  const visibleConversations = channelFilter === "all"
+    ? conversations
+    : conversations.filter((conversation) => conversation.channel === channelFilter);
   const pollingRef = useRef(false);
   const detailPollingRef = useRef(false);
   const explicitSelectionRef =
@@ -553,7 +558,9 @@ export function StaffInboxClient() {
       setNotice(
         resumeAI
           ? "Reply sent and AI resumed."
-          : "Reply sent to LINE.",
+          : detail.conversation.channel === "line"
+            ? "Reply sent to LINE."
+            : "Reply sent to Messenger.",
       );
       setComposer(
         emptyStaffInboxComposer(
@@ -636,7 +643,7 @@ export function StaffInboxClient() {
     try {
       await readJson(
         await fetch(
-          `/api/admin/ui/inbox/channel-response-configs/line/${encodeURIComponent(detail.conversation.channelAccountId)}`,
+          `/api/admin/ui/inbox/channel-response-configs/${detail.conversation.channel}/${encodeURIComponent(detail.conversation.channelAccountId)}`,
           {
             method: "PUT",
             headers: {
@@ -729,7 +736,7 @@ export function StaffInboxClient() {
           {detail && (
             <div className={styles.modeControl}>
               <label htmlFor="response-mode">
-                LINE response mode
+                {detail.conversation.channel === "line" ? "LINE" : "Messenger"} response mode
               </label>
               <select
                 id="response-mode"
@@ -772,7 +779,7 @@ export function StaffInboxClient() {
         <aside className={styles.listPanel}>
           <div className={styles.panelTitle}>
             <div>
-              <h2>LINE conversations</h2>
+              <h2>Conversations</h2>
               <p>
                 {conversations.length} recent
               </p>
@@ -788,17 +795,31 @@ export function StaffInboxClient() {
             </button>
           </div>
 
+          <div className={styles.channelFilters} aria-label="Filter conversations by channel">
+            {(["all", "line", "facebook"] as const).map((filter) => (
+              <button
+                key={filter}
+                type="button"
+                className={channelFilter === filter ? styles.activeFilter : undefined}
+                aria-pressed={channelFilter === filter}
+                onClick={() => setChannelFilter(filter)}
+              >
+                {filter === "all" ? "All" : filter === "line" ? "LINE" : "Facebook"}
+              </button>
+            ))}
+          </div>
+
           <div className={styles.conversationList}>
             {loading && !conversations.length ? (
               <p className={styles.emptyList}>
                 Loading conversations...
               </p>
-            ) : conversations.length === 0 ? (
+            ) : visibleConversations.length === 0 ? (
               <p className={styles.emptyList}>
-                No LINE conversations yet.
+                No conversations in this view.
               </p>
             ) : (
-              conversations.map(
+              visibleConversations.map(
                 (conversation) => (
                   <button
                     type="button"
@@ -838,10 +859,13 @@ export function StaffInboxClient() {
                     />
                     <span className={styles.itemBody}>
                       <strong>
-                        LINE user {shortIdentity(conversation.channelUserId)}
+                        <span className={styles.listChannelBadge}>
+                          {conversation.channel === "line" ? "LINE" : "FB"}
+                        </span>
+                        {conversation.channel === "line" ? "LINE" : "Messenger"} user {shortIdentity(conversation.channelUserId)}
                       </strong>
                       <span>
-                        Account {shortIdentity(conversation.channelAccountId ?? "Legacy")}
+                        {conversation.channel === "line" ? "LINE" : "Facebook"} · Account {shortIdentity(conversation.channelAccountId ?? "Legacy")}
                       </span>
                       <small>
                         {formatTime(conversation.lastMessageAt ?? conversation.updatedAt)}
@@ -880,7 +904,7 @@ export function StaffInboxClient() {
               <div className={styles.chatHeader}>
                 <div>
                   <span className={styles.channelBadge}>
-                    LINE
+                    {detail.conversation.channel === "line" ? "LINE" : "MESSENGER"}
                   </span>
                   <h2>
                     User {shortIdentity(detail.conversation.channelUserId)}
@@ -926,7 +950,7 @@ export function StaffInboxClient() {
                     >
                       <span>
                         {message.senderType === "user"
-                          ? "LINE user"
+                          ? detail.conversation.channel === "line" ? "LINE user" : "Messenger user"
                           : message.senderType === "ai"
                             ? "ISE AI"
                             : message.senderType === "human"
@@ -1021,7 +1045,7 @@ export function StaffInboxClient() {
                     <h3>
                       {detail.draft?.status === "ready"
                         ? "AI suggested draft"
-                        : "Reply to LINE"}
+                        : detail.conversation.channel === "line" ? "Reply to LINE" : "Reply to Messenger"}
                     </h3>
                     <p>
                       Review the text before sending.
@@ -1043,7 +1067,7 @@ export function StaffInboxClient() {
                   value={composerText}
                   maxLength={5000}
                   rows={5}
-                  placeholder="Write a reply to the LINE user"
+                  placeholder={detail.conversation.channel === "line" ? "Write a reply to the LINE user" : "Write a reply to the Messenger user"}
                   onChange={(event) => {
                     setComposer((current) =>
                       editStaffInboxComposer(
@@ -1076,7 +1100,7 @@ export function StaffInboxClient() {
                       disabled={sending || resuming || !composerText.trim()}
                       onClick={() => void sendReply(false)}
                     >
-                      {sending ? "Sending..." : "Send to LINE"}
+                      {sending ? "Sending..." : detail.conversation.channel === "line" ? "Send to LINE" : "Send to Messenger"}
                     </button>
                     {(detail.conversation.mode ===
                       "waiting_human" ||

@@ -3,13 +3,19 @@ import type {
   ConversationMessage,
 } from "@/core/ai-platform/types/conversations";
 
+import type {
+  ExternalResponseChannel,
+} from "@/core/ai-platform/types/channel-response";
+
 export type AssistedStaffSendStatus =
   | "pending"
+  | "uncertain"
   | "delivered";
 
 export interface AssistedStaffSendReceipt {
   clientRequestId: string;
   conversationId: string;
+  channel?: ExternalResponseChannel;
   text: string;
   textSha256: string;
   sourceMessageId?: string;
@@ -18,6 +24,8 @@ export interface AssistedStaffSendReceipt {
   status: AssistedStaffSendStatus;
   createdAt: string;
   deliveredAt?: string;
+  uncertainAt?: string;
+  uncertaintyReason?: string;
 }
 
 export interface PrepareAssistedStaffSendInput {
@@ -39,6 +47,12 @@ export interface CompleteAssistedStaffSendResult {
   conversation: Conversation;
   message: ConversationMessage;
   newlyCompleted: boolean;
+}
+
+export interface MarkAssistedStaffSendUncertainInput {
+  clientRequestId: string;
+  uncertainAt: string;
+  reason: string;
 }
 
 export class AssistedStaffSendConflictError extends Error {
@@ -65,4 +79,8 @@ export interface AssistedStaffSendRepository {
   completeDeliveredSend(
     input: CompleteAssistedStaffSendInput,
   ): Promise<CompleteAssistedStaffSendResult>;
+
+  markSendUncertain(
+    input: MarkAssistedStaffSendUncertainInput,
+  ): Promise<AssistedStaffSendReceipt>;
 }

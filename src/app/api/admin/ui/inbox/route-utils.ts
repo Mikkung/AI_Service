@@ -5,6 +5,8 @@ import {
 
 import {
   AssistedSendReconciliationRequiredError,
+  FacebookMessagingWindowExpiredError,
+  FacebookSendDeliveryError,
   LinePushDeliveryError,
 } from "@/core/ai-platform/inbox/staff-inbox-service";
 
@@ -51,7 +53,14 @@ export function inboxRouteError(
     );
   }
 
-  if (error instanceof LinePushDeliveryError) {
+  if (error instanceof FacebookMessagingWindowExpiredError) {
+    return Response.json({ ok: false, error: error.message }, { status: 409 });
+  }
+
+  if (
+    error instanceof LinePushDeliveryError ||
+    error instanceof FacebookSendDeliveryError
+  ) {
     return Response.json(
       {
         ok: false,

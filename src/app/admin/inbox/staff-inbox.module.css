@@ -150,6 +150,31 @@
   overflow-y: auto;
 }
 
+.channelFilters {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e8ecf2;
+}
+
+.channelFilters button {
+  min-height: 30px;
+  border: 1px solid #ccd4df;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #526078;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.channelFilters .activeFilter {
+  border-color: #27364f;
+  background: #27364f;
+  color: #ffffff;
+}
+
 .conversationItem {
   width: 100%;
   min-height: 96px;
@@ -208,6 +233,17 @@
 .itemBody strong {
   color: #243049;
   font-size: 12px;
+}
+
+.itemBody .listChannelBadge {
+  display: inline-flex;
+  margin-right: 6px;
+  border: 1px solid #cbd4e1;
+  border-radius: 4px;
+  padding: 1px 4px;
+  color: #344159;
+  font-size: 8px;
+  font-weight: 800;
 }
 
 .itemBody span,

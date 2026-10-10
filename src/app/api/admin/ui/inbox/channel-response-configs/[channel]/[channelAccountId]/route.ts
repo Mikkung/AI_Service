@@ -60,7 +60,8 @@ export function createInboxModeHandler(
       ),
     );
     if (
-      params.channel !== "line" ||
+      (params.channel !== "line" &&
+        params.channel !== "facebook") ||
       !params.channelAccountId ||
       !body.success
     ) {
@@ -79,6 +80,7 @@ export function createInboxModeHandler(
       const config =
         await serviceFactory()
           .updateResponseMode({
+            channel: params.channel,
             channelAccountId:
               params.channelAccountId,
             responseMode:

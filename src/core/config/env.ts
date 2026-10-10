@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+const optionalConfigValue = z.preprocess(
+  (value) => value === "" ? undefined : value,
+  z.string().min(1).optional(),
+);
+
 const schema = z.object({
   APP_ENV: z
     .enum(["development", "preview", "production", "test"])
@@ -14,6 +19,12 @@ const schema = z.object({
   LINE_CHANNEL_ACCESS_TOKEN: z
     .string()
     .min(1),
+
+  FACEBOOK_APP_SECRET: optionalConfigValue,
+  FACEBOOK_VERIFY_TOKEN: optionalConfigValue,
+  FACEBOOK_PAGE_ACCESS_TOKEN: optionalConfigValue,
+  FACEBOOK_PAGE_ID: optionalConfigValue,
+  FACEBOOK_GRAPH_API_VERSION: optionalConfigValue,
 
   DEFAULT_AI_PROVIDER: z
     .string()
@@ -64,6 +75,17 @@ const result = schema.safeParse({
 
   LINE_CHANNEL_ACCESS_TOKEN:
     process.env.LINE_CHANNEL_ACCESS_TOKEN,
+
+  FACEBOOK_APP_SECRET:
+    process.env.FACEBOOK_APP_SECRET,
+  FACEBOOK_VERIFY_TOKEN:
+    process.env.FACEBOOK_VERIFY_TOKEN,
+  FACEBOOK_PAGE_ACCESS_TOKEN:
+    process.env.FACEBOOK_PAGE_ACCESS_TOKEN,
+  FACEBOOK_PAGE_ID:
+    process.env.FACEBOOK_PAGE_ID,
+  FACEBOOK_GRAPH_API_VERSION:
+    process.env.FACEBOOK_GRAPH_API_VERSION,
 
   DEFAULT_AI_PROVIDER:
     process.env.DEFAULT_AI_PROVIDER,

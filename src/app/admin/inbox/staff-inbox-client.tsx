@@ -96,6 +96,11 @@ type ApiError = {
   error?: string;
 };
 
+type ImageLightbox = {
+  messageId: string;
+  previewUrl: string;
+};
+
 const modeDescription: Record<
   ResponseMode,
   string
@@ -182,12 +187,54 @@ export function StaffInboxClient() {
     useState<Set<string>>(
       () => new Set(),
     );
+  const [imageLightbox, setImageLightbox] =
+    useState<ImageLightbox>();
   const [sendRequestId, setSendRequestId] =
     useState<string>();
   const pollingRef = useRef(false);
   const detailPollingRef = useRef(false);
   const explicitSelectionRef =
     useRef(false);
+  const lightboxCloseRef =
+    useRef<HTMLButtonElement>(null);
+  const lightboxTriggerRef =
+    useRef<HTMLButtonElement | null>(
+      null,
+    );
+
+  const closeImageLightbox =
+    useCallback(() => {
+      setImageLightbox(undefined);
+      window.requestAnimationFrame(
+        () =>
+          lightboxTriggerRef.current
+            ?.focus(),
+      );
+    }, []);
+
+  const markPreviewExpired =
+    useCallback(
+      (messageId: string) => {
+        setExpiredPreviews(
+          (current) => {
+            const next =
+              new Set(current);
+            next.add(messageId);
+            return next;
+          },
+        );
+        if (
+          imageLightbox?.messageId ===
+          messageId
+        ) {
+          closeImageLightbox();
+        }
+      },
+      [
+        imageLightbox,
+        closeImageLightbox,
+      ],
+    );
 
   const checkSession = useCallback(
     async () => {
@@ -345,6 +392,43 @@ export function StaffInboxClient() {
     );
     return () => window.clearInterval(timer);
   }, [selectedId, authenticated, loadDetail]);
+
+  useEffect(() => {
+    if (!imageLightbox) {
+      return;
+    }
+
+    const previousOverflow =
+      document.body.style.overflow;
+    const handleKeyDown = (
+      event: KeyboardEvent,
+    ) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeImageLightbox();
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        lightboxCloseRef.current?.focus();
+      }
+    };
+
+    document.body.style.overflow =
+      "hidden";
+    window.addEventListener(
+      "keydown",
+      handleKeyDown,
+    );
+    lightboxCloseRef.current?.focus();
+
+    return () => {
+      document.body.style.overflow =
+        previousOverflow;
+      window.removeEventListener(
+        "keydown",
+        handleKeyDown,
+      );
+    };
+  }, [imageLightbox, closeImageLightbox]);
 
   async function login(
     event: FormEvent,
@@ -851,65 +935,77 @@ export function StaffInboxClient() {
                       </span>
                       <p>{message.text}</p>
                       {message.attachments?.map(
-                        (attachment) => (
-                          <div
-                            key={attachment.id}
-                            className={styles.attachmentCard}
-                          >
-                            <div className={styles.attachmentPreview}>
-                              {expiredPreviews.has(
-                                message.id,
-                              ) ? (
-                                <span>
-                                  Preview expired
-                                </span>
-                              ) : (
-                                <img
-                                  src={`/api/admin/ui/inbox/conversations/${encodeURIComponent(detail.conversation.id)}/messages/${encodeURIComponent(message.id)}/media-preview`}
-                                  alt="Temporary LINE image preview"
-                                  loading="lazy"
-                                  onError={() =>
-                                    setExpiredPreviews(
-                                      (current) => {
-                                        const next =
-                                          new Set(
-                                            current,
-                                          );
-                                        next.add(
+                        (attachment) => {
+                          const previewUrl =
+                            `/api/admin/ui/inbox/conversations/${encodeURIComponent(detail.conversation.id)}/messages/${encodeURIComponent(message.id)}/media-preview`;
+
+                          return (
+                            <div
+                              key={attachment.id}
+                              className={styles.attachmentCard}
+                            >
+                              <div className={styles.attachmentPreview}>
+                                {expiredPreviews.has(
+                                  message.id,
+                                ) ? (
+                                  <span>
+                                    Preview expired
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className={styles.attachmentPreviewButton}
+                                    aria-label="Open image preview"
+                                    title="Open full size"
+                                    onClick={(event) => {
+                                      lightboxTriggerRef.current =
+                                        event.currentTarget;
+                                      setImageLightbox({
+                                        messageId:
                                           message.id,
-                                        );
-                                        return next;
-                                      },
-                                    )
-                                  }
-                                />
-                              )}
-                            </div>
-                            <div className={styles.attachmentBody}>
-                              <strong>Image</strong>
-                              <span>
-                                {attachment.analysisStatus?.replaceAll("_", " ") ?? "received"}
-                              </span>
-                              {attachment.category && (
-                                <small>
-                                  {attachment.category.replaceAll("_", " ")}
-                                </small>
-                              )}
-                              {attachment.sensitivity &&
-                                attachment.sensitivity !==
-                                  "none" && (
-                                  <small className={styles.sensitiveLabel}>
-                                    Sensitive content protected
+                                        previewUrl,
+                                      });
+                                    }}
+                                  >
+                                    <img
+                                      src={previewUrl}
+                                      alt="Temporary LINE image preview"
+                                      loading="lazy"
+                                      onError={() =>
+                                        markPreviewExpired(
+                                          message.id,
+                                        )
+                                      }
+                                    />
+                                  </button>
+                                )}
+                              </div>
+                              <div className={styles.attachmentBody}>
+                                <strong>Image</strong>
+                                <span>
+                                  {attachment.analysisStatus?.replaceAll("_", " ") ?? "received"}
+                                </span>
+                                {attachment.category && (
+                                  <small>
+                                    {attachment.category.replaceAll("_", " ")}
                                   </small>
                                 )}
-                              {attachment.safeContextText && (
-                                <p>
-                                  {attachment.safeContextText}
-                                </p>
-                              )}
+                                {attachment.sensitivity &&
+                                  attachment.sensitivity !==
+                                    "none" && (
+                                    <small className={styles.sensitiveLabel}>
+                                      Sensitive content protected
+                                    </small>
+                                  )}
+                                {attachment.safeContextText && (
+                                  <p>
+                                    {attachment.safeContextText}
+                                  </p>
+                                )}
+                              </div>
                             </div>
-                          </div>
-                        ),
+                          );
+                        },
                       )}
                       <time>
                         {formatTime(message.createdAt)}
@@ -1002,6 +1098,56 @@ export function StaffInboxClient() {
           )}
         </section>
       </main>
+      {imageLightbox &&
+        !expiredPreviews.has(
+          imageLightbox.messageId,
+        ) && (
+          <div
+            className={styles.lightboxBackdrop}
+            role="presentation"
+            onClick={(event) => {
+              if (
+                event.target ===
+                event.currentTarget
+              ) {
+                closeImageLightbox();
+              }
+            }}
+          >
+            <div
+              className={styles.lightboxDialog}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Image preview"
+              onClick={(event) =>
+                event.stopPropagation()
+              }
+            >
+              <button
+                ref={lightboxCloseRef}
+                type="button"
+                className={styles.lightboxClose}
+                aria-label="Close image preview"
+                onClick={closeImageLightbox}
+              >
+                X
+              </button>
+              <img
+                className={styles.lightboxImage}
+                src={imageLightbox.previewUrl}
+                alt="Temporary LINE image preview, full size"
+                onError={() =>
+                  markPreviewExpired(
+                    imageLightbox.messageId,
+                  )
+                }
+              />
+              <p className={styles.lightboxNote}>
+                Temporary LINE preview
+              </p>
+            </div>
+          </div>
+        )}
     </div>
   );
 }

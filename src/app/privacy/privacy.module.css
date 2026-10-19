@@ -1,0 +1,154 @@
+.page {
+  min-height: 100vh;
+  background: #ffffff;
+  color: #182235;
+}
+
+.header {
+  border-top: 5px solid #d7193f;
+  border-bottom: 1px solid #dce2ea;
+  background: #ffffff;
+}
+
+.headerInner,
+.content,
+.footer {
+  width: min(100% - 40px, 820px);
+  margin: 0 auto;
+}
+
+.headerInner {
+  padding: 48px 0 36px;
+}
+
+.brand {
+  margin: 0 0 12px;
+  color: #b51637;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.header h1 {
+  margin: 0;
+  color: #15213a;
+  font-size: 44px;
+  line-height: 1.08;
+  letter-spacing: 0;
+}
+
+.intro {
+  max-width: 720px;
+  margin: 18px 0 0;
+  color: #4c596d;
+  font-size: 17px;
+  line-height: 1.7;
+}
+
+.updated {
+  margin: 18px 0 0;
+  color: #69758a;
+  font-size: 13px;
+}
+
+.content {
+  padding: 18px 0 52px;
+  background: #ffffff;
+}
+
+.content section {
+  padding: 30px 0;
+  border-bottom: 1px solid #e4e8ee;
+}
+
+.content section:last-child {
+  border-bottom: 0;
+}
+
+.content h2 {
+  margin: 0 0 12px;
+  color: #1f2d48;
+  font-size: 21px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+
+.content p,
+.content li {
+  color: #3d4a5f;
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+.content p {
+  margin: 0 0 14px;
+}
+
+.content p:last-child {
+  margin-bottom: 0;
+}
+
+.content ul {
+  margin: 12px 0 16px;
+  padding-left: 24px;
+}
+
+.content li + li {
+  margin-top: 8px;
+}
+
+.content a {
+  color: #a41232;
+  font-weight: 700;
+  text-underline-offset: 3px;
+}
+
+.content a:hover,
+.content a:focus-visible {
+  color: #761027;
+}
+
+.footer {
+  padding: 26px 0 40px;
+  color: #657187;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.footer p {
+  margin: 2px 0;
+}
+
+.footer p:first-child {
+  color: #243049;
+  font-weight: 800;
+}
+
+@media (max-width: 600px) {
+  .headerInner,
+  .content,
+  .footer {
+    width: min(100% - 28px, 820px);
+  }
+
+  .headerInner {
+    padding: 34px 0 28px;
+  }
+
+  .header h1 {
+    font-size: 34px;
+  }
+
+  .intro {
+    font-size: 16px;
+  }
+
+  .content section {
+    padding: 24px 0;
+  }
+
+  .content h2 {
+    font-size: 19px;
+  }
+}

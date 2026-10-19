@@ -440,3 +440,7 @@ Response mode is account-scoped. `off` stores inbound text only, `draft` creates
 Staff Messenger replies are blocked at and beyond 24 hours after the latest inbound message. Facebook has no equivalent of LINE's retry key: an ambiguous network outcome is recorded as `uncertain` and requires manual reconciliation instead of an automatic resend. Confirmed sends alone create a human conversation message and mark a linked draft sent. LINE retry-key behavior is unchanged.
 
 The Staff Inbox queries recent LINE and Facebook conversations separately using the existing `channel + updatedAt` query, merges and sorts the bounded results, and offers All, LINE, and Facebook views. LINE media preview remains LINE-only. Facebook image/media support is deferred to F5.4B and will feed the shared image-understanding pipeline.
+
+## Public Privacy Policy
+
+`GET /privacy` is a public, unauthenticated privacy-policy page for the ISE AI Service. It documents website/chat, LINE, Facebook Messenger, AI-assisted, staff-assisted, media, retention, and data-deletion practices. The route is intended to provide users with transparent privacy information and to support Meta and other third-party platform review requirements.

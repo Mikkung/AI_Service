@@ -47,7 +47,6 @@ import type {
   ConversationMessage,
 } from "@/core/ai-platform/types/conversations";
 
-const STAFF_ID = "admin-ui-staff";
 const MAX_REPLY_LENGTH = 5000;
 const LINE_RETRY_KEY_SAFE_WINDOW_MS =
   24 * 60 * 60 * 1000;
@@ -95,6 +94,7 @@ export type StaffInboxMessage = Pick<
 
 export interface SendAssistedReplyInput {
   conversationId: string;
+  staffActorId: string;
   text: string;
   clientRequestId: string;
   sourceMessageId?: string;
@@ -453,6 +453,14 @@ export class StaffInboxService {
     input: SendAssistedReplyInput,
   ) {
     const text = input.text.trim();
+    const staffActorId =
+      input.staffActorId.trim();
+
+    if (!staffActorId) {
+      throw new Error(
+        "Staff actor identity is required",
+      );
+    }
 
     if (
       !UUID_PATTERN.test(
@@ -602,7 +610,7 @@ export class StaffInboxService {
           clientRequestId:
             input.clientRequestId,
           deliveredAt: this.now(),
-          staffId: STAFF_ID,
+          staffId: staffActorId,
         });
 
     return {

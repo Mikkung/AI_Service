@@ -50,6 +50,35 @@
   text-decoration: none;
 }
 
+.staffIdentity {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  color: #344159;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.staffIdentity small {
+  max-width: 220px;
+  overflow: hidden;
+  color: #758198;
+  font-size: 10px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.signOutButton {
+  min-height: 34px;
+  border: 1px solid #ccd4df;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #526078;
+  font-weight: 700;
+}
+
 .modeControl {
   min-width: 310px;
   display: grid;
@@ -672,6 +701,26 @@
 .loginPanel p {
   color: #758198;
   font-size: 12px;
+}
+
+.loginPanel .microsoftButton {
+  margin-top: 16px;
+  border-color: #23436d;
+  background: #28517f;
+}
+
+.legacyLogin {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #e1e6ed;
+}
+
+.legacyLogin h2 {
+  margin: 0;
+  color: #59667b;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-align: left;
 }
 
 .loginPanel label {

@@ -23,14 +23,15 @@ export function createInboxConversationListHandler(
   serviceFactory: ServiceFactory = () =>
     createProductionStaffInboxEnvironment()
       .service,
+  authorize = requireInboxSession,
 ) {
   return async function GET(
     request: Request,
   ): Promise<Response> {
-    const unauthorized =
-      requireInboxSession(request);
-    if (unauthorized) {
-      return unauthorized;
+    const authorization =
+      await authorize(request);
+    if (!authorization.authorized) {
+      return authorization.response;
     }
 
     const url = new URL(request.url);

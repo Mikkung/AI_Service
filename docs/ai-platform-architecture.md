@@ -441,6 +441,25 @@ Staff Messenger replies are blocked at and beyond 24 hours after the latest inbo
 
 The Staff Inbox queries recent LINE and Facebook conversations separately using the existing `channel + updatedAt` query, merges and sorts the bounded results, and offers All, LINE, and Facebook views. LINE media preview remains LINE-only. Facebook image/media support is deferred to F5.4B and will feed the shared image-understanding pipeline.
 
+## Staff Inbox Authentication (F6.0)
+
+Staff access is authenticated independently from external messaging users and from non-UI administrative integrations:
+
+```text
+Microsoft Entra ID
+    -> single Chulalongkorn tenant
+    -> explicit STAFF_ALLOWED_EMAILS allowlist
+    -> Staff Inbox
+```
+
+A valid organizational Microsoft account is not sufficient by itself. The verified Entra email or `preferred_username` is normalized and must exactly match an entry in the server-side allowlist. A missing identity or an empty allowlist denies access. Auth.js uses a JWT session with an eight-hour maximum age and exposes only the staff name and normalized email to the browser; provider tokens remain server-side.
+
+External LINE and Facebook identities are unrelated to staff authentication. F6.0 adds no Microsoft Graph, Teams, SharePoint, or role authorization. Roles are deferred to F6.1.
+
+The existing admin-key Staff Inbox login remains a temporary migration fallback only when `ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED=true`. Production should change this to `false` after Entra sign-in is verified and the Meta review-safe cutover is complete. This switch does not disable `APP_API_KEY` for unrelated administrative endpoints or alter LINE/Facebook webhook authentication.
+
+Confirmed human messages derive `senderId` from the authenticated server session: the normalized Entra email for Microsoft sign-in or `legacy-admin-ui` for the temporary fallback. The browser cannot supply or override this actor identity.
+
 ## Public Privacy Policy
 
 `GET /privacy` is a public, unauthenticated privacy-policy page for the ISE AI Service. It documents website/chat, LINE, Facebook Messenger, AI-assisted, staff-assisted, media, retention, and data-deletion practices. The route is intended to provide users with transparent privacy information and to support Meta and other third-party platform review requirements.

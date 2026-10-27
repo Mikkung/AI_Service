@@ -16,23 +16,50 @@ import {
 } from "@/core/ai-platform/repositories/conversation-workflow-repository";
 
 import {
-  hasValidAdminUiSession,
-} from "@/lib/http/admin-ui-session";
+  resolveStaffInboxAuthorization,
+  type StaffInboxAuthorization,
+  type StaffInboxAuthorizationOptions,
+} from "@/lib/auth/staff-inbox-authorization";
 
-export function requireInboxSession(
+export type InboxAuthorizationResult =
+  | {
+      authorized: true;
+      auth: StaffInboxAuthorization;
+    }
+  | {
+      authorized: false;
+      response: Response;
+    };
+
+export async function requireInboxSession(
   request: Request,
-): Response | null {
-  return hasValidAdminUiSession(request)
-    ? null
-    : Response.json(
-        {
-          ok: false,
-          error: "Unauthorized",
-        },
-        {
-          status: 401,
-        },
-      );
+  options?: StaffInboxAuthorizationOptions,
+): Promise<InboxAuthorizationResult> {
+  const authorization =
+    await resolveStaffInboxAuthorization(
+      request,
+      options,
+    );
+
+  if (authorization) {
+    return {
+      authorized: true,
+      auth: authorization,
+    };
+  }
+
+  return {
+    authorized: false,
+    response: Response.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+      },
+      {
+        status: 401,
+      },
+    ),
+  };
 }
 
 export function inboxRouteError(

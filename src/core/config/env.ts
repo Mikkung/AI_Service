@@ -26,6 +26,18 @@ const schema = z.object({
   FACEBOOK_PAGE_ID: optionalConfigValue,
   FACEBOOK_GRAPH_API_VERSION: optionalConfigValue,
 
+  AUTH_SECRET: optionalConfigValue,
+  AUTH_MICROSOFT_ENTRA_ID_ID: optionalConfigValue,
+  AUTH_MICROSOFT_ENTRA_ID_SECRET: optionalConfigValue,
+  AUTH_MICROSOFT_ENTRA_ID_ISSUER: optionalConfigValue,
+  STAFF_ALLOWED_EMAILS: optionalConfigValue,
+  ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED: z.preprocess(
+    (value) => value === "" || value === undefined
+      ? "true"
+      : value,
+    z.enum(["true", "false"]),
+  ),
+
   DEFAULT_AI_PROVIDER: z
     .string()
     .default("typhoon"),
@@ -86,6 +98,19 @@ const result = schema.safeParse({
     process.env.FACEBOOK_PAGE_ID,
   FACEBOOK_GRAPH_API_VERSION:
     process.env.FACEBOOK_GRAPH_API_VERSION,
+
+  AUTH_SECRET:
+    process.env.AUTH_SECRET,
+  AUTH_MICROSOFT_ENTRA_ID_ID:
+    process.env.AUTH_MICROSOFT_ENTRA_ID_ID,
+  AUTH_MICROSOFT_ENTRA_ID_SECRET:
+    process.env.AUTH_MICROSOFT_ENTRA_ID_SECRET,
+  AUTH_MICROSOFT_ENTRA_ID_ISSUER:
+    process.env.AUTH_MICROSOFT_ENTRA_ID_ISSUER,
+  STAFF_ALLOWED_EMAILS:
+    process.env.STAFF_ALLOWED_EMAILS,
+  ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED:
+    process.env.ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED,
 
   DEFAULT_AI_PROVIDER:
     process.env.DEFAULT_AI_PROVIDER,

@@ -185,6 +185,22 @@ import {
 } from "@/lib/http/admin-ui-session";
 
 import {
+  getVerifiedEntraIdentifier,
+  isAllowedStaffEmail,
+  normalizeStaffEmail,
+  parseStaffAllowedEmails,
+} from "@/lib/auth/staff-allowlist";
+
+import {
+  isLegacyAdminUiLoginEnabled,
+  isTenantSpecificEntraIssuer,
+} from "@/lib/auth/staff-auth-config";
+
+import {
+  resolveStaffInboxAuthorization,
+} from "@/lib/auth/staff-inbox-authorization";
+
+import {
   ConversationConflictError,
   ConversationInvariantError,
 } from "../repositories/conversation-workflow-repository";
@@ -7514,6 +7530,455 @@ async function testLineReplyClientContract() {
   );
 }
 
+async function testStaffAuthenticationPolicy() {
+  const allowed = parseStaffAllowedEmails(
+    " Person@Chula.ac.th,person@chula.ac.th, second@chula.ac.th, malformed, @chula.ac.th ",
+  );
+
+  assert.deepEqual(
+    [...allowed],
+    [
+      "person@chula.ac.th",
+      "second@chula.ac.th",
+    ],
+  );
+  assert.equal(
+    isAllowedStaffEmail(
+      " PERSON@CHULA.AC.TH ",
+      allowed,
+    ),
+    true,
+  );
+  assert.equal(
+    isAllowedStaffEmail(
+      "person+other@chula.ac.th",
+      allowed,
+    ),
+    false,
+  );
+  assert.equal(
+    isAllowedStaffEmail(
+      "other@chula.ac.th",
+      allowed,
+    ),
+    false,
+  );
+  assert.equal(
+    isAllowedStaffEmail(
+      "person@chula.ac.th",
+      parseStaffAllowedEmails(""),
+    ),
+    false,
+  );
+  assert.equal(
+    getVerifiedEntraIdentifier({}, {}),
+    null,
+  );
+  assert.equal(
+    getVerifiedEntraIdentifier(
+      {},
+      {
+        preferred_username:
+          " Staff@Chula.ac.th ",
+      },
+    ),
+    "staff@chula.ac.th",
+  );
+  assert.equal(
+    normalizeStaffEmail("not-an-email"),
+    null,
+  );
+  assert.equal(
+    isTenantSpecificEntraIssuer(
+      "https://login.microsoftonline.com/11111111-2222-4333-8444-555555555555/v2.0",
+    ),
+    true,
+  );
+  for (const sharedIssuer of [
+    "https://login.microsoftonline.com/common/v2.0",
+    "https://login.microsoftonline.com/organizations/v2.0",
+    "https://login.microsoftonline.com/consumers/v2.0",
+  ]) {
+    assert.equal(
+      isTenantSpecificEntraIssuer(
+        sharedIssuer,
+      ),
+      false,
+    );
+  }
+  assert.equal(
+    isLegacyAdminUiLoginEnabled(undefined),
+    true,
+  );
+  assert.equal(
+    isLegacyAdminUiLoginEnabled("false"),
+    false,
+  );
+
+  const legacyRequest = new Request(
+    "http://localhost/admin/inbox",
+    {
+      headers: {
+        cookie:
+          buildAdminUiSessionCookie(
+            createAdminUiSessionToken(),
+          ),
+      },
+    },
+  );
+  const legacyAuthorization =
+    await resolveStaffInboxAuthorization(
+      legacyRequest,
+      {
+        resolveEntraSession:
+          async () => null,
+        legacyLoginEnabled: true,
+      },
+    );
+  assert.equal(
+    legacyAuthorization?.authMethod,
+    "legacy",
+  );
+  assert.equal(
+    legacyAuthorization?.actorId,
+    "legacy-admin-ui",
+  );
+  assert.equal(
+    await resolveStaffInboxAuthorization(
+      legacyRequest,
+      {
+        resolveEntraSession:
+          async () => null,
+        legacyLoginEnabled: false,
+      },
+    ),
+    null,
+  );
+
+  const previousAllowlist =
+    process.env.STAFF_ALLOWED_EMAILS;
+  process.env.STAFF_ALLOWED_EMAILS =
+    "staff@chula.ac.th";
+  try {
+    const entraAuthorization =
+      await resolveStaffInboxAuthorization(
+        new Request(
+          "http://localhost/admin/inbox",
+        ),
+        {
+          resolveEntraSession:
+            async () => ({
+              user: {
+                name: "Allowed Staff",
+                email:
+                  " Staff@Chula.ac.th ",
+              },
+            }),
+          legacyLoginEnabled: false,
+        },
+      );
+    assert.deepEqual(
+      entraAuthorization,
+      {
+        authMethod: "entra",
+        actorId: "staff@chula.ac.th",
+        user: {
+          name: "Allowed Staff",
+          email: "staff@chula.ac.th",
+        },
+      },
+    );
+    assert.equal(
+      await resolveStaffInboxAuthorization(
+        new Request(
+          "http://localhost/admin/inbox",
+        ),
+        {
+          resolveEntraSession:
+            async () => ({
+              user: {
+                email:
+                  "other@chula.ac.th",
+              },
+            }),
+          legacyLoginEnabled: false,
+        },
+      ),
+      null,
+    );
+    assert.equal(
+      await resolveStaffInboxAuthorization(
+        new Request(
+          "http://localhost/admin/inbox",
+        ),
+        {
+          resolveEntraSession:
+            async () => ({
+              user: {
+                name: "Missing email",
+              },
+            }),
+          legacyLoginEnabled: false,
+        },
+      ),
+      null,
+    );
+  } finally {
+    if (previousAllowlist === undefined) {
+      delete process.env
+        .STAFF_ALLOWED_EMAILS;
+    } else {
+      process.env.STAFF_ALLOWED_EMAILS =
+        previousAllowlist;
+    }
+  }
+}
+
+async function testStaffInboxAuthRoutesAndActorIdentity() {
+  const listRoute = await import(
+    "@/app/api/admin/ui/inbox/conversations/route"
+  );
+  const entraAuthorization = async () => ({
+    authorized: true as const,
+    auth: {
+      authMethod: "entra" as const,
+      actorId: "staff@chula.ac.th",
+      user: {
+        name: "Allowed Staff",
+        email: "staff@chula.ac.th",
+      },
+    },
+  });
+  const listResponse =
+    await listRoute
+      .createInboxConversationListHandler(
+        () => ({
+          listConversations:
+            async () => [],
+        }),
+        entraAuthorization,
+      )(
+        new Request(
+          "http://localhost/api/admin/ui/inbox/conversations",
+        ),
+      );
+  assert.equal(listResponse.status, 200);
+
+  const sendRoute = await import(
+    "@/app/api/admin/ui/inbox/conversations/[id]/send/route"
+  );
+  let staffActorId: string | undefined;
+  let serviceCalls = 0;
+  const service = {
+    sendAssistedReply: async (input: {
+      staffActorId: string;
+    }) => {
+      serviceCalls += 1;
+      staffActorId = input.staffActorId;
+      return {
+        delivered: true,
+        duplicate: false,
+      };
+    },
+    sendAssistedReplyAndResumeAI:
+      async (input: {
+        staffActorId: string;
+      }) => {
+        serviceCalls += 1;
+        staffActorId = input.staffActorId;
+        return {
+          delivered: true,
+          duplicate: false,
+          resumed: true,
+        };
+      },
+  };
+  const context = {
+    params: Promise.resolve({
+      id: "conversation-auth-test",
+    }),
+  };
+  const handler =
+    sendRoute.createInboxSendHandler(
+      () => service as never,
+      entraAuthorization,
+    );
+  const spoofed = await handler(
+    new Request(
+      "http://localhost/api/admin/ui/inbox/conversations/conversation-auth-test/send",
+      {
+        method: "POST",
+        headers: {
+          "content-type":
+            "application/json",
+        },
+        body: JSON.stringify({
+          text: "Reply",
+          clientRequestId:
+            "11111111-1111-4111-8111-111111111111",
+          staffActorId:
+            "attacker@chula.ac.th",
+        }),
+      },
+    ),
+    context,
+  );
+  assert.equal(spoofed.status, 400);
+  assert.equal(serviceCalls, 0);
+
+  const sent = await handler(
+    new Request(
+      "http://localhost/api/admin/ui/inbox/conversations/conversation-auth-test/send",
+      {
+        method: "POST",
+        headers: {
+          "content-type":
+            "application/json",
+        },
+        body: JSON.stringify({
+          text: "Reply",
+          clientRequestId:
+            "22222222-2222-4222-8222-222222222222",
+        }),
+      },
+    ),
+    context,
+  );
+  assert.equal(sent.status, 200);
+  assert.equal(
+    staffActorId,
+    "staff@chula.ac.th",
+  );
+
+  const legacyHandler =
+    sendRoute.createInboxSendHandler(
+      () => service as never,
+      async () => ({
+        authorized: true as const,
+        auth: {
+          authMethod: "legacy" as const,
+          actorId: "legacy-admin-ui",
+          user: null,
+        },
+      }),
+    );
+  const legacySent = await legacyHandler(
+    new Request(
+      "http://localhost/api/admin/ui/inbox/conversations/conversation-auth-test/send",
+      {
+        method: "POST",
+        headers: {
+          "content-type":
+            "application/json",
+        },
+        body: JSON.stringify({
+          text: "Legacy reply",
+          clientRequestId:
+            "33333333-3333-4333-8333-333333333333",
+        }),
+      },
+    ),
+    context,
+  );
+  assert.equal(legacySent.status, 200);
+  assert.equal(
+    staffActorId,
+    "legacy-admin-ui",
+  );
+
+  const unauthenticatedSend =
+    await sendRoute
+      .createInboxSendHandler(
+        () => service as never,
+      )(
+        new Request(
+          "http://localhost/api/admin/ui/inbox/conversations/conversation-auth-test/send",
+          {
+            method: "POST",
+            headers: {
+              "content-type":
+                "application/json",
+            },
+            body: JSON.stringify({
+              text: "No session",
+              clientRequestId:
+                "44444444-4444-4444-8444-444444444444",
+            }),
+          },
+        ),
+        context,
+      );
+  assert.equal(
+    unauthenticatedSend.status,
+    401,
+  );
+
+  const routeFiles = [
+    "src/app/api/admin/ui/inbox/conversations/route.ts",
+    "src/app/api/admin/ui/inbox/conversations/[id]/route.ts",
+    "src/app/api/admin/ui/inbox/conversations/[id]/read/route.ts",
+    "src/app/api/admin/ui/inbox/conversations/[id]/draft/route.ts",
+    "src/app/api/admin/ui/inbox/conversations/[id]/send/route.ts",
+    "src/app/api/admin/ui/inbox/conversations/[id]/resume-ai/route.ts",
+    "src/app/api/admin/ui/inbox/conversations/[id]/messages/[messageId]/media-preview/route.ts",
+    "src/app/api/admin/ui/inbox/channel-response-configs/[channel]/[channelAccountId]/route.ts",
+  ];
+  for (const routeFile of routeFiles) {
+    const source = await readFile(
+      path.join(process.cwd(), routeFile),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /await (?:authorize|requireInboxSession)\(request\)/,
+      `${routeFile} must await Staff Inbox authorization`,
+    );
+  }
+}
+
+async function testLegacyStaffLoginCanBeDisabled() {
+  const previousValue =
+    process.env
+      .ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED;
+  process.env
+    .ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED =
+    "false";
+  try {
+    const sessionRoute = await import(
+      "@/app/api/admin/ui/session/route"
+    );
+    const response = await sessionRoute.POST(
+      new Request(
+        "http://localhost/api/admin/ui/session",
+        {
+          method: "POST",
+          headers: {
+            "content-type":
+              "application/json",
+          },
+          body: JSON.stringify({
+            apiKey: "inert-test-key",
+          }),
+        },
+      ),
+    );
+    assert.equal(response.status, 403);
+    assert.equal(
+      response.headers.get("set-cookie"),
+      null,
+    );
+  } finally {
+    if (previousValue === undefined) {
+      delete process.env
+        .ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED;
+    } else {
+      process.env
+        .ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED =
+        previousValue;
+    }
+  }
+}
+
 async function testStaffInboxMvp() {
   const db = new FakeFirestore();
   const conversationRepository =
@@ -7749,6 +8214,7 @@ async function testStaffInboxMvp() {
   await assert.rejects(
     () =>
       service.sendAssistedReply({
+        staffActorId: "staff@chula.ac.th",
         conversationId:
           "inbox-line-conversation",
         text: "Edited staff reply",
@@ -7782,6 +8248,7 @@ async function testStaffInboxMvp() {
 
   const delivered =
     await service.sendAssistedReply({
+      staffActorId: "staff@chula.ac.th",
       conversationId:
         "inbox-line-conversation",
       text: "Edited staff reply",
@@ -7820,6 +8287,7 @@ async function testStaffInboxMvp() {
 
   const duplicate =
     await service.sendAssistedReply({
+      staffActorId: "staff@chula.ac.th",
       conversationId:
         "inbox-line-conversation",
       text: "Edited staff reply",
@@ -7841,10 +8309,23 @@ async function testStaffInboxMvp() {
     ).length,
     1,
   );
+  assert.equal(
+    (
+      await conversationRepository
+        .listMessages(
+          "inbox-line-conversation",
+        )
+    ).find(
+      (message) =>
+        message.senderType === "human",
+    )?.senderId,
+    "staff@chula.ac.th",
+  );
 
   await assert.rejects(
     () =>
       service.sendAssistedReply({
+        staffActorId: "staff@chula.ac.th",
         conversationId:
           "inbox-line-conversation",
         text: "Different text",
@@ -7894,6 +8375,7 @@ async function testStaffInboxMvp() {
     () =>
       retryWindowService
         .sendAssistedReply({
+          staffActorId: "legacy-admin-ui",
           conversationId:
             "expired-send-conversation",
           text: "Ambiguous delivery",
@@ -7908,6 +8390,7 @@ async function testStaffInboxMvp() {
     () =>
       retryWindowService
         .sendAssistedReply({
+          staffActorId: "legacy-admin-ui",
           conversationId:
             "expired-send-conversation",
           text: "Ambiguous delivery",
@@ -7964,6 +8447,7 @@ async function testStaffInboxMvp() {
   const acceptedRetryResult =
     await acceptedRetryService
       .sendAssistedReply({
+        staffActorId: "legacy-admin-ui",
         conversationId:
           "inbox-line-conversation",
         text:
@@ -8253,6 +8737,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
 
   const requestId = "44444444-4444-4444-8444-444444444444";
   const delivered = await service.sendAssistedReply({
+    staffActorId: "legacy-admin-ui",
     conversationId: "unified-facebook",
     text: "Edited Facebook reply",
     sourceMessageId: "facebook-inbound-1",
@@ -8266,6 +8751,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
     text: "Edited Facebook reply",
   });
   const duplicate = await service.sendAssistedReply({
+    staffActorId: "legacy-admin-ui",
     conversationId: "unified-facebook",
     text: "Edited Facebook reply",
     sourceMessageId: "facebook-inbound-1",
@@ -8276,6 +8762,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
   assert.equal((await conversationRepository.listMessages("unified-facebook")).filter((message) => message.senderType === "human").length, 1);
   await assert.rejects(
     () => service.sendAssistedReply({
+      staffActorId: "legacy-admin-ui",
       conversationId: "unified-facebook",
       text: "Conflicting text",
       clientRequestId: requestId,
@@ -8308,6 +8795,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
   });
   now = "2027-01-01T23:59:59.999Z";
   await service.sendAssistedReply({
+    staffActorId: "legacy-admin-ui",
     conversationId: "facebook-window",
     text: "Inside window",
     clientRequestId: "55555555-5555-4555-8555-555555555555",
@@ -8340,6 +8828,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
   now = "2027-01-02T00:00:00.000Z";
   await assert.rejects(
     () => service.sendAssistedReply({
+      staffActorId: "legacy-admin-ui",
       conversationId: "facebook-boundary",
       text: "At boundary",
       clientRequestId: "66666666-6666-4666-8666-666666666666",
@@ -8352,6 +8841,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
   facebookClient.error = new FacebookDeliveryUncertainError();
   await assert.rejects(
     () => service.sendAssistedReply({
+      staffActorId: "legacy-admin-ui",
       conversationId: "unified-facebook",
       text: "Uncertain send",
       clientRequestId: "77777777-7777-4777-8777-777777777777",
@@ -8362,6 +8852,7 @@ async function testUnifiedFacebookStaffInboxAndDeliverySafety() {
   facebookClient.error = undefined;
   await assert.rejects(
     () => service.sendAssistedReply({
+      staffActorId: "legacy-admin-ui",
       conversationId: "unified-facebook",
       text: "Uncertain send",
       clientRequestId: "77777777-7777-4777-8777-777777777777",
@@ -8737,6 +9228,7 @@ async function testStaffInboxResumeAI() {
         "knowledge_not_found",
     });
   await inboxService.sendAssistedReply({
+    staffActorId: "legacy-admin-ui",
     conversationId:
       sendOnlyConversation.id,
     text: "Staff answer only",
@@ -8779,6 +9271,7 @@ async function testStaffInboxResumeAI() {
   const sendAndResume =
     await inboxService
       .sendAssistedReplyAndResumeAI({
+        staffActorId: "legacy-admin-ui",
         conversationId:
           sendResumeConversation.id,
         text:
@@ -8801,6 +9294,7 @@ async function testStaffInboxResumeAI() {
   const sendAndResumeRetry =
     await inboxService
       .sendAssistedReplyAndResumeAI({
+        staffActorId: "legacy-admin-ui",
         conversationId:
           sendResumeConversation.id,
         text:
@@ -8847,6 +9341,7 @@ async function testStaffInboxResumeAI() {
     () =>
       inboxService
         .sendAssistedReplyAndResumeAI({
+          staffActorId: "legacy-admin-ui",
           conversationId:
             failedSendConversation.id,
           text: "Delivery fails",
@@ -8896,6 +9391,7 @@ async function testStaffInboxResumeAI() {
     reason: "staff_requested",
   });
   const facebookSendAndResume = await inboxService.sendAssistedReplyAndResumeAI({
+    staffActorId: "legacy-admin-ui",
     conversationId: facebookResumeConversation.id,
     text: "Confirmed Messenger reply",
     clientRequestId: "88888888-8888-4888-8888-888888888888",
@@ -15083,6 +15579,9 @@ async function main() {
   await testLineResponseModesAndRedelivery();
   await testLineConversationResolution();
   await testLineReplyClientContract();
+  await testStaffAuthenticationPolicy();
+  await testStaffInboxAuthRoutesAndActorIdentity();
+  await testLegacyStaffLoginCanBeDisabled();
   testStaffInboxComposerSynchronization();
   await testUnifiedStaffInboxUiSource();
   await testStaffInboxMvp();

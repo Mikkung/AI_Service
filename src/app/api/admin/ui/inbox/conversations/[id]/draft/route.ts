@@ -42,10 +42,10 @@ export function createInboxDraftHandler(
     request: Request,
     context: Context,
   ): Promise<Response> {
-    const unauthorized =
-      requireInboxSession(request);
-    if (unauthorized) {
-      return unauthorized;
+    const authorization =
+      await requireInboxSession(request);
+    if (!authorization.authorized) {
+      return authorization.response;
     }
 
     const body = bodySchema.safeParse(

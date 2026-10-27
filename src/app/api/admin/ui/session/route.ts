@@ -6,8 +6,15 @@ import {
   buildAdminUiSessionCookie,
   buildExpiredAdminUiSessionCookie,
   createAdminUiSessionToken,
-  hasValidAdminUiSession,
 } from "@/lib/http/admin-ui-session";
+
+import {
+  isLegacyAdminUiLoginEnabled,
+} from "@/lib/auth/staff-auth-config";
+
+import {
+  resolveStaffInboxAuthorization,
+} from "@/lib/auth/staff-inbox-authorization";
 
 import {
   hasValidApiKey,
@@ -28,18 +35,43 @@ const requestSchema = z.object({
 export async function GET(
   request: Request,
 ) {
+  const legacyLoginEnabled =
+    isLegacyAdminUiLoginEnabled();
+  const authorization =
+    await resolveStaffInboxAuthorization(
+      request,
+      {
+        legacyLoginEnabled,
+      },
+    );
+
   return Response.json({
     ok: true,
     authenticated:
-      hasValidAdminUiSession(
-        request,
-      ),
+      authorization !== null,
+    authMethod:
+      authorization?.authMethod ?? null,
+    user: authorization?.user ?? null,
+    legacyLoginEnabled,
   });
 }
 
 export async function POST(
   request: Request,
 ) {
+  if (
+    !isLegacyAdminUiLoginEnabled()
+  ) {
+    return Response.json(
+      {
+        ok: false,
+        error:
+          "Legacy admin-key login is disabled.",
+      },
+      { status: 403 },
+    );
+  }
+
   let json: unknown;
 
   try {
@@ -102,6 +134,9 @@ export async function POST(
     Response.json({
       ok: true,
       authenticated: true,
+      authMethod: "legacy",
+      user: null,
+      legacyLoginEnabled: true,
     });
 
   response.headers.append(
@@ -119,6 +154,10 @@ export async function DELETE() {
     Response.json({
       ok: true,
       authenticated: false,
+      authMethod: null,
+      user: null,
+      legacyLoginEnabled:
+        isLegacyAdminUiLoginEnabled(),
     });
 
   response.headers.append(

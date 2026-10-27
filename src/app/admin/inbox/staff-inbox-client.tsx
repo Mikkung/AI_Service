@@ -9,6 +9,11 @@ import {
 } from "react";
 
 import {
+  signIn as authSignIn,
+  signOut as authSignOut,
+} from "next-auth/react";
+
+import {
   editStaffInboxComposer,
   emptyStaffInboxComposer,
   markStaffInboxComposerSaved,
@@ -96,6 +101,16 @@ type ApiError = {
   error?: string;
 };
 
+type StaffSession = {
+  authenticated: boolean;
+  authMethod: "entra" | "legacy" | null;
+  user: {
+    name: string | null;
+    email: string;
+  } | null;
+  legacyLoginEnabled: boolean;
+};
+
 type ImageLightbox = {
   messageId: string;
   previewUrl: string;
@@ -158,6 +173,12 @@ export function StaffInboxClient() {
   const [checkingSession, setCheckingSession] =
     useState(true);
   const [authenticated, setAuthenticated] =
+    useState(false);
+  const [authMethod, setAuthMethod] =
+    useState<StaffSession["authMethod"]>(null);
+  const [sessionUser, setSessionUser] =
+    useState<StaffSession["user"]>(null);
+  const [legacyLoginEnabled, setLegacyLoginEnabled] =
     useState(false);
   const [apiKey, setApiKey] = useState("");
   const [conversations, setConversations] =
@@ -248,14 +269,22 @@ export function StaffInboxClient() {
           "/api/admin/ui/session",
           { cache: "no-store" },
         );
-        const body = await readJson<{
-          authenticated: boolean;
-        }>(response);
+        const body =
+          await readJson<StaffSession>(
+            response,
+          );
         setAuthenticated(
           body.authenticated,
         );
+        setAuthMethod(body.authMethod);
+        setSessionUser(body.user);
+        setLegacyLoginEnabled(
+          body.legacyLoginEnabled,
+        );
       } catch {
         setAuthenticated(false);
+        setAuthMethod(null);
+        setSessionUser(null);
       } finally {
         setCheckingSession(false);
       }
@@ -456,11 +485,55 @@ export function StaffInboxClient() {
       );
       setApiKey("");
       setAuthenticated(true);
+      setAuthMethod("legacy");
+      setSessionUser(null);
     } catch (failure) {
       setError(
         failure instanceof Error
           ? failure.message
           : "Sign in failed.",
+      );
+    }
+  }
+
+  async function signInWithMicrosoft() {
+    setError("");
+    await authSignIn(
+      "microsoft-entra-id",
+      {
+        redirectTo: "/admin/inbox",
+      },
+    );
+  }
+
+  async function logout() {
+    setError("");
+
+    if (authMethod === "entra") {
+      await authSignOut({
+        redirectTo: "/admin/inbox",
+      });
+      return;
+    }
+
+    try {
+      await readJson(
+        await fetch(
+          "/api/admin/ui/session",
+          { method: "DELETE" },
+        ),
+      );
+      setAuthenticated(false);
+      setAuthMethod(null);
+      setSessionUser(null);
+      setConversations([]);
+      setDetail(undefined);
+      setSelectedId(undefined);
+    } catch (failure) {
+      setError(
+        failure instanceof Error
+          ? failure.message
+          : "Could not sign out.",
       );
     }
   }
@@ -683,39 +756,53 @@ export function StaffInboxClient() {
   if (!authenticated) {
     return (
       <main className={styles.centered}>
-        <form
-          className={styles.loginPanel}
-          onSubmit={login}
-        >
+        <div className={styles.loginPanel}>
           <div className={styles.brandMark}>
             ISE
           </div>
           <h1>Staff Inbox</h1>
           <p>
-            Sign in with the existing admin
-            access key.
+            Access is restricted to authorized
+            ISE staff accounts.
           </p>
-          <label htmlFor="admin-key">
-            Admin access key
-          </label>
-          <input
-            id="admin-key"
-            type="password"
-            value={apiKey}
-            onChange={(event) =>
-              setApiKey(event.target.value)
+          <button
+            type="button"
+            className={styles.microsoftButton}
+            onClick={() =>
+              void signInWithMicrosoft()
             }
-            autoComplete="current-password"
-          />
-          <button type="submit">
-            Sign in
+          >
+            Sign in with Microsoft
           </button>
+          {legacyLoginEnabled && (
+            <form
+              className={styles.legacyLogin}
+              onSubmit={login}
+            >
+              <h2>Temporary legacy access</h2>
+              <label htmlFor="admin-key">
+                Admin access key
+              </label>
+              <input
+                id="admin-key"
+                type="password"
+                value={apiKey}
+                onChange={(event) =>
+                  setApiKey(event.target.value)
+                }
+                autoComplete="current-password"
+              />
+              <button type="submit">
+                Use legacy access
+              </button>
+            </form>
+          )}
           {error && (
             <p className={styles.error}>
               {error}
             </p>
           )}
-        </form>
+        </div>
       </main>
     );
   }
@@ -733,6 +820,27 @@ export function StaffInboxClient() {
           <a href="/admin/test-ai">
             Test AI
           </a>
+          <div className={styles.staffIdentity}>
+            <span>
+              {authMethod === "entra"
+                ? sessionUser?.name ??
+                  "ISE staff"
+                : "Legacy admin session"}
+            </span>
+            {authMethod === "entra" &&
+              sessionUser?.email && (
+                <small>
+                  {sessionUser.email}
+                </small>
+              )}
+          </div>
+          <button
+            type="button"
+            className={styles.signOutButton}
+            onClick={() => void logout()}
+          >
+            Sign out
+          </button>
           {detail && (
             <div className={styles.modeControl}>
               <label htmlFor="response-mode">

@@ -40,15 +40,16 @@ export function createInboxSendHandler(
   serviceFactory: ServiceFactory = () =>
     createProductionStaffInboxEnvironment()
       .service,
+  authorize = requireInboxSession,
 ) {
   return async function POST(
     request: Request,
     context: Context,
   ): Promise<Response> {
-    const unauthorized =
-      requireInboxSession(request);
-    if (unauthorized) {
-      return unauthorized;
+    const authorization =
+      await authorize(request);
+    if (!authorization.authorized) {
+      return authorization.response;
     }
 
     const body = bodySchema.safeParse(
@@ -77,11 +78,15 @@ export function createInboxSendHandler(
         ? await service
             .sendAssistedReplyAndResumeAI({
               conversationId: id,
+              staffActorId:
+                authorization.auth.actorId,
               ...sendInput,
             })
         : await service
             .sendAssistedReply({
               conversationId: id,
+              staffActorId:
+                authorization.auth.actorId,
               ...sendInput,
             });
       return Response.json({

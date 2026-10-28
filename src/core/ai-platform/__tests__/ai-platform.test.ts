@@ -214,6 +214,12 @@ import {
 } from "@/lib/firebase/client-singleton";
 
 import {
+  completeFirebaseEmailLink,
+  FirebaseStaffSessionExchangeError,
+  retryFirebaseStaffSession,
+} from "@/lib/firebase/staff-auth-completion";
+
+import {
   ConversationConflictError,
   ConversationInvariantError,
 } from "../repositories/conversation-workflow-repository";
@@ -7890,6 +7896,118 @@ async function testFirebaseStaffSessionExchange() {
           },
         )(request());
     assert.equal(invalidResponse.status, 401);
+
+    const diagnosticLogs: Array<{
+      message: string;
+      metadata: Record<string, string>;
+    }> = [];
+    const diagnosticResponse =
+      await route
+        .createFirebaseStaffSessionHandler({
+          verifyIdToken: async () => {
+            const verificationError =
+              new Error(
+                "sensitive upstream detail with inert-firebase-id-token",
+              ) as Error & {
+                code: string;
+              };
+            verificationError.name =
+              "FirebaseAuthError";
+            verificationError.code =
+              "auth/argument-error";
+            throw verificationError;
+          },
+          getProjectConsistency:
+            async () => ({
+              configuredProjectId:
+                "safe-test-project",
+              appProjectId:
+                "safe-test-project",
+              credentialProjectId:
+                "safe-test-project",
+              consistent: true,
+            }),
+          logError: (
+            message,
+            metadata,
+          ) => {
+            diagnosticLogs.push({
+              message,
+              metadata,
+            });
+          },
+        })(request());
+    assert.equal(
+      diagnosticResponse.status,
+      401,
+    );
+    assert.deepEqual(diagnosticLogs, [
+      {
+        message:
+          "Firebase staff token verification failed",
+        metadata: {
+          projectId:
+            "safe-test-project",
+          code: "auth/argument-error",
+          name: "FirebaseAuthError",
+        },
+      },
+    ]);
+    assert.doesNotMatch(
+      JSON.stringify(diagnosticLogs),
+      /inert-firebase-id-token|sensitive upstream detail/,
+    );
+
+    let mismatchVerifierCalls = 0;
+    const mismatchLogs: Array<{
+      message: string;
+      metadata: Record<string, string>;
+    }> = [];
+    const mismatchResponse =
+      await route
+        .createFirebaseStaffSessionHandler({
+          verifyIdToken: async () => {
+            mismatchVerifierCalls += 1;
+            return {};
+          },
+          getProjectConsistency:
+            async () => ({
+              configuredProjectId:
+                "configured-project",
+              appProjectId:
+                "different-app-project",
+              credentialProjectId:
+                "configured-project",
+              consistent: false,
+            }),
+          logError: (
+            message,
+            metadata,
+          ) => {
+            mismatchLogs.push({
+              message,
+              metadata,
+            });
+          },
+        })(request());
+    assert.equal(mismatchResponse.status, 401);
+    assert.equal(mismatchVerifierCalls, 0);
+    assert.deepEqual(mismatchLogs, [
+      {
+        message:
+          "Firebase Admin project configuration mismatch",
+        metadata: {
+          code:
+            "auth/project-id-mismatch",
+          projectId:
+            "configured-project",
+          appProjectId:
+            "different-app-project",
+          credentialProjectId:
+            "configured-project",
+        },
+      },
+    ]);
   } finally {
     if (previousAllowlist === undefined) {
       delete process.env
@@ -7906,6 +8024,128 @@ async function testFirebaseStaffSessionExchange() {
         previousSecret;
     }
   }
+}
+
+async function testFirebaseEmailLinkCompletionRetry() {
+  const auth = {
+    id: "firebase-auth",
+  };
+  const user = {
+    getIdToken: async () =>
+      "inert-id-token",
+  };
+  let signInCalls = 0;
+  const exchangeForceRefresh: boolean[] = [];
+
+  const firstResult =
+    await completeFirebaseEmailLink({
+      auth,
+      email: " staff@chula.ac.th ",
+      href:
+        "https://example.test/admin/inbox/auth/complete?mode=signIn",
+      isEmailLink: () => true,
+      signIn: async (
+        receivedAuth,
+        email,
+      ) => {
+        signInCalls += 1;
+        assert.equal(receivedAuth, auth);
+        assert.equal(
+          email,
+          "staff@chula.ac.th",
+        );
+        return { user };
+      },
+      exchangeSession: async (
+        receivedUser,
+        forceRefresh,
+      ) => {
+        assert.equal(receivedUser, user);
+        exchangeForceRefresh.push(
+          forceRefresh,
+        );
+        throw new FirebaseStaffSessionExchangeError(
+          "exchange_failed",
+        );
+      },
+    });
+  assert.deepEqual(firstResult, {
+    status: "session_exchange_failed",
+  });
+  assert.equal(signInCalls, 1);
+
+  const retryResult =
+    await retryFirebaseStaffSession({
+      currentUser: user,
+      exchangeSession: async (
+        receivedUser,
+        forceRefresh,
+      ) => {
+        assert.equal(receivedUser, user);
+        exchangeForceRefresh.push(
+          forceRefresh,
+        );
+      },
+    });
+  assert.deepEqual(retryResult, {
+    status: "success",
+  });
+  assert.equal(signInCalls, 1);
+  assert.deepEqual(
+    exchangeForceRefresh,
+    [false, true],
+  );
+
+  assert.deepEqual(
+    await retryFirebaseStaffSession({
+      currentUser: null,
+      exchangeSession: async () => {
+        assert.fail(
+          "Missing users must not trigger session exchange",
+        );
+      },
+    }),
+    { status: "missing_user" },
+  );
+
+  assert.deepEqual(
+    await completeFirebaseEmailLink({
+      auth,
+      email: "staff@chula.ac.th",
+      href:
+        "https://example.test/consumed-link",
+      isEmailLink: () => true,
+      signIn: async () => {
+        throw Object.assign(
+          new Error(
+            "The action code has already been used.",
+          ),
+          {
+            code:
+              "auth/invalid-action-code",
+          },
+        );
+      },
+      exchangeSession: async () => {
+        assert.fail(
+          "Invalid links must not trigger session exchange",
+        );
+      },
+    }),
+    { status: "invalid_link" },
+  );
+
+  assert.deepEqual(
+    await retryFirebaseStaffSession({
+      currentUser: user,
+      exchangeSession: async () => {
+        throw new FirebaseStaffSessionExchangeError(
+          "unauthorized",
+        );
+      },
+    }),
+    { status: "unauthorized" },
+  );
 }
 
 async function testStaffEmailLinkRequestFlow() {
@@ -16055,6 +16295,7 @@ async function main() {
   await testLineReplyClientContract();
   await testStaffAuthenticationPolicy();
   await testFirebaseStaffSessionExchange();
+  await testFirebaseEmailLinkCompletionRetry();
   await testStaffEmailLinkRequestFlow();
   await testFirebaseClientSingletonAndImportPolicy();
   await testStaffInboxAuthRoutesAndActorIdentity();

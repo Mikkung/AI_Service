@@ -16,6 +16,12 @@ import {
   FIREBASE_EMAIL_STORAGE_KEY,
   getFirebaseClientAuth,
 } from "@/lib/firebase/client-auth";
+import {
+  completeFirebaseEmailLink,
+  exchangeFirebaseStaffSession,
+  retryFirebaseStaffSession,
+  type FirebaseCompletionResult,
+} from "@/lib/firebase/staff-auth-completion";
 
 import styles from "../../staff-inbox.module.css";
 
@@ -26,77 +32,123 @@ export default function StaffAuthCompletePage() {
   const [working, setWorking] =
     useState(true);
   const [error, setError] = useState("");
+  const [sessionRetryAvailable, setSessionRetryAvailable] =
+    useState(false);
   const autoCompletionStarted =
     useRef(false);
+
+  async function finishSuccessfulSession() {
+    const auth = getFirebaseClientAuth();
+    window.localStorage.removeItem(
+      FIREBASE_EMAIL_STORAGE_KEY,
+    );
+    await signOut(auth);
+    window.location.replace(
+      "/admin/inbox",
+    );
+  }
+
+  async function applyCompletionResult(
+    result: FirebaseCompletionResult,
+  ) {
+    if (result.status === "success") {
+      await finishSuccessfulSession();
+      return;
+    }
+
+    setSessionRetryAvailable(
+      result.status ===
+        "session_exchange_failed",
+    );
+
+    if (result.status === "invalid_link") {
+      setError(
+        "That sign-in link is invalid or has expired. Please request a new one.",
+      );
+    } else if (
+      result.status === "unauthorized"
+    ) {
+      setError(
+        "This account could not be authorized for the Staff Inbox.",
+      );
+    } else if (
+      result.status === "missing_user"
+    ) {
+      setError(
+        "Please request a new sign-in link.",
+      );
+    } else {
+      setError(
+        "Your email was verified, but the Staff Inbox session could not be created.",
+      );
+    }
+    setWorking(false);
+  }
 
   async function completeSignIn(
     confirmedEmail: string,
   ) {
     setWorking(true);
     setError("");
+    setNeedsEmail(false);
+    setSessionRetryAvailable(false);
 
     try {
-      const auth =
-        getFirebaseClientAuth();
-      if (
-        !isSignInWithEmailLink(
+      const auth = getFirebaseClientAuth();
+      const result =
+        await completeFirebaseEmailLink({
           auth,
-          window.location.href,
-        )
-      ) {
-        throw new Error(
-          "This sign-in link is invalid or incomplete.",
-        );
-      }
-
-      const credential =
-        await signInWithEmailLink(
-          auth,
-          confirmedEmail.trim(),
-          window.location.href,
-        );
-      const idToken =
-        await credential.user.getIdToken();
-      const response = await fetch(
-        "/api/admin/ui/auth/firebase-session",
-        {
-          method: "POST",
-          headers: {
-            "content-type":
-              "application/json",
-          },
-          body: JSON.stringify({
-            idToken,
-          }),
-        },
-      );
-      if (!response.ok) {
-        throw new Error(
-          "Sign-in could not be completed for this account.",
-        );
-      }
-
-      window.localStorage.removeItem(
-        FIREBASE_EMAIL_STORAGE_KEY,
-      );
-      await signOut(auth);
-      window.location.replace(
-        "/admin/inbox",
-      );
+          email: confirmedEmail,
+          href: window.location.href,
+          isEmailLink:
+            isSignInWithEmailLink,
+          signIn:
+            signInWithEmailLink,
+          exchangeSession: (
+            user,
+            forceRefresh,
+          ) =>
+            exchangeFirebaseStaffSession(
+              user,
+              { forceRefresh },
+            ),
+        });
+      await applyCompletionResult(result);
     } catch (failure) {
-      try {
-        await signOut(
-          getFirebaseClientAuth(),
-        );
-      } catch {
-        // No client session may have been created.
-      }
       setError(
         failure instanceof Error
           ? failure.message
           : "Sign-in could not be completed.",
       );
-      setNeedsEmail(true);
+      setWorking(false);
+    }
+  }
+
+  async function retrySessionCreation() {
+    setWorking(true);
+    setError("");
+    setSessionRetryAvailable(false);
+
+    try {
+      const auth = getFirebaseClientAuth();
+      const result =
+        await retryFirebaseStaffSession({
+          currentUser: auth.currentUser,
+          exchangeSession: (
+            user,
+            forceRefresh,
+          ) =>
+            exchangeFirebaseStaffSession(
+              user,
+              { forceRefresh },
+            ),
+        });
+      await applyCompletionResult(result);
+    } catch {
+      setError(
+        "Your email was verified, but the Staff Inbox session could not be created.",
+      );
+      setSessionRetryAvailable(true);
       setWorking(false);
     }
   }
@@ -166,6 +218,17 @@ export default function StaffAuthCompletePage() {
             {error}
           </p>
         )}
+        {!working &&
+          sessionRetryAvailable && (
+            <button
+              type="button"
+              onClick={() =>
+                void retrySessionCreation()
+              }
+            >
+              Retry session creation
+            </button>
+          )}
         {!working && (
           <a href="/admin/inbox">
             Return to Staff Inbox

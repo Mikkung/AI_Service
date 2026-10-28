@@ -32,6 +32,62 @@ type VerifyIdToken = (
   idToken: string,
 ) => Promise<VerifiedFirebaseToken>;
 
+interface ProjectConsistency {
+  configuredProjectId: string;
+  appProjectId?: string;
+  credentialProjectId?: string;
+  consistent: boolean;
+}
+
+interface FirebaseStaffSessionHandlerOptions {
+  verifyIdToken?: VerifyIdToken;
+  getProjectConsistency?: () => Promise<
+    ProjectConsistency
+  >;
+  logError?: (
+    message: string,
+    metadata: Record<string, string>,
+  ) => void;
+}
+
+function safeDiagnosticValue(
+  value: unknown,
+): string | undefined {
+  return typeof value === "string" &&
+    /^[a-z0-9._:/-]{1,160}$/i.test(value)
+    ? value
+    : undefined;
+}
+
+export function getSafeFirebaseAdminErrorMetadata(
+  error: unknown,
+  projectId: string,
+): Record<string, string> {
+  const candidate =
+    error !== null &&
+    typeof error === "object"
+      ? error as Record<string, unknown>
+      : {};
+  const metadata: Record<string, string> = {
+    projectId,
+  };
+  const code = safeDiagnosticValue(
+    candidate.code,
+  );
+  const name = safeDiagnosticValue(
+    candidate.name,
+  );
+
+  if (code) {
+    metadata.code = code;
+  }
+  if (name) {
+    metadata.name = name;
+  }
+
+  return metadata;
+}
+
 async function verifyFirebaseIdToken(
   idToken: string,
 ): Promise<VerifiedFirebaseToken> {
@@ -43,10 +99,47 @@ async function verifyFirebaseIdToken(
   );
 }
 
+async function getDefaultProjectConsistency():
+  Promise<ProjectConsistency> {
+  const {
+    getFirebaseAdminProjectConsistency,
+  } = await import(
+    "@/infrastructure/db/firebase-admin"
+  );
+  return getFirebaseAdminProjectConsistency();
+}
+
 export function createFirebaseStaffSessionHandler(
-  verifyIdToken: VerifyIdToken =
-    verifyFirebaseIdToken,
+  input:
+    | VerifyIdToken
+    | FirebaseStaffSessionHandlerOptions = {},
 ) {
+  const options:
+    FirebaseStaffSessionHandlerOptions =
+    typeof input === "function"
+      ? {
+          verifyIdToken: input,
+          getProjectConsistency:
+            async () => ({
+              configuredProjectId:
+                process.env
+                  .FIREBASE_PROJECT_ID ??
+                "unconfigured",
+              consistent: true,
+            }),
+        }
+      : input;
+  const verifyIdToken =
+    options.verifyIdToken ??
+    verifyFirebaseIdToken;
+  const getProjectConsistency =
+    options.getProjectConsistency ??
+    getDefaultProjectConsistency;
+  const logError =
+    options.logError ??
+    ((message, metadata) =>
+      console.error(message, metadata));
+
   return async function POST(
     request: Request,
   ): Promise<Response> {
@@ -66,12 +159,55 @@ export function createFirebaseStaffSessionHandler(
       );
     }
 
+    const consistency =
+      await getProjectConsistency();
+    if (!consistency.consistent) {
+      const metadata: Record<
+        string,
+        string
+      > = {
+        code:
+          "auth/project-id-mismatch",
+        projectId:
+          consistency.configuredProjectId,
+      };
+      if (consistency.appProjectId) {
+        metadata.appProjectId =
+          consistency.appProjectId;
+      }
+      if (
+        consistency.credentialProjectId
+      ) {
+        metadata.credentialProjectId =
+          consistency.credentialProjectId;
+      }
+      logError(
+        "Firebase Admin project configuration mismatch",
+        metadata,
+      );
+      return Response.json(
+        {
+          ok: false,
+          error:
+            "Firebase authentication failed.",
+        },
+        { status: 401 },
+      );
+    }
+
     let decoded: VerifiedFirebaseToken;
     try {
       decoded = await verifyIdToken(
         body.data.idToken,
       );
-    } catch {
+    } catch (error) {
+      logError(
+        "Firebase staff token verification failed",
+        getSafeFirebaseAdminErrorMetadata(
+          error,
+          consistency.configuredProjectId,
+        ),
+      );
       return Response.json(
         {
           ok: false,

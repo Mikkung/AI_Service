@@ -10,6 +10,9 @@ import { getFirestore } from "firebase-admin/firestore";
 
 import { env } from "@/core/config/env";
 
+let credentialProjectId:
+  string | undefined;
+
 function getCredential() {
   // Production / Vercel
   if (env.FIREBASE_SERVICE_ACCOUNT_B64) {
@@ -21,6 +24,12 @@ function getCredential() {
     const serviceAccount = JSON.parse(
       decoded,
     ) as ServiceAccount;
+
+    credentialProjectId =
+      typeof serviceAccount.projectId ===
+      "string"
+        ? serviceAccount.projectId
+        : undefined;
 
     return cert(serviceAccount);
   }
@@ -39,3 +48,32 @@ export const firebaseApp =
 
 export const firestore =
   getFirestore(firebaseApp);
+
+export interface FirebaseAdminProjectConsistency {
+  configuredProjectId: string;
+  appProjectId?: string;
+  credentialProjectId?: string;
+  consistent: boolean;
+}
+
+export function getFirebaseAdminProjectConsistency():
+  FirebaseAdminProjectConsistency {
+  const configuredProjectId =
+    env.FIREBASE_PROJECT_ID;
+  const appProjectId =
+    firebaseApp.options.projectId;
+  const consistent =
+    (!appProjectId ||
+      appProjectId ===
+        configuredProjectId) &&
+    (!credentialProjectId ||
+      credentialProjectId ===
+        configuredProjectId);
+
+  return {
+    configuredProjectId,
+    appProjectId,
+    credentialProjectId,
+    consistent,
+  };
+}

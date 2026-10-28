@@ -25,6 +25,17 @@ const firebaseConfig = {
 export const FIREBASE_EMAIL_STORAGE_KEY =
   "ise_staff_email_for_sign_in";
 
+export class FirebaseClientConfigurationError
+  extends Error {
+  constructor() {
+    super(
+      "Firebase staff authentication is not configured.",
+    );
+    this.name =
+      "FirebaseClientConfigurationError";
+  }
+}
+
 export function getFirebaseClientAuth() {
   if (
     !firebaseConfig.apiKey ||
@@ -32,9 +43,7 @@ export function getFirebaseClientAuth() {
     !firebaseConfig.projectId ||
     !firebaseConfig.appId
   ) {
-    throw new Error(
-      "Firebase staff authentication is not configured.",
-    );
+    throw new FirebaseClientConfigurationError();
   }
 
   const app = getApps().length

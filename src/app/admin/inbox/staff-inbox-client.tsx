@@ -14,9 +14,14 @@ import {
 } from "firebase/auth";
 
 import {
+  FirebaseClientConfigurationError,
   FIREBASE_EMAIL_STORAGE_KEY,
   getFirebaseClientAuth,
 } from "@/lib/firebase/client-auth";
+
+import {
+  requestStaffEmailLink,
+} from "@/lib/firebase/staff-email-link-request";
 
 import {
   editStaffInboxComposer,
@@ -514,28 +519,36 @@ export function StaffInboxClient() {
     setRequestingLink(true);
 
     try {
-      const auth =
-        getFirebaseClientAuth();
-      const email = staffEmail.trim();
-      await sendSignInLinkToEmail(
-        auth,
-        email,
-        {
-          url: `${window.location.origin}/admin/inbox/auth/complete`,
-          handleCodeInApp: true,
-        },
+      await new Promise<void>(
+        (resolve) =>
+          window.requestAnimationFrame(
+            () => resolve(),
+          ),
       );
-      window.localStorage.setItem(
-        FIREBASE_EMAIL_STORAGE_KEY,
-        email,
-      );
-    } catch {
-      // Keep the response neutral so the UI does
-      // not reveal allowlist membership.
-    } finally {
+
+      await requestStaffEmailLink({
+        email: staffEmail,
+        origin: window.location.origin,
+        getAuth: getFirebaseClientAuth,
+        sendLink:
+          sendSignInLinkToEmail,
+        persistEmail: (email) =>
+          window.localStorage.setItem(
+            FIREBASE_EMAIL_STORAGE_KEY,
+            email,
+          ),
+      });
       setNotice(
-        "If this email is authorized, a sign-in link will be sent.",
+        "Sign-in link requested. If this email is authorized, check your inbox and spam folder.",
       );
+    } catch (failure) {
+      setError(
+        failure instanceof
+          FirebaseClientConfigurationError
+          ? "Staff sign-in is temporarily unavailable because Firebase authentication is not configured."
+          : "Unable to request a sign-in link. Please try again.",
+      );
+    } finally {
       setRequestingLink(false);
     }
   }

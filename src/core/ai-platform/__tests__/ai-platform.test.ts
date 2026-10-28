@@ -205,6 +205,10 @@ import {
 } from "@/lib/auth/staff-inbox-session";
 
 import {
+  requestStaffEmailLink,
+} from "@/lib/firebase/staff-email-link-request";
+
+import {
   ConversationConflictError,
   ConversationInvariantError,
 } from "../repositories/conversation-workflow-repository";
@@ -7897,6 +7901,97 @@ async function testFirebaseStaffSessionExchange() {
         previousSecret;
     }
   }
+}
+
+async function testStaffEmailLinkRequestFlow() {
+  const auth = {
+    id: "firebase-auth",
+  };
+  let sendCalls = 0;
+  let persistedEmail:
+    string | undefined;
+
+  await requestStaffEmailLink({
+    email: " Staff@Chula.ac.th ",
+    origin: "https://example.test",
+    getAuth: () => auth,
+    sendLink: async (
+      receivedAuth,
+      email,
+      settings,
+    ) => {
+      sendCalls += 1;
+      assert.equal(receivedAuth, auth);
+      assert.equal(
+        email,
+        "Staff@Chula.ac.th",
+      );
+      assert.deepEqual(settings, {
+        url:
+          "https://example.test/admin/inbox/auth/complete",
+        handleCodeInApp: true,
+      });
+    },
+    persistEmail: (email) => {
+      persistedEmail = email;
+    },
+  });
+
+  assert.equal(sendCalls, 1);
+  assert.equal(
+    persistedEmail,
+    "Staff@Chula.ac.th",
+  );
+
+  let sendReachedAfterConfigFailure =
+    false;
+  await assert.rejects(
+    () =>
+      requestStaffEmailLink({
+        email: "staff@chula.ac.th",
+        origin:
+          "https://example.test",
+        getAuth: () => {
+          throw new Error(
+            "Firebase config missing",
+          );
+        },
+        sendLink: async () => {
+          sendReachedAfterConfigFailure =
+            true;
+        },
+        persistEmail: () => undefined,
+      }),
+    /Firebase config missing/,
+  );
+  assert.equal(
+    sendReachedAfterConfigFailure,
+    false,
+  );
+
+  const clientSource = await readFile(
+    path.join(
+      process.cwd(),
+      "src/app/admin/inbox/staff-inbox-client.tsx",
+    ),
+    "utf8",
+  );
+  assert.match(
+    clientSource,
+    /setRequestingLink\(true\)[\s\S]*requestAnimationFrame[\s\S]*requestStaffEmailLink/,
+  );
+  assert.match(
+    clientSource,
+    /Sign-in link requested\. If this email is authorized, check your inbox and spam folder\./,
+  );
+  assert.match(
+    clientSource,
+    /Firebase authentication is not configured/,
+  );
+  assert.match(
+    clientSource,
+    /disabled=\{requestingLink\}/,
+  );
 }
 
 async function testStaffInboxAuthRoutesAndActorIdentity() {
@@ -15804,6 +15899,7 @@ async function main() {
   await testLineReplyClientContract();
   await testStaffAuthenticationPolicy();
   await testFirebaseStaffSessionExchange();
+  await testStaffEmailLinkRequestFlow();
   await testStaffInboxAuthRoutesAndActorIdentity();
   await testFirebaseStaffSessionAuthorizesInboxList();
   await testLegacyStaffLoginCanBeDisabled();

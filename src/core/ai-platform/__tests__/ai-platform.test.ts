@@ -185,7 +185,6 @@ import {
 } from "@/lib/http/admin-ui-session";
 
 import {
-  getVerifiedEntraIdentifier,
   isAllowedStaffEmail,
   normalizeStaffEmail,
   parseStaffAllowedEmails,
@@ -193,12 +192,17 @@ import {
 
 import {
   isLegacyAdminUiLoginEnabled,
-  isTenantSpecificEntraIssuer,
 } from "@/lib/auth/staff-auth-config";
 
 import {
   resolveStaffInboxAuthorization,
 } from "@/lib/auth/staff-inbox-authorization";
+
+import {
+  buildFirebaseStaffSessionCookie,
+  createFirebaseStaffSessionToken,
+  readFirebaseStaffSession,
+} from "@/lib/auth/staff-inbox-session";
 
 import {
   ConversationConflictError,
@@ -7571,41 +7575,9 @@ async function testStaffAuthenticationPolicy() {
     false,
   );
   assert.equal(
-    getVerifiedEntraIdentifier({}, {}),
-    null,
-  );
-  assert.equal(
-    getVerifiedEntraIdentifier(
-      {},
-      {
-        preferred_username:
-          " Staff@Chula.ac.th ",
-      },
-    ),
-    "staff@chula.ac.th",
-  );
-  assert.equal(
     normalizeStaffEmail("not-an-email"),
     null,
   );
-  assert.equal(
-    isTenantSpecificEntraIssuer(
-      "https://login.microsoftonline.com/11111111-2222-4333-8444-555555555555/v2.0",
-    ),
-    true,
-  );
-  for (const sharedIssuer of [
-    "https://login.microsoftonline.com/common/v2.0",
-    "https://login.microsoftonline.com/organizations/v2.0",
-    "https://login.microsoftonline.com/consumers/v2.0",
-  ]) {
-    assert.equal(
-      isTenantSpecificEntraIssuer(
-        sharedIssuer,
-      ),
-      false,
-    );
-  }
   assert.equal(
     isLegacyAdminUiLoginEnabled(undefined),
     true,
@@ -7630,8 +7602,8 @@ async function testStaffAuthenticationPolicy() {
     await resolveStaffInboxAuthorization(
       legacyRequest,
       {
-        resolveEntraSession:
-          async () => null,
+        readFirebaseSession:
+          () => null,
         legacyLoginEnabled: true,
       },
     );
@@ -7647,8 +7619,8 @@ async function testStaffAuthenticationPolicy() {
     await resolveStaffInboxAuthorization(
       legacyRequest,
       {
-        resolveEntraSession:
-          async () => null,
+        readFirebaseSession:
+          () => null,
         legacyLoginEnabled: false,
       },
     ),
@@ -7660,27 +7632,84 @@ async function testStaffAuthenticationPolicy() {
   process.env.STAFF_ALLOWED_EMAILS =
     "staff@chula.ac.th";
   try {
-    const entraAuthorization =
-      await resolveStaffInboxAuthorization(
+    const sessionSecret =
+      "test-staff-session-secret-0000000000000001";
+    const sessionToken =
+      createFirebaseStaffSessionToken(
+        {
+          email:
+            " Staff@Chula.ac.th ",
+          name: "Allowed Staff",
+        },
+        {
+          secret: sessionSecret,
+          now: () => 1_800_000_000_000,
+        },
+      );
+    const firebaseRequest = new Request(
+      "http://localhost/admin/inbox",
+      {
+        headers: {
+          cookie:
+            buildFirebaseStaffSessionCookie(
+              sessionToken,
+            ),
+        },
+      },
+    );
+    assert.deepEqual(
+      readFirebaseStaffSession(
+        firebaseRequest,
+        {
+          secret: sessionSecret,
+          now: () => 1_800_000_001_000,
+        },
+      ),
+      {
+        authMethod: "firebase",
+        email: "staff@chula.ac.th",
+        name: "Allowed Staff",
+        expiresAt: 1_800_028_800,
+      },
+    );
+    assert.equal(
+      readFirebaseStaffSession(
         new Request(
           "http://localhost/admin/inbox",
+          {
+            headers: {
+              cookie: `${buildFirebaseStaffSessionCookie(
+                `${sessionToken.slice(0, -1)}x`,
+              )}`,
+            },
+          },
         ),
+        { secret: sessionSecret },
+      ),
+      null,
+    );
+
+    const firebaseAuthorization =
+      await resolveStaffInboxAuthorization(
+        firebaseRequest,
         {
-          resolveEntraSession:
-            async () => ({
-              user: {
-                name: "Allowed Staff",
-                email:
-                  " Staff@Chula.ac.th ",
-              },
-            }),
+          readFirebaseSession:
+            (request) =>
+              readFirebaseStaffSession(
+                request,
+                {
+                  secret: sessionSecret,
+                  now: () =>
+                    1_800_000_001_000,
+                },
+              ),
           legacyLoginEnabled: false,
         },
       );
     assert.deepEqual(
-      entraAuthorization,
+      firebaseAuthorization,
       {
-        authMethod: "entra",
+        authMethod: "firebase",
         actorId: "staff@chula.ac.th",
         user: {
           name: "Allowed Staff",
@@ -7694,12 +7723,12 @@ async function testStaffAuthenticationPolicy() {
           "http://localhost/admin/inbox",
         ),
         {
-          resolveEntraSession:
-            async () => ({
-              user: {
-                email:
-                  "other@chula.ac.th",
-              },
+          readFirebaseSession:
+            () => ({
+              authMethod: "firebase",
+              email: "other@chula.ac.th",
+              name: null,
+              expiresAt: 1_800_028_800,
             }),
           legacyLoginEnabled: false,
         },
@@ -7712,12 +7741,8 @@ async function testStaffAuthenticationPolicy() {
           "http://localhost/admin/inbox",
         ),
         {
-          resolveEntraSession:
-            async () => ({
-              user: {
-                name: "Missing email",
-              },
-            }),
+          readFirebaseSession:
+            () => null,
           legacyLoginEnabled: false,
         },
       ),
@@ -7734,14 +7759,154 @@ async function testStaffAuthenticationPolicy() {
   }
 }
 
+async function testFirebaseStaffSessionExchange() {
+  const previousAllowlist =
+    process.env.STAFF_ALLOWED_EMAILS;
+  const previousSecret =
+    process.env.STAFF_AUTH_SESSION_SECRET;
+  process.env.STAFF_ALLOWED_EMAILS =
+    "staff@chula.ac.th";
+  process.env.STAFF_AUTH_SESSION_SECRET =
+    "test-firebase-session-secret-000000000000001";
+
+  try {
+    const route = await import(
+      "@/app/api/admin/ui/auth/firebase-session/route"
+    );
+    const request = () =>
+      new Request(
+        "http://localhost/api/admin/ui/auth/firebase-session",
+        {
+          method: "POST",
+          headers: {
+            "content-type":
+              "application/json",
+          },
+          body: JSON.stringify({
+            idToken:
+              "inert-firebase-id-token",
+          }),
+        },
+      );
+
+    const validResponse =
+      await route
+        .createFirebaseStaffSessionHandler(
+          async (idToken) => {
+            assert.equal(
+              idToken,
+              "inert-firebase-id-token",
+            );
+            return {
+              email:
+                " Staff@Chula.ac.th ",
+              email_verified: true,
+              name: "Allowed Staff",
+            };
+          },
+        )(request());
+    assert.equal(validResponse.status, 200);
+    assert.match(
+      validResponse.headers.get(
+        "set-cookie",
+      ) ?? "",
+      /ise_staff_inbox_session=/,
+    );
+    const validBody =
+      (await validResponse.json()) as Record<
+        string,
+        unknown
+      >;
+    assert.equal(
+      validBody.authMethod,
+      "firebase",
+    );
+    const serializedBody =
+      JSON.stringify(validBody);
+    assert.doesNotMatch(
+      serializedBody,
+      /inert-firebase-id-token|test-firebase-session-secret/,
+    );
+
+    const deniedResponse =
+      await route
+        .createFirebaseStaffSessionHandler(
+          async () => ({
+            email:
+              "other@chula.ac.th",
+            email_verified: true,
+          }),
+        )(request());
+    assert.equal(deniedResponse.status, 403);
+    assert.equal(
+      deniedResponse.headers.get(
+        "set-cookie",
+      ),
+      null,
+    );
+
+    const unverifiedResponse =
+      await route
+        .createFirebaseStaffSessionHandler(
+          async () => ({
+            email:
+              "staff@chula.ac.th",
+            email_verified: false,
+          }),
+        )(request());
+    assert.equal(
+      unverifiedResponse.status,
+      403,
+    );
+
+    const missingEmailResponse =
+      await route
+        .createFirebaseStaffSessionHandler(
+          async () => ({
+            email_verified: true,
+          }),
+        )(request());
+    assert.equal(
+      missingEmailResponse.status,
+      403,
+    );
+
+    const invalidResponse =
+      await route
+        .createFirebaseStaffSessionHandler(
+          async () => {
+            throw new Error(
+              "invalid token",
+            );
+          },
+        )(request());
+    assert.equal(invalidResponse.status, 401);
+  } finally {
+    if (previousAllowlist === undefined) {
+      delete process.env
+        .STAFF_ALLOWED_EMAILS;
+    } else {
+      process.env.STAFF_ALLOWED_EMAILS =
+        previousAllowlist;
+    }
+    if (previousSecret === undefined) {
+      delete process.env
+        .STAFF_AUTH_SESSION_SECRET;
+    } else {
+      process.env.STAFF_AUTH_SESSION_SECRET =
+        previousSecret;
+    }
+  }
+}
+
 async function testStaffInboxAuthRoutesAndActorIdentity() {
   const listRoute = await import(
     "@/app/api/admin/ui/inbox/conversations/route"
   );
-  const entraAuthorization = async () => ({
+  const firebaseAuthorization = async () => ({
     authorized: true as const,
     auth: {
-      authMethod: "entra" as const,
+      authMethod: "firebase" as const,
       actorId: "staff@chula.ac.th",
       user: {
         name: "Allowed Staff",
@@ -7756,7 +7921,7 @@ async function testStaffInboxAuthRoutesAndActorIdentity() {
           listConversations:
             async () => [],
         }),
-        entraAuthorization,
+        firebaseAuthorization,
       )(
         new Request(
           "http://localhost/api/admin/ui/inbox/conversations",
@@ -7801,7 +7966,7 @@ async function testStaffInboxAuthRoutesAndActorIdentity() {
   const handler =
     sendRoute.createInboxSendHandler(
       () => service as never,
-      entraAuthorization,
+      firebaseAuthorization,
     );
   const spoofed = await handler(
     new Request(
@@ -7933,6 +8098,64 @@ async function testStaffInboxAuthRoutesAndActorIdentity() {
       /await (?:authorize|requireInboxSession)\(request\)/,
       `${routeFile} must await Staff Inbox authorization`,
     );
+  }
+}
+
+async function testFirebaseStaffSessionAuthorizesInboxList() {
+  const previousAllowlist =
+    process.env.STAFF_ALLOWED_EMAILS;
+  const previousSecret =
+    process.env.STAFF_AUTH_SESSION_SECRET;
+  process.env.STAFF_ALLOWED_EMAILS =
+    "staff@chula.ac.th";
+  process.env.STAFF_AUTH_SESSION_SECRET =
+    "test-inbox-route-secret-000000000000000001";
+
+  try {
+    const token =
+      createFirebaseStaffSessionToken({
+        email: "staff@chula.ac.th",
+        name: "Allowed Staff",
+      });
+    const route = await import(
+      "@/app/api/admin/ui/inbox/conversations/route"
+    );
+    const response =
+      await route
+        .createInboxConversationListHandler(
+          () => ({
+            listConversations:
+              async () => [],
+          }),
+        )(
+          new Request(
+            "http://localhost/api/admin/ui/inbox/conversations",
+            {
+              headers: {
+                cookie:
+                  buildFirebaseStaffSessionCookie(
+                    token,
+                  ),
+              },
+            },
+          ),
+        );
+    assert.equal(response.status, 200);
+  } finally {
+    if (previousAllowlist === undefined) {
+      delete process.env
+        .STAFF_ALLOWED_EMAILS;
+    } else {
+      process.env.STAFF_ALLOWED_EMAILS =
+        previousAllowlist;
+    }
+    if (previousSecret === undefined) {
+      delete process.env
+        .STAFF_AUTH_SESSION_SECRET;
+    } else {
+      process.env.STAFF_AUTH_SESSION_SECRET =
+        previousSecret;
+    }
   }
 }
 
@@ -15580,7 +15803,9 @@ async function main() {
   await testLineConversationResolution();
   await testLineReplyClientContract();
   await testStaffAuthenticationPolicy();
+  await testFirebaseStaffSessionExchange();
   await testStaffInboxAuthRoutesAndActorIdentity();
+  await testFirebaseStaffSessionAuthorizesInboxList();
   await testLegacyStaffLoginCanBeDisabled();
   testStaffInboxComposerSynchronization();
   await testUnifiedStaffInboxUiSource();

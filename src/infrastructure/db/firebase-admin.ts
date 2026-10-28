@@ -30,7 +30,7 @@ function getCredential() {
   return applicationDefault();
 }
 
-const firebaseApp =
+export const firebaseApp =
   getApps()[0] ??
   initializeApp({
     credential: getCredential(),

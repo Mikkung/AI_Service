@@ -26,17 +26,18 @@ const schema = z.object({
   FACEBOOK_PAGE_ID: optionalConfigValue,
   FACEBOOK_GRAPH_API_VERSION: optionalConfigValue,
 
-  AUTH_SECRET: optionalConfigValue,
-  AUTH_MICROSOFT_ENTRA_ID_ID: optionalConfigValue,
-  AUTH_MICROSOFT_ENTRA_ID_SECRET: optionalConfigValue,
-  AUTH_MICROSOFT_ENTRA_ID_ISSUER: optionalConfigValue,
   STAFF_ALLOWED_EMAILS: optionalConfigValue,
+  STAFF_AUTH_SESSION_SECRET: optionalConfigValue,
   ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED: z.preprocess(
     (value) => value === "" || value === undefined
       ? "true"
       : value,
     z.enum(["true", "false"]),
   ),
+  NEXT_PUBLIC_FIREBASE_API_KEY: optionalConfigValue,
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: optionalConfigValue,
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID: optionalConfigValue,
+  NEXT_PUBLIC_FIREBASE_APP_ID: optionalConfigValue,
 
   DEFAULT_AI_PROVIDER: z
     .string()
@@ -99,18 +100,20 @@ const result = schema.safeParse({
   FACEBOOK_GRAPH_API_VERSION:
     process.env.FACEBOOK_GRAPH_API_VERSION,
 
-  AUTH_SECRET:
-    process.env.AUTH_SECRET,
-  AUTH_MICROSOFT_ENTRA_ID_ID:
-    process.env.AUTH_MICROSOFT_ENTRA_ID_ID,
-  AUTH_MICROSOFT_ENTRA_ID_SECRET:
-    process.env.AUTH_MICROSOFT_ENTRA_ID_SECRET,
-  AUTH_MICROSOFT_ENTRA_ID_ISSUER:
-    process.env.AUTH_MICROSOFT_ENTRA_ID_ISSUER,
   STAFF_ALLOWED_EMAILS:
     process.env.STAFF_ALLOWED_EMAILS,
+  STAFF_AUTH_SESSION_SECRET:
+    process.env.STAFF_AUTH_SESSION_SECRET,
   ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED:
     process.env.ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED,
+  NEXT_PUBLIC_FIREBASE_API_KEY:
+    process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:
+    process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID:
+    process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  NEXT_PUBLIC_FIREBASE_APP_ID:
+    process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 
   DEFAULT_AI_PROVIDER:
     process.env.DEFAULT_AI_PROVIDER,

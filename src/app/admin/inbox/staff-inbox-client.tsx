@@ -9,9 +9,14 @@ import {
 } from "react";
 
 import {
-  signIn as authSignIn,
-  signOut as authSignOut,
-} from "next-auth/react";
+  sendSignInLinkToEmail,
+  signOut as firebaseSignOut,
+} from "firebase/auth";
+
+import {
+  FIREBASE_EMAIL_STORAGE_KEY,
+  getFirebaseClientAuth,
+} from "@/lib/firebase/client-auth";
 
 import {
   editStaffInboxComposer,
@@ -103,7 +108,7 @@ type ApiError = {
 
 type StaffSession = {
   authenticated: boolean;
-  authMethod: "entra" | "legacy" | null;
+  authMethod: "firebase" | "legacy" | null;
   user: {
     name: string | null;
     email: string;
@@ -181,6 +186,10 @@ export function StaffInboxClient() {
   const [legacyLoginEnabled, setLegacyLoginEnabled] =
     useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [staffEmail, setStaffEmail] =
+    useState("");
+  const [requestingLink, setRequestingLink] =
+    useState(false);
   const [conversations, setConversations] =
     useState<InboxConversation[]>([]);
   const [channelFilter, setChannelFilter] =
@@ -496,24 +505,56 @@ export function StaffInboxClient() {
     }
   }
 
-  async function signInWithMicrosoft() {
+  async function requestMagicLink(
+    event: FormEvent,
+  ) {
+    event.preventDefault();
     setError("");
-    await authSignIn(
-      "microsoft-entra-id",
-      {
-        redirectTo: "/admin/inbox",
-      },
-    );
+    setNotice("");
+    setRequestingLink(true);
+
+    try {
+      const auth =
+        getFirebaseClientAuth();
+      const email = staffEmail.trim();
+      await sendSignInLinkToEmail(
+        auth,
+        email,
+        {
+          url: `${window.location.origin}/admin/inbox/auth/complete`,
+          handleCodeInApp: true,
+        },
+      );
+      window.localStorage.setItem(
+        FIREBASE_EMAIL_STORAGE_KEY,
+        email,
+      );
+    } catch {
+      // Keep the response neutral so the UI does
+      // not reveal allowlist membership.
+    } finally {
+      setNotice(
+        "If this email is authorized, a sign-in link will be sent.",
+      );
+      setRequestingLink(false);
+    }
   }
 
   async function logout() {
     setError("");
+    window.localStorage.removeItem(
+      FIREBASE_EMAIL_STORAGE_KEY,
+    );
 
-    if (authMethod === "entra") {
-      await authSignOut({
-        redirectTo: "/admin/inbox",
-      });
-      return;
+    if (authMethod === "firebase") {
+      try {
+        await firebaseSignOut(
+          getFirebaseClientAuth(),
+        );
+      } catch {
+        // The HttpOnly server session remains the
+        // authorization source and is cleared below.
+      }
     }
 
     try {
@@ -765,15 +806,31 @@ export function StaffInboxClient() {
             Access is restricted to authorized
             ISE staff accounts.
           </p>
-          <button
-            type="button"
-            className={styles.microsoftButton}
-            onClick={() =>
-              void signInWithMicrosoft()
-            }
-          >
-            Sign in with Microsoft
-          </button>
+          <form onSubmit={requestMagicLink}>
+            <label htmlFor="staff-email">
+              Email address
+            </label>
+            <input
+              id="staff-email"
+              type="email"
+              required
+              autoComplete="email"
+              value={staffEmail}
+              onChange={(event) =>
+                setStaffEmail(
+                  event.target.value,
+                )
+              }
+            />
+            <button
+              type="submit"
+              disabled={requestingLink}
+            >
+              {requestingLink
+                ? "Sending..."
+                : "Send sign-in link"}
+            </button>
+          </form>
           {legacyLoginEnabled && (
             <form
               className={styles.legacyLogin}
@@ -802,6 +859,9 @@ export function StaffInboxClient() {
               {error}
             </p>
           )}
+          {notice && (
+            <p>{notice}</p>
+          )}
         </div>
       </main>
     );
@@ -822,12 +882,12 @@ export function StaffInboxClient() {
           </a>
           <div className={styles.staffIdentity}>
             <span>
-              {authMethod === "entra"
+              {authMethod === "firebase"
                 ? sessionUser?.name ??
                   "ISE staff"
                 : "Legacy admin session"}
             </span>
-            {authMethod === "entra" &&
+            {authMethod === "firebase" &&
               sessionUser?.email && (
                 <small>
                   {sessionUser.email}

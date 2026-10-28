@@ -17,6 +17,10 @@ import {
 } from "@/lib/auth/staff-inbox-authorization";
 
 import {
+  buildExpiredFirebaseStaffSessionCookie,
+} from "@/lib/auth/staff-inbox-session";
+
+import {
   hasValidApiKey,
 } from "@/lib/http/api-key";
 
@@ -163,6 +167,10 @@ export async function DELETE() {
   response.headers.append(
     "Set-Cookie",
     buildExpiredAdminUiSessionCookie(),
+  );
+  response.headers.append(
+    "Set-Cookie",
+    buildExpiredFirebaseStaffSessionCookie(),
   );
 
   return response;

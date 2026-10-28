@@ -703,12 +703,6 @@
   font-size: 12px;
 }
 
-.loginPanel .microsoftButton {
-  margin-top: 16px;
-  border-color: #23436d;
-  background: #28517f;
-}
-
 .legacyLogin {
   margin-top: 24px;
   padding-top: 20px;

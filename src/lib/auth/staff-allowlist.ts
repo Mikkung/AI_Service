@@ -47,33 +47,3 @@ export function isAllowedStaffEmail(
   return normalized !== null &&
     allowedEmails.has(normalized);
 }
-
-export function getVerifiedEntraIdentifier(
-  user: { email?: string | null },
-  profile?: unknown,
-): string | null {
-  const userEmail =
-    normalizeStaffEmail(user.email);
-  if (userEmail) {
-    return userEmail;
-  }
-
-  if (
-    profile === null ||
-    typeof profile !== "object" ||
-    Array.isArray(profile)
-  ) {
-    return null;
-  }
-
-  const claims = profile as Record<
-    string,
-    unknown
-  >;
-
-  return normalizeStaffEmail(
-    claims.preferred_username,
-  ) ?? normalizeStaffEmail(
-    claims.email,
-  );
-}

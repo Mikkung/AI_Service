@@ -446,19 +446,23 @@ The Staff Inbox queries recent LINE and Facebook conversations separately using 
 Staff access is authenticated independently from external messaging users and from non-UI administrative integrations:
 
 ```text
-Microsoft Entra ID
-    -> single Chulalongkorn tenant
-    -> explicit STAFF_ALLOWED_EMAILS allowlist
+Firebase Authentication
+    -> verified email ownership
+    -> Firebase Admin ID-token verification
+    -> explicit exact STAFF_ALLOWED_EMAILS allowlist
+    -> signed eight-hour server Staff Inbox session
     -> Staff Inbox
 ```
 
-A valid organizational Microsoft account is not sufficient by itself. The verified Entra email or `preferred_username` is normalized and must exactly match an entry in the server-side allowlist. A missing identity or an empty allowlist denies access. Auth.js uses a JWT session with an eight-hour maximum age and exposes only the staff name and normalized email to the browser; provider tokens remain server-side.
+Firebase authentication proves control of the email account; it does not prove employment or organizational membership. That distinction is intentional for this application. A verified Firebase email is normalized and must exactly match an entry in the server-side allowlist. A missing or unverified identity and an empty allowlist all deny access.
 
-External LINE and Facebook identities are unrelated to staff authentication. F6.0 adds no Microsoft Graph, Teams, SharePoint, or role authorization. Roles are deferred to F6.1.
+The browser exchanges its short-lived Firebase ID token for an application-owned, signed, HttpOnly Staff Inbox session. Inbox APIs authorize only this server session; Firebase browser state alone grants no access. Provider tokens, service-account credentials, the allowlist, and signing secrets are never returned to the browser.
 
-The existing admin-key Staff Inbox login remains a temporary migration fallback only when `ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED=true`. Production should change this to `false` after Entra sign-in is verified and the Meta review-safe cutover is complete. This switch does not disable `APP_API_KEY` for unrelated administrative endpoints or alter LINE/Facebook webhook authentication.
+External LINE and Facebook identities are unrelated to staff authentication. F6.0 adds no roles or Firestore staff directory; roles are deferred to F6.1.
 
-Confirmed human messages derive `senderId` from the authenticated server session: the normalized Entra email for Microsoft sign-in or `legacy-admin-ui` for the temporary fallback. The browser cannot supply or override this actor identity.
+The existing admin-key Staff Inbox login remains a temporary migration fallback only when `ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED=true`. Production should change this to `false` after Firebase passwordless sign-in is verified and the Meta review-safe cutover is complete. This switch does not disable `APP_API_KEY` for unrelated administrative endpoints or alter LINE/Facebook webhook authentication.
+
+Confirmed human messages derive `senderId` from the authenticated server session: the normalized verified Firebase email or `legacy-admin-ui` for the temporary fallback. The browser cannot supply or override this actor identity.
 
 ## Public Privacy Policy
 

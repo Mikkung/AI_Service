@@ -1,11 +1,14 @@
 import {
-  getEntraStaffAuthConfig,
   isLegacyAdminUiLoginEnabled,
 } from "@/lib/auth/staff-auth-config";
 import {
   isAllowedStaffEmail,
   normalizeStaffEmail,
 } from "@/lib/auth/staff-allowlist";
+import {
+  readFirebaseStaffSession,
+  type FirebaseStaffSession,
+} from "@/lib/auth/staff-inbox-session";
 import {
   hasValidAdminUiSession,
 } from "@/lib/http/admin-ui-session";
@@ -16,52 +19,30 @@ export interface StaffInboxUser {
 }
 
 export interface StaffInboxAuthorization {
-  authMethod: "entra" | "legacy";
+  authMethod: "firebase" | "legacy";
   actorId: string;
   user: StaffInboxUser | null;
 }
 
-interface EntraSession {
-  user?: {
-    name?: string | null;
-    email?: string | null;
-  };
-}
-
 export interface StaffInboxAuthorizationOptions {
-  resolveEntraSession?: () => Promise<
-    EntraSession | null
-  >;
+  readFirebaseSession?: (
+    request: Request,
+  ) => FirebaseStaffSession | null;
   legacyLoginEnabled?: boolean;
-}
-
-async function resolveDefaultEntraSession():
-  Promise<EntraSession | null> {
-  if (
-    !process.env.AUTH_SECRET ||
-    !getEntraStaffAuthConfig()
-  ) {
-    return null;
-  }
-
-  const { auth } = await import(
-    "@/auth"
-  );
-  return auth();
 }
 
 export async function resolveStaffInboxAuthorization(
   request: Request,
   options: StaffInboxAuthorizationOptions = {},
 ): Promise<StaffInboxAuthorization | null> {
-  const session = await (
-    options.resolveEntraSession ??
-    resolveDefaultEntraSession
-  )();
+  const session = (
+    options.readFirebaseSession ??
+    readFirebaseStaffSession
+  )(request);
 
   if (session) {
     const email = normalizeStaffEmail(
-      session.user?.email,
+      session.email,
     );
 
     if (
@@ -72,11 +53,11 @@ export async function resolveStaffInboxAuthorization(
     }
 
     return {
-      authMethod: "entra",
+      authMethod: "firebase",
       actorId: email,
       user: {
         name:
-          session.user?.name ?? null,
+          session.name,
         email,
       },
     };

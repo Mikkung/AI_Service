@@ -715,10 +715,9 @@ export function TestAiClient() {
             }
           >
             Development admin
-            access • replace with
-            Entra ID / Firebase
-            Auth before public
-            production use.
+            access. Staff Inbox
+            authentication is
+            managed separately.
           </p>
         </section>
       </main>

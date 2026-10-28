@@ -7,6 +7,10 @@ import {
   getAuth,
 } from "firebase/auth";
 
+import {
+  createFirebaseClientAuthSingleton,
+} from "@/lib/firebase/client-singleton";
+
 const firebaseConfig = {
   apiKey:
     process.env
@@ -36,6 +40,17 @@ export class FirebaseClientConfigurationError
   }
 }
 
+const resolveFirebaseClientAuth =
+  createFirebaseClientAuthSingleton({
+    isBrowser: () =>
+      typeof window !== "undefined",
+    getApps,
+    getApp,
+    initializeApp: () =>
+      initializeApp(firebaseConfig),
+    getAuth,
+  });
+
 export function getFirebaseClientAuth() {
   if (
     !firebaseConfig.apiKey ||
@@ -46,9 +61,5 @@ export function getFirebaseClientAuth() {
     throw new FirebaseClientConfigurationError();
   }
 
-  const app = getApps().length
-    ? getApp()
-    : initializeApp(firebaseConfig);
-
-  return getAuth(app);
+  return resolveFirebaseClientAuth();
 }

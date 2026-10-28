@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -207,6 +208,10 @@ import {
 import {
   requestStaffEmailLink,
 } from "@/lib/firebase/staff-email-link-request";
+
+import {
+  createFirebaseClientAuthSingleton,
+} from "@/lib/firebase/client-singleton";
 
 import {
   ConversationConflictError,
@@ -7991,6 +7996,157 @@ async function testStaffEmailLinkRequestFlow() {
   assert.match(
     clientSource,
     /disabled=\{requestingLink\}/,
+  );
+}
+
+async function testFirebaseClientSingletonAndImportPolicy() {
+  const initializedApp = {
+    id: "initialized-app",
+  };
+  const auth = {
+    app: initializedApp,
+  };
+  let initializeCalls = 0;
+  let getAuthCalls = 0;
+  let authApp:
+    typeof initializedApp | undefined;
+
+  const getClientAuth =
+    createFirebaseClientAuthSingleton({
+      isBrowser: () => true,
+      getApps: () => [],
+      getApp: () => {
+        throw new Error(
+          "getApp should not be called",
+        );
+      },
+      initializeApp: () => {
+        initializeCalls += 1;
+        return initializedApp;
+      },
+      getAuth: (app) => {
+        getAuthCalls += 1;
+        authApp = app;
+        return auth;
+      },
+    });
+
+  assert.equal(getClientAuth(), auth);
+  assert.equal(getClientAuth(), auth);
+  assert.equal(initializeCalls, 1);
+  assert.equal(getAuthCalls, 1);
+  assert.equal(authApp, initializedApp);
+
+  const existingApp = {
+    id: "existing-app",
+  };
+  const existingAuth = {
+    app: existingApp,
+  };
+  let existingInitializeCalls = 0;
+  const getExistingAuth =
+    createFirebaseClientAuthSingleton({
+      isBrowser: () => true,
+      getApps: () => [existingApp],
+      getApp: () => existingApp,
+      initializeApp: () => {
+        existingInitializeCalls += 1;
+        return initializedApp;
+      },
+      getAuth: (app) => {
+        assert.equal(app, existingApp);
+        return existingAuth;
+      },
+    });
+  assert.equal(
+    getExistingAuth(),
+    existingAuth,
+  );
+  assert.equal(existingInitializeCalls, 0);
+
+  const getServerAuth =
+    createFirebaseClientAuthSingleton({
+      isBrowser: () => false,
+      getApps: () => [],
+      getApp: () => initializedApp,
+      initializeApp: () => initializedApp,
+      getAuth: () => auth,
+    });
+  assert.throws(
+    () => getServerAuth(),
+    /only available in the browser/,
+  );
+
+  async function collectSourceFiles(
+    directory: string,
+  ): Promise<string[]> {
+    const entries = await readdir(
+      directory,
+      { withFileTypes: true },
+    );
+    const files: string[] = [];
+
+    for (const entry of entries) {
+      const entryPath = path.join(
+        directory,
+        entry.name,
+      );
+      if (entry.isDirectory()) {
+        files.push(
+          ...(await collectSourceFiles(
+            entryPath,
+          )),
+        );
+      } else if (
+        /\.(?:ts|tsx)$/.test(entry.name)
+      ) {
+        files.push(entryPath);
+      }
+    }
+
+    return files;
+  }
+
+  for (const sourceFile of
+    await collectSourceFiles(
+      path.join(process.cwd(), "src"),
+    )) {
+    const source = await readFile(
+      sourceFile,
+      "utf8",
+    );
+    assert.doesNotMatch(
+      source,
+      /(?:from|import\()\s*["']@firebase\//,
+      `${sourceFile} must use public firebase/* imports`,
+    );
+  }
+
+  const packageJson = JSON.parse(
+    await readFile(
+      path.join(
+        process.cwd(),
+        "package.json",
+      ),
+      "utf8",
+    ),
+  ) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  };
+  const directDependencies = [
+    ...Object.keys(
+      packageJson.dependencies ?? {},
+    ),
+    ...Object.keys(
+      packageJson.devDependencies ?? {},
+    ),
+  ];
+  assert.equal(
+    directDependencies.some((name) =>
+      name.startsWith("@firebase/"),
+    ),
+    false,
   );
 }
 
@@ -15900,6 +16056,7 @@ async function main() {
   await testStaffAuthenticationPolicy();
   await testFirebaseStaffSessionExchange();
   await testStaffEmailLinkRequestFlow();
+  await testFirebaseClientSingletonAndImportPolicy();
   await testStaffInboxAuthRoutesAndActorIdentity();
   await testFirebaseStaffSessionAuthorizesInboxList();
   await testLegacyStaffLoginCanBeDisabled();

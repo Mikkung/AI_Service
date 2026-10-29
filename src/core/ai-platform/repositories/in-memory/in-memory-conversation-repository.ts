@@ -265,6 +265,50 @@ export class InMemoryConversationRepository
     return cloneConversation(updated);
   }
 
+  async setLineMarkAsReadToken(
+    id: string,
+    token: string,
+  ): Promise<Conversation> {
+    const existing =
+      this.conversations.get(id);
+    if (!existing) {
+      throw new Error(
+        `Conversation not found: ${id}`,
+      );
+    }
+    const updated = {
+      ...existing,
+      lineMarkAsReadToken: token,
+    };
+    this.conversations.set(
+      id,
+      cloneConversation(updated),
+    );
+    return cloneConversation(updated);
+  }
+
+  async markLineReadSynced(
+    id: string,
+    token: string,
+    markedAt: string,
+  ): Promise<boolean> {
+    const existing =
+      this.conversations.get(id);
+    if (
+      !existing ||
+      existing.lineMarkAsReadToken !==
+        token
+    ) {
+      return false;
+    }
+    this.conversations.set(id, {
+      ...existing,
+      lineMarkedReadToken: token,
+      lineMarkedReadAt: markedAt,
+    });
+    return true;
+  }
+
   async appendMessage(
     message: ConversationMessage,
   ): Promise<void> {

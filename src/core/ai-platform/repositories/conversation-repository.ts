@@ -81,6 +81,17 @@ export interface ConversationRepository {
     readAt: string,
   ): Promise<Conversation>;
 
+  setLineMarkAsReadToken(
+    id: string,
+    token: string,
+  ): Promise<Conversation>;
+
+  markLineReadSynced(
+    id: string,
+    token: string,
+    markedAt: string,
+  ): Promise<boolean>;
+
   appendMessage(
     message: ConversationMessage,
   ): Promise<void>;

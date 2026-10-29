@@ -179,6 +179,12 @@ function normalizeTextEvent(
     channelMessageId,
     lineMessageId,
     replyToken: event.replyToken,
+    markAsReadToken:
+      typeof message.markAsReadToken ===
+        "string" &&
+      message.markAsReadToken.length > 0
+        ? message.markAsReadToken
+        : undefined,
     text: message.text,
   };
 }
@@ -244,6 +250,12 @@ function normalizeImageEvent(
     channelMessageId,
     lineMessageId,
     replyToken: event.replyToken,
+    markAsReadToken:
+      typeof message.markAsReadToken ===
+        "string" &&
+      message.markAsReadToken.length > 0
+        ? message.markAsReadToken
+        : undefined,
     contentProviderType:
       contentProvider.type,
   };

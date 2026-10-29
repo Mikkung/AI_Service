@@ -259,6 +259,27 @@
   white-space: nowrap;
 }
 
+.contactAvatar,
+.contactAvatarLarge {
+  object-fit: cover;
+  border-radius: 50%;
+  background: #e8ecf2;
+}
+
+.contactAvatar {
+  width: 22px;
+  height: 22px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.contactAvatarLarge {
+  width: 38px;
+  height: 38px;
+  margin: 6px 10px 0 0;
+  float: left;
+}
+
 .itemBody strong {
   color: #243049;
   font-size: 12px;

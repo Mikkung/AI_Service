@@ -59,6 +59,9 @@ export interface Conversation {
   lastInboundAt?: string;
   lastInboundMessageId?: string;
   lastStaffReadAt?: string;
+  lineMarkAsReadToken?: string;
+  lineMarkedReadToken?: string;
+  lineMarkedReadAt?: string;
   metadata?: Record<string, unknown>;
 }
 

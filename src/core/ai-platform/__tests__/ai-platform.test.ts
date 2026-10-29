@@ -137,6 +137,27 @@ import {
 } from "../integrations/line/line-reply-client";
 
 import {
+  LineMessagingApiProfileClient,
+} from "../integrations/line/line-profile-client";
+
+import {
+  LineContactService,
+} from "../integrations/line/line-contact-service";
+
+import {
+  LineMessagingApiReadClient,
+  LineReadSyncService,
+} from "../integrations/line/line-read-sync";
+
+import {
+  InMemoryChannelContactRepository,
+} from "../repositories/in-memory/in-memory-channel-contact-repository";
+
+import {
+  channelContactId,
+} from "../repositories/channel-contact-id";
+
+import {
   LinePushDeliveryError,
   AssistedSendReconciliationRequiredError,
   FacebookMessagingWindowExpiredError,
@@ -1682,6 +1703,12 @@ async function createLineTestEnvironment(
     wait?: (durationMs: number) => Promise<void>;
     imageContextWaitTimeoutMs?: number;
     imageContextPollIntervalMs?: number;
+    contactService?: ConstructorParameters<
+      typeof LineMessageService
+    >[0]["contactService"];
+    readSyncService?: ConstructorParameters<
+      typeof LineMessageService
+    >[0]["readSyncService"];
   } = {},
 ) {
   const provider =
@@ -1720,6 +1747,10 @@ async function createLineTestEnvironment(
       replyClient,
       mediaClient,
       imageUnderstandingProvider,
+      contactService:
+        options.contactService,
+      readSyncService:
+        options.readSyncService,
       wait: options.wait,
       imageContextWaitTimeoutMs:
         options.imageContextWaitTimeoutMs,
@@ -5853,6 +5884,8 @@ async function testLineWebhookEventFilteringAndAccountMapping() {
           message: {
             type: "text",
             id: "message-1",
+            markAsReadToken:
+              "mark-read-token-1",
             text: "first",
           },
         },
@@ -5914,6 +5947,8 @@ async function testLineWebhookEventFilteringAndAccountMapping() {
         event.channelAccountId,
       inboundId:
         event.channelMessageId,
+      markAsReadToken:
+        event.markAsReadToken,
     })),
     [
       {
@@ -5921,12 +5956,15 @@ async function testLineWebhookEventFilteringAndAccountMapping() {
           "destination-from-root",
         inboundId:
           "webhook-supported-1",
+        markAsReadToken:
+          "mark-read-token-1",
       },
       {
         account:
           "destination-from-root",
         inboundId:
           "line-message:message-2",
+        markAsReadToken: undefined,
       },
     ],
   );
@@ -5950,6 +5988,8 @@ async function testLineImageWebhookNormalization() {
           message: {
             type: "image",
             id: "image-message-1",
+            markAsReadToken:
+              "mark-read-image-1",
             contentProvider: {
               type: "line",
             },
@@ -6020,6 +6060,8 @@ async function testLineImageWebhookNormalization() {
         event.lineMessageId,
       contentProviderType:
         event.contentProviderType,
+      markAsReadToken:
+        event.markAsReadToken,
     })),
     [
       {
@@ -6028,6 +6070,8 @@ async function testLineImageWebhookNormalization() {
         lineMessageId:
           "image-message-1",
         contentProviderType: "line",
+        markAsReadToken:
+          "mark-read-image-1",
       },
       {
         channelMessageId:
@@ -6036,8 +6080,267 @@ async function testLineImageWebhookNormalization() {
           "image-message-2",
         contentProviderType:
           "external",
+        markAsReadToken: undefined,
       },
     ],
+  );
+}
+
+async function testLineContactAndReadSyncFoundation() {
+  const profileRequests: string[] = [];
+  const profileClient =
+    new LineMessagingApiProfileClient({
+      channelAccessToken:
+        "line-profile-token",
+      fetchImplementation: async (
+        input,
+        init,
+      ) => {
+        profileRequests.push(
+          String(input),
+        );
+        assert.equal(
+          (
+            init?.headers as Record<
+              string,
+              string
+            >
+          ).authorization,
+          "Bearer line-profile-token",
+        );
+        return Response.json({
+          displayName: "ISE Student",
+          pictureUrl:
+            "https://profile.line-scdn.net/student",
+          language: "th",
+        });
+      },
+    });
+  assert.deepEqual(
+    await profileClient.getProfile(
+      "U/user id",
+    ),
+    {
+      displayName: "ISE Student",
+      pictureUrl:
+        "https://profile.line-scdn.net/student",
+      language: "th",
+    },
+  );
+  assert.deepEqual(profileRequests, [
+    "https://api.line.me/v2/bot/profile/U%2Fuser%20id",
+  ]);
+
+  const contactRepository =
+    new InMemoryChannelContactRepository();
+  let now =
+    "2027-01-01T00:00:00.000Z";
+  let fetches = 0;
+  let failProfile = false;
+  const contactService =
+    new LineContactService({
+      repository: contactRepository,
+      profileClient: {
+        getProfile: async () => {
+          fetches += 1;
+          if (failProfile) {
+            throw new Error(
+              "profile unavailable",
+            );
+          }
+          return {
+            displayName:
+              `Student ${fetches}`,
+            language: "th",
+          };
+        },
+      },
+      now: () => now,
+    });
+  const identity = {
+    channel: "line" as const,
+    channelAccountId:
+      "line-account-contact",
+    channelUserId:
+      "line-user-contact",
+  };
+  const first =
+    await contactService.refreshIfStale(
+      identity,
+    );
+  assert.equal(
+    first?.displayName,
+    "Student 1",
+  );
+  await contactService.refreshIfStale(
+    identity,
+  );
+  assert.equal(fetches, 1);
+
+  now = "2027-01-02T00:00:01.000Z";
+  const refreshed =
+    await contactService.refreshIfStale(
+      identity,
+    );
+  assert.equal(
+    refreshed?.displayName,
+    "Student 2",
+  );
+  assert.equal(fetches, 2);
+
+  now = "2027-01-03T00:00:02.000Z";
+  failProfile = true;
+  const afterFailure =
+    await contactService.refreshIfStale(
+      identity,
+    );
+  assert.equal(
+    afterFailure?.displayName,
+    "Student 2",
+  );
+  assert.equal(fetches, 3);
+
+  const missingProfileService =
+    new LineContactService({
+      repository:
+        new InMemoryChannelContactRepository(),
+      profileClient: {
+        getProfile: async () => {
+          throw new Error(
+            "profile unavailable",
+          );
+        },
+      },
+      now: () => now,
+    });
+  assert.equal(
+    await missingProfileService
+      .refreshIfStale({
+        channel: "line",
+        channelAccountId:
+          "missing-profile-account",
+        channelUserId:
+          "missing-profile-user",
+      }),
+    null,
+  );
+  const profileFailureEnvironment =
+    await createLineTestEnvironment(
+      groundedResult(),
+      "off",
+      {
+        contactService:
+          missingProfileService,
+      },
+    );
+  const profileFailureResult =
+    await profileFailureEnvironment
+      .lineMessageService
+      .processTextEvent(
+        lineTextEvent({
+          channelMessageId:
+            "profile-failure-event",
+          lineMessageId:
+            "profile-failure-message",
+        }),
+      );
+  assert.equal(
+    profileFailureResult.duplicate,
+    false,
+  );
+
+  const readRequests: Array<{
+    url: string;
+    body: string;
+  }> = [];
+  const readClient =
+    new LineMessagingApiReadClient({
+      channelAccessToken:
+        "line-read-token",
+      fetchImplementation: async (
+        input,
+        init,
+      ) => {
+        assert.equal(
+          (
+            init?.headers as Record<
+              string,
+              string
+            >
+          ).authorization,
+          "Bearer line-read-token",
+        );
+        readRequests.push({
+          url: String(input),
+          body: String(init?.body),
+        });
+        return new Response(null, {
+          status: 200,
+        });
+      },
+    });
+  await readClient.markAsRead(
+    "server-only-read-token",
+  );
+  assert.deepEqual(readRequests, [
+    {
+      url:
+        "https://api.line.me/v2/bot/chat/markAsRead",
+      body: JSON.stringify({
+        markAsReadToken:
+          "server-only-read-token",
+      }),
+    },
+  ]);
+
+  const conversationRepository =
+    new InMemoryConversationRepository();
+  await conversationRepository
+    .createConversation({
+      id: "read-failure-conversation",
+      channel: "line",
+      channelAudience: "external",
+      channelAccountId:
+        "line-account-contact",
+      channelUserId:
+        "line-user-contact",
+      mode: "ai_active",
+      createdAt: now,
+      updatedAt: now,
+    });
+  await conversationRepository
+    .setLineMarkAsReadToken(
+      "read-failure-conversation",
+      "read-failure-token",
+    );
+  const failingSync =
+    new LineReadSyncService({
+      conversationRepository,
+      readClient: {
+        markAsRead: async () => {
+          throw new Error(
+            "LINE unavailable",
+          );
+        },
+      },
+    });
+  assert.equal(
+    await failingSync.markReadBestEffort(
+      (await conversationRepository
+        .getConversation(
+          "read-failure-conversation",
+        ))!,
+    ),
+    false,
+  );
+  assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "read-failure-conversation",
+        )
+    )?.lineMarkedReadAt,
+    undefined,
   );
 }
 
@@ -7184,14 +7487,32 @@ async function testLineResponseModesAndRedelivery() {
     undefined,
   );
 
+  let autoReadSyncCalls = 0;
   const auto =
     await createLineTestEnvironment(
       groundedResult(
         "Grounded automatic reply",
       ),
       "auto",
+      {
+        readSyncService: {
+          markReadBestEffort:
+            async (conversation) => {
+              autoReadSyncCalls += 1;
+              assert.equal(
+                conversation
+                  .lineMarkAsReadToken,
+                "auto-read-token",
+              );
+              return true;
+            },
+        },
+      },
     );
-  const autoEvent = lineTextEvent();
+  const autoEvent = lineTextEvent({
+    markAsReadToken:
+      "auto-read-token",
+  });
   const autoFirst =
     await auto.lineMessageService
       .processTextEvent(autoEvent);
@@ -7202,6 +7523,7 @@ async function testLineResponseModesAndRedelivery() {
   assert.equal(autoFirst.replied, true);
   assert.equal(autoDuplicate.duplicate, true);
   assert.equal(auto.provider.calls, 1);
+  assert.equal(autoReadSyncCalls, 1);
   assert.deepEqual(
     auto.replyClient.replies,
     [
@@ -7236,10 +7558,20 @@ async function testLineResponseModesAndRedelivery() {
     undefined,
   );
 
+  let unsafeReadSyncCalls = 0;
   const unsupported =
     await createLineTestEnvironment(
       unsupportedResult(),
       "auto",
+      {
+        readSyncService: {
+          markReadBestEffort:
+            async () => {
+              unsafeReadSyncCalls += 1;
+              return true;
+            },
+        },
+      },
     );
   const unsupportedResultValue =
     await unsupported.lineMessageService
@@ -7254,6 +7586,7 @@ async function testLineResponseModesAndRedelivery() {
       .length,
     0,
   );
+  assert.equal(unsafeReadSyncCalls, 0);
   assert.equal(
     (
       await unsupported.handoffRepository
@@ -9031,6 +9364,33 @@ async function testStaffInboxMvp() {
     );
   const pushClient =
     new RecordingLinePushClient();
+  const contactRepository =
+    new InMemoryChannelContactRepository();
+  let profileCalls = 0;
+  const lineContactService =
+    new LineContactService({
+      repository: contactRepository,
+      profileClient: {
+        getProfile: async () => {
+          profileCalls += 1;
+          throw new Error(
+            "Inbox polling must not fetch LINE profiles",
+          );
+        },
+      },
+    });
+  const markedReadTokens: string[] = [];
+  const lineReadSyncService =
+    new LineReadSyncService({
+      conversationRepository,
+      readClient: {
+        markAsRead: async (token) => {
+          markedReadTokens.push(token);
+        },
+      },
+      now: () =>
+        "2027-01-01T00:00:30.000Z",
+    });
   let nowIndex = 20;
   const service = new StaffInboxService({
     conversationRepository,
@@ -9042,6 +9402,9 @@ async function testStaffInboxMvp() {
     linePushClient: pushClient,
     lineMediaClient:
       new RecordingLineMediaClient(),
+    contactRepository,
+    lineContactService,
+    lineReadSyncService,
     now: () => {
       const timestamp =
         `2027-01-01T00:00:${String(nowIndex).padStart(2, "0")}.000Z`;
@@ -9065,6 +9428,35 @@ async function testStaffInboxMvp() {
       updatedAt:
         "2027-01-01T00:00:00.000Z",
     });
+  await conversationRepository
+    .setLineMarkAsReadToken(
+      "inbox-line-conversation",
+      "mark-read-token-open",
+    );
+  await contactRepository.upsertContact({
+    id: channelContactId({
+      channel: "line",
+      channelAccountId:
+        "line-account-1",
+      channelUserId:
+        "trusted-line-user",
+    }),
+    channel: "line",
+    channelAccountId:
+      "line-account-1",
+    channelUserId:
+      "trusted-line-user",
+    displayName: "LINE Student",
+    pictureUrl:
+      "https://profile.line-scdn.net/avatar",
+    language: "th",
+    profileFetchedAt:
+      "2027-01-01T00:00:00.000Z",
+    createdAt:
+      "2027-01-01T00:00:00.000Z",
+    updatedAt:
+      "2027-01-01T00:00:00.000Z",
+  });
   await conversationRepository
     .createConversation({
       id: "inbox-web-conversation",
@@ -9123,6 +9515,20 @@ async function testStaffInboxMvp() {
     listed[0].draftStatus,
     "ready",
   );
+  assert.deepEqual(
+    listed[0].contact,
+    {
+      displayName: "LINE Student",
+      pictureUrl:
+        "https://profile.line-scdn.net/avatar",
+      language: "th",
+    },
+  );
+  assert.equal(profileCalls, 0);
+  assert.doesNotMatch(
+    JSON.stringify(listed),
+    /mark-read-token-open|lineMarkAsReadToken/,
+  );
   assert.equal(
     isConversationUnread({
       lastInboundAt:
@@ -9160,6 +9566,16 @@ async function testStaffInboxMvp() {
   assert.equal(
     detail.draft?.status,
     "ready",
+  );
+  assert.equal(
+    detail.conversation.contact
+      ?.displayName,
+    "LINE Student",
+  );
+  assert.equal(profileCalls, 0);
+  assert.doesNotMatch(
+    JSON.stringify(detail),
+    /mark-read-token-open|lineMarkAsReadToken/,
   );
   assert.equal(
     (
@@ -9229,6 +9645,23 @@ async function testStaffInboxMvp() {
     readConversation.unread,
     false,
   );
+  assert.deepEqual(
+    markedReadTokens,
+    ["mark-read-token-open"],
+  );
+  await service.markRead(
+    "inbox-line-conversation",
+  );
+  assert.deepEqual(
+    markedReadTokens,
+    ["mark-read-token-open"],
+  );
+
+  await conversationRepository
+    .setLineMarkAsReadToken(
+      "inbox-line-conversation",
+      "mark-read-token-reply",
+    );
 
   const requestId =
     "11111111-1111-4111-8111-111111111111";
@@ -9245,6 +9678,10 @@ async function testStaffInboxMvp() {
           "inbox-user-message",
       }),
     /LINE delivery failed/,
+  );
+  assert.deepEqual(
+    markedReadTokens,
+    ["mark-read-token-open"],
   );
   assert.equal(
     (
@@ -9287,6 +9724,13 @@ async function testStaffInboxMvp() {
   assert.equal(
     pushClient.pushes[0].retryKey,
     pushClient.pushes[1].retryKey,
+  );
+  assert.deepEqual(
+    markedReadTokens,
+    [
+      "mark-read-token-open",
+      "mark-read-token-reply",
+    ],
   );
   assert.equal(
     (
@@ -16590,6 +17034,7 @@ async function main() {
   await testLineWebhookSignatureAndParsing();
   await testLineWebhookEventFilteringAndAccountMapping();
   await testLineImageWebhookNormalization();
+  await testLineContactAndReadSyncFoundation();
   await testLineMediaClientPolicy();
   await testOpenAIImageUnderstandingContract();
   await testLineImageResponseModesAndContext();

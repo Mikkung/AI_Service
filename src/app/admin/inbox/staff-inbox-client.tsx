@@ -60,6 +60,11 @@ type InboxConversation = {
     | "failed"
     | "dismissed"
     | "sent";
+  contact?: {
+    displayName?: string;
+    pictureUrl?: string;
+    language?: string;
+  };
 };
 
 type Message = {
@@ -163,6 +168,21 @@ function shortIdentity(
   return value.length > 18
     ? `${value.slice(0, 8)}...${value.slice(-5)}`
     : value;
+}
+
+function conversationDisplayName(
+  conversation: InboxConversation,
+): string {
+  if (conversation.channel === "line") {
+    return conversation.contact
+      ?.displayName ??
+      `LINE user ${shortIdentity(
+        conversation.channelUserId,
+      )}`;
+  }
+  return `Messenger user ${shortIdentity(
+    conversation.channelUserId,
+  )}`;
 }
 
 function formatTime(
@@ -1154,13 +1174,28 @@ export function StaffInboxClient() {
                     />
                     <span className={styles.itemBody}>
                       <strong>
+                        {conversation.channel ===
+                          "line" &&
+                          conversation.contact
+                            ?.pictureUrl && (
+                            <img
+                              className={styles.contactAvatar}
+                              src={conversation.contact.pictureUrl}
+                              alt=""
+                              loading="lazy"
+                            />
+                          )}
                         <span className={styles.listChannelBadge}>
                           {conversation.channel === "line" ? "LINE" : "FB"}
                         </span>
-                        {conversation.channel === "line" ? "LINE" : "Messenger"} user {shortIdentity(conversation.channelUserId)}
+                        {conversationDisplayName(
+                          conversation,
+                        )}
                       </strong>
                       <span>
-                        {conversation.channel === "line" ? "LINE" : "Facebook"} · Account {shortIdentity(conversation.channelAccountId ?? "Legacy")}
+                        {conversation.channel === "line"
+                          ? `LINE ID ${shortIdentity(conversation.channelUserId)}`
+                          : `Facebook ID ${shortIdentity(conversation.channelUserId)}`} · Account {shortIdentity(conversation.channelAccountId ?? "Legacy")}
                       </span>
                       <small>
                         {formatTime(conversation.lastMessageAt ?? conversation.updatedAt)}
@@ -1201,11 +1236,25 @@ export function StaffInboxClient() {
                   <span className={styles.channelBadge}>
                     {detail.conversation.channel === "line" ? "LINE" : "MESSENGER"}
                   </span>
+                  {detail.conversation.channel ===
+                    "line" &&
+                    detail.conversation.contact
+                      ?.pictureUrl && (
+                      <img
+                        className={styles.contactAvatarLarge}
+                        src={detail.conversation.contact.pictureUrl}
+                        alt=""
+                      />
+                    )}
                   <h2>
-                    User {shortIdentity(detail.conversation.channelUserId)}
+                    {conversationDisplayName(
+                      detail.conversation,
+                    )}
                   </h2>
                   <p>
-                    Account {shortIdentity(detail.conversation.channelAccountId ?? "Legacy account")}
+                    {detail.conversation.channel === "line"
+                      ? `LINE ID ${shortIdentity(detail.conversation.channelUserId)} · `
+                      : ""}Account {shortIdentity(detail.conversation.channelAccountId ?? "Legacy account")}
                   </p>
                 </div>
                 <span className={styles.modeBadge}>

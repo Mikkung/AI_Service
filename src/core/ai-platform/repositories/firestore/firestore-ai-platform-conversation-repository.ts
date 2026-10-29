@@ -414,6 +414,57 @@ export class FirestoreAIPlatformConversationRepository
     return cloneConversation(updated);
   }
 
+  async setLineMarkAsReadToken(
+    id: string,
+    token: string,
+  ): Promise<Conversation> {
+    const existing =
+      await this.getConversation(id);
+    if (!existing) {
+      throw new Error(
+        `Conversation not found: ${id}`,
+      );
+    }
+    await this.db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(id)
+      .set(
+        { lineMarkAsReadToken: token },
+        { merge: true },
+      );
+    return cloneConversation({
+      ...existing,
+      lineMarkAsReadToken: token,
+    });
+  }
+
+  async markLineReadSynced(
+    id: string,
+    token: string,
+    markedAt: string,
+  ): Promise<boolean> {
+    const existing =
+      await this.getConversation(id);
+    if (
+      !existing ||
+      existing.lineMarkAsReadToken !==
+        token
+    ) {
+      return false;
+    }
+    await this.db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(id)
+      .set(
+        {
+          lineMarkedReadToken: token,
+          lineMarkedReadAt: markedAt,
+        },
+        { merge: true },
+      );
+    return true;
+  }
+
   async appendMessage(
     message: ConversationMessage,
   ): Promise<void> {

@@ -26,6 +26,14 @@ import type {
   LineReplyClient,
 } from "@/core/ai-platform/integrations/line/line-reply-client";
 
+import type {
+  LineContactService,
+} from "@/core/ai-platform/integrations/line/line-contact-service";
+
+import type {
+  LineReadSyncService,
+} from "@/core/ai-platform/integrations/line/line-read-sync";
+
 import {
   LineMediaBlockedError,
   LineMediaUnavailableError,
@@ -75,6 +83,7 @@ export interface LineTextInboundEvent {
   channelMessageId: string;
   lineMessageId: string;
   replyToken: string;
+  markAsReadToken?: string;
   text: string;
 }
 
@@ -84,6 +93,7 @@ export interface LineImageInboundEvent {
   channelMessageId: string;
   lineMessageId: string;
   replyToken: string;
+  markAsReadToken?: string;
   contentProviderType: string;
 }
 
@@ -119,6 +129,14 @@ export interface LineMessageServiceDependencies {
   replyClient: LineReplyClient;
   mediaClient: LineMediaClient;
   imageUnderstandingProvider: ImageUnderstandingProvider;
+  contactService?: Pick<
+    LineContactService,
+    "refreshIfStale"
+  >;
+  readSyncService?: Pick<
+    LineReadSyncService,
+    "markReadBestEffort"
+  >;
   now?: () => string;
   nextId?: (prefix: string) => string;
   wait?: (durationMs: number) => Promise<void>;
@@ -348,13 +366,10 @@ export class LineMessageService {
           event.channelAccountId,
         );
 
-    if (existing) {
-      return existing;
-    }
-
-    return this.dependencies
-      .conversationService
-      .createConversation({
+    let conversation = existing ??
+      await this.dependencies
+        .conversationService
+        .createConversation({
         channel: "line",
         channelAccountId:
           event.channelAccountId,
@@ -365,6 +380,27 @@ export class LineMessageService {
             event.channelAccountId,
         },
       });
+
+    if (event.markAsReadToken) {
+      conversation =
+        await this.dependencies
+          .conversationRepository
+          .setLineMarkAsReadToken(
+            conversation.id,
+            event.markAsReadToken,
+          );
+    }
+
+    await this.dependencies.contactService
+      ?.refreshIfStale({
+        channel: "line",
+        channelAccountId:
+          event.channelAccountId,
+        channelUserId:
+          event.channelUserId,
+      });
+
+    return conversation;
   }
 
   private async analyzeImage(
@@ -527,6 +563,12 @@ export class LineMessageService {
         .replyText(
           event.replyToken,
           result.outboundMessage.text,
+        );
+
+      await this.dependencies
+        .readSyncService
+        ?.markReadBestEffort(
+          conversation,
         );
 
       return {

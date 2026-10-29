@@ -19,12 +19,29 @@ import {
 } from "@/core/ai-platform/integrations/line/line-reply-client";
 
 import {
+  LineMessagingApiProfileClient,
+} from "@/core/ai-platform/integrations/line/line-profile-client";
+
+import {
+  LineContactService,
+} from "@/core/ai-platform/integrations/line/line-contact-service";
+
+import {
+  LineMessagingApiReadClient,
+  LineReadSyncService,
+} from "@/core/ai-platform/integrations/line/line-read-sync";
+
+import {
   FirestoreChannelResponseConfigRepository,
 } from "@/core/ai-platform/repositories/firestore/firestore-channel-response-config-repository";
 
 import {
   FirestoreSuggestedReplyDraftRepository,
 } from "@/core/ai-platform/repositories/firestore/firestore-suggested-reply-draft-repository";
+
+import {
+  FirestoreChannelContactRepository,
+} from "@/core/ai-platform/repositories/firestore/firestore-channel-contact-repository";
 
 import {
   OpenAIImageUnderstandingProvider,
@@ -55,6 +72,27 @@ export function createProductionLineEnvironment() {
     });
   const imageUnderstandingProvider =
     new OpenAIImageUnderstandingProvider();
+  const contactService =
+    new LineContactService({
+      repository:
+        new FirestoreChannelContactRepository(),
+      profileClient:
+        new LineMessagingApiProfileClient({
+          channelAccessToken:
+            env.LINE_CHANNEL_ACCESS_TOKEN,
+        }),
+    });
+  const readSyncService =
+    new LineReadSyncService({
+      conversationRepository:
+        conversationEnvironment
+          .conversationRepository,
+      readClient:
+        new LineMessagingApiReadClient({
+          channelAccessToken:
+            env.LINE_CHANNEL_ACCESS_TOKEN,
+        }),
+    });
   const lineMessageService =
     new LineMessageService({
       configService,
@@ -73,6 +111,8 @@ export function createProductionLineEnvironment() {
       replyClient,
       mediaClient,
       imageUnderstandingProvider,
+      contactService,
+      readSyncService,
     });
 
   return {

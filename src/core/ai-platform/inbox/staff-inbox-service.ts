@@ -21,12 +21,28 @@ import type {
 } from "@/core/ai-platform/integrations/line/line-media-client";
 
 import type {
+  LineContactService,
+} from "@/core/ai-platform/integrations/line/line-contact-service";
+
+import type {
+  LineReadSyncService,
+} from "@/core/ai-platform/integrations/line/line-read-sync";
+
+import type {
   AssistedStaffSendRepository,
 } from "@/core/ai-platform/repositories/assisted-staff-send-repository";
 
 import type {
   ConversationRepository,
 } from "@/core/ai-platform/repositories/conversation-repository";
+
+import type {
+  ChannelContactRepository,
+} from "@/core/ai-platform/repositories/channel-contact-repository";
+
+import type {
+  ChannelContact,
+} from "@/core/ai-platform/types/channel-contact";
 
 import type {
   ConversationWorkflowRepository,
@@ -67,6 +83,12 @@ export interface StaffInboxConversation {
   lastStaffReadAt?: string;
   unread: boolean;
   draftStatus?: SuggestedReplyDraft["status"];
+  contact?: Pick<
+    ChannelContact,
+    | "displayName"
+    | "pictureUrl"
+    | "language"
+  >;
 }
 
 type SupportedExternalConversation = Conversation & {
@@ -115,6 +137,18 @@ export interface StaffInboxServiceDependencies {
   conversationWorkflowRepository: Pick<
     ConversationWorkflowRepository,
     "resolveHandoffAndResumeAI"
+  >;
+  contactRepository?: Pick<
+    ChannelContactRepository,
+    "getContact"
+  >;
+  lineContactService?: Pick<
+    LineContactService,
+    "refreshIfStale"
+  >;
+  lineReadSyncService?: Pick<
+    LineReadSyncService,
+    "markReadBestEffort"
   >;
   now?: () => string;
 }
@@ -176,6 +210,7 @@ export function isConversationUnread(
 
 function toInboxConversation(
   conversation: Conversation,
+  contact?: ChannelContact | null,
 ): StaffInboxConversation {
   if (
     conversation.channel !== "line" &&
@@ -205,6 +240,16 @@ function toInboxConversation(
       isConversationUnread(
         conversation,
       ),
+    contact: contact
+      ? {
+          displayName:
+            contact.displayName,
+          pictureUrl:
+            contact.pictureUrl,
+          language:
+            contact.language,
+        }
+      : undefined,
   };
 }
 
@@ -251,9 +296,24 @@ export class StaffInboxService {
     return Promise.all(
       conversations.map(
         async (conversation) => {
+          const contact =
+            conversation.channel ===
+              "line" &&
+            conversation.channelAccountId
+              ? await this.dependencies
+                  .contactRepository
+                  ?.getContact({
+                    channel: "line",
+                    channelAccountId:
+                      conversation.channelAccountId,
+                    channelUserId:
+                      conversation.channelUserId,
+                  })
+              : null;
           const item =
             toInboxConversation(
               conversation,
+              contact,
             );
           const draft =
             conversation.lastInboundMessageId
@@ -311,11 +371,25 @@ export class StaffInboxService {
               )
           ).responseMode
         : "off";
+    const contact =
+      conversation.channel === "line" &&
+      conversation.channelAccountId
+        ? await this.dependencies
+            .contactRepository
+            ?.getContact({
+              channel: "line",
+              channelAccountId:
+                conversation.channelAccountId,
+              channelUserId:
+                conversation.channelUserId,
+            })
+        : null;
 
     return {
       conversation:
         toInboxConversation(
           conversation,
+          contact,
         ),
       messages: messages.map(
         (message) => ({
@@ -398,8 +472,39 @@ export class StaffInboxService {
           conversationId,
           this.now(),
         );
+    await this.dependencies
+      .lineReadSyncService
+      ?.markReadBestEffort(conversation);
     return toInboxConversation(
       conversation,
+    );
+  }
+
+  async refreshLineContact(
+    conversationId: string,
+  ): Promise<StaffInboxConversation> {
+    const conversation =
+      await this.requireLineConversation(
+        conversationId,
+      );
+    if (!conversation.channelAccountId) {
+      return toInboxConversation(
+        conversation,
+      );
+    }
+    const contact =
+      await this.dependencies
+        .lineContactService
+        ?.refreshIfStale({
+          channel: "line",
+          channelAccountId:
+            conversation.channelAccountId,
+          channelUserId:
+            conversation.channelUserId,
+        });
+    return toInboxConversation(
+      conversation,
+      contact,
     );
   }
 
@@ -612,6 +717,24 @@ export class StaffInboxService {
           deliveredAt: this.now(),
           staffId: staffActorId,
         });
+
+    if (
+      conversation.channel === "line"
+    ) {
+      const currentConversation =
+        await this.dependencies
+          .conversationRepository
+          .getConversation(
+            conversation.id,
+          );
+      if (currentConversation) {
+        await this.dependencies
+          .lineReadSyncService
+          ?.markReadBestEffort(
+            currentConversation,
+          );
+      }
+    }
 
     return {
       delivered: true,

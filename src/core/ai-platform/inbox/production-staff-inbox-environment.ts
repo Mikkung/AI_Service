@@ -16,6 +16,19 @@ import {
 } from "@/core/ai-platform/integrations/line/line-media-client";
 
 import {
+  LineMessagingApiProfileClient,
+} from "@/core/ai-platform/integrations/line/line-profile-client";
+
+import {
+  LineContactService,
+} from "@/core/ai-platform/integrations/line/line-contact-service";
+
+import {
+  LineMessagingApiReadClient,
+  LineReadSyncService,
+} from "@/core/ai-platform/integrations/line/line-read-sync";
+
+import {
   StaffInboxService,
 } from "@/core/ai-platform/inbox/staff-inbox-service";
 
@@ -38,6 +51,10 @@ import {
 import {
   FirestoreSuggestedReplyDraftRepository,
 } from "@/core/ai-platform/repositories/firestore/firestore-suggested-reply-draft-repository";
+
+import {
+  FirestoreChannelContactRepository,
+} from "@/core/ai-platform/repositories/firestore/firestore-channel-contact-repository";
 
 import {
   env,
@@ -80,6 +97,26 @@ export function createProductionStaffInboxEnvironment() {
     new FirestoreAssistedStaffSendRepository();
   const conversationWorkflowRepository =
     new FirestoreAIPlatformConversationWorkflowRepository();
+  const contactRepository =
+    new FirestoreChannelContactRepository();
+  const lineContactService =
+    new LineContactService({
+      repository: contactRepository,
+      profileClient:
+        new LineMessagingApiProfileClient({
+          channelAccessToken:
+            env.LINE_CHANNEL_ACCESS_TOKEN,
+        }),
+    });
+  const lineReadSyncService =
+    new LineReadSyncService({
+      conversationRepository,
+      readClient:
+        new LineMessagingApiReadClient({
+          channelAccessToken:
+            env.LINE_CHANNEL_ACCESS_TOKEN,
+        }),
+    });
   const service = new StaffInboxService({
     conversationRepository,
     draftRepository,
@@ -88,6 +125,9 @@ export function createProductionStaffInboxEnvironment() {
     lineMediaClient,
     sendRepository,
     conversationWorkflowRepository,
+    contactRepository,
+    lineContactService,
+    lineReadSyncService,
   });
 
   return {
@@ -101,5 +141,8 @@ export function createProductionStaffInboxEnvironment() {
     lineMediaClient,
     sendRepository,
     conversationWorkflowRepository,
+    contactRepository,
+    lineContactService,
+    lineReadSyncService,
   };
 }

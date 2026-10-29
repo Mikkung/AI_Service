@@ -13,6 +13,30 @@ import { env } from "@/core/config/env";
 let credentialProjectId:
   string | undefined;
 
+export function getServiceAccountProjectId(
+  value: unknown,
+): string | undefined {
+  if (
+    value === null ||
+    typeof value !== "object"
+  ) {
+    return undefined;
+  }
+
+  const serviceAccount = value as Record<
+    string,
+    unknown
+  >;
+  const rawProjectId =
+    serviceAccount.project_id ??
+    serviceAccount.projectId;
+
+  return typeof rawProjectId === "string" &&
+    rawProjectId.trim().length > 0
+    ? rawProjectId.trim()
+    : undefined;
+}
+
 function getCredential() {
   // Production / Vercel
   if (env.FIREBASE_SERVICE_ACCOUNT_B64) {
@@ -21,15 +45,15 @@ function getCredential() {
       "base64",
     ).toString("utf8");
 
-    const serviceAccount = JSON.parse(
-      decoded,
-    ) as ServiceAccount;
+    const rawServiceAccount: unknown =
+      JSON.parse(decoded);
+    const serviceAccount =
+      rawServiceAccount as ServiceAccount;
 
     credentialProjectId =
-      typeof serviceAccount.projectId ===
-      "string"
-        ? serviceAccount.projectId
-        : undefined;
+      getServiceAccountProjectId(
+        rawServiceAccount,
+      );
 
     return cert(serviceAccount);
   }

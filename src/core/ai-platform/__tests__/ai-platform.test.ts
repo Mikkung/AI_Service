@@ -7788,7 +7788,26 @@ async function testFirebaseStaffSessionExchange() {
     const route = await import(
       "@/app/api/admin/ui/auth/firebase-session/route"
     );
-    const request = () =>
+    const projectId = "safe-test-project";
+    const diagnosticToken = (
+      payload: Record<string, unknown>,
+    ) =>
+      [
+        Buffer.from(
+          JSON.stringify({
+            alg: "RS256",
+            typ: "JWT",
+          }),
+        ).toString("base64url"),
+        Buffer.from(
+          JSON.stringify(payload),
+        ).toString("base64url"),
+        "inert-signature-value",
+      ].join(".");
+    const request = (
+      idToken =
+        "inert-firebase-id-token",
+    ) =>
       new Request(
         "http://localhost/api/admin/ui/auth/firebase-session",
         {
@@ -7798,11 +7817,30 @@ async function testFirebaseStaffSessionExchange() {
               "application/json",
           },
           body: JSON.stringify({
-            idToken:
-              "inert-firebase-id-token",
+            idToken,
           }),
         },
       );
+
+    const firebaseAdmin = await import(
+      "@/infrastructure/db/firebase-admin"
+    );
+    assert.equal(
+      firebaseAdmin
+        .getServiceAccountProjectId({
+          project_id:
+            "snake-case-project",
+        }),
+      "snake-case-project",
+    );
+    assert.equal(
+      firebaseAdmin
+        .getServiceAccountProjectId({
+          projectId:
+            "camel-case-project",
+        }),
+      "camel-case-project",
+    );
 
     const validResponse =
       await route
@@ -7905,9 +7943,19 @@ async function testFirebaseStaffSessionExchange() {
       await route
         .createFirebaseStaffSessionHandler({
           verifyIdToken: async () => {
+            const cause = Object.assign(
+              new Error(
+                "certificate fetch failed\nfor eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJzZWNyZXQifQ.inertsignatur-value",
+              ),
+              {
+                code:
+                  "auth/certificate-fetch-failed",
+              },
+            );
             const verificationError =
               new Error(
-                "sensitive upstream detail with inert-firebase-id-token",
+                'verification failed for inert-firebase-id-token {"private_key":"-----BEGIN PRIVATE KEY-----\\nSECRET\\n-----END PRIVATE KEY-----","client_email":"secret@example.test"}',
+                { cause },
               ) as Error & {
                 code: string;
               };
@@ -7920,11 +7968,11 @@ async function testFirebaseStaffSessionExchange() {
           getProjectConsistency:
             async () => ({
               configuredProjectId:
-                "safe-test-project",
+                projectId,
               appProjectId:
-                "safe-test-project",
+                projectId,
               credentialProjectId:
-                "safe-test-project",
+                projectId,
               consistent: true,
             }),
           logError: (
@@ -7947,15 +7995,22 @@ async function testFirebaseStaffSessionExchange() {
           "Firebase staff token verification failed",
         metadata: {
           projectId:
-            "safe-test-project",
+            projectId,
           code: "auth/argument-error",
           name: "FirebaseAuthError",
+          message:
+            'verification failed for [REDACTED] {"private_key":"[REDACTED]","client_email":"[REDACTED]"}',
+          causeCode:
+            "auth/certificate-fetch-failed",
+          causeName: "Error",
+          causeMessage:
+            "certificate fetch failed for [REDACTED]",
         },
       },
     ]);
     assert.doesNotMatch(
       JSON.stringify(diagnosticLogs),
-      /inert-firebase-id-token|sensitive upstream detail/,
+      /inert-firebase-id-token|PRIVATE KEY|SECRET|secret@example\.test|eyJhbGci/,
     );
 
     let mismatchVerifierCalls = 0;
@@ -7975,9 +8030,9 @@ async function testFirebaseStaffSessionExchange() {
               configuredProjectId:
                 "configured-project",
               appProjectId:
-                "different-app-project",
-              credentialProjectId:
                 "configured-project",
+              credentialProjectId:
+                "different-credential-project",
               consistent: false,
             }),
           logError: (
@@ -8002,12 +8057,148 @@ async function testFirebaseStaffSessionExchange() {
           projectId:
             "configured-project",
           appProjectId:
-            "different-app-project",
-          credentialProjectId:
             "configured-project",
+          credentialProjectId:
+            "different-credential-project",
         },
       },
     ]);
+
+    const matchingIssuer =
+      `https://securetoken.google.com/${projectId}`;
+    const tokenMismatchCases = [
+      {
+        token: diagnosticToken({
+          aud: "different-client-project",
+          iss: matchingIssuer,
+        }),
+        expectedMetadata: {
+          code:
+            "auth/token-project-mismatch",
+          projectId,
+          tokenAudience:
+            "different-client-project",
+          tokenIssuerProjectId:
+            projectId,
+        },
+      },
+      {
+        token: diagnosticToken({
+          aud: projectId,
+          iss:
+            "https://securetoken.google.com/different-issuer-project",
+        }),
+        expectedMetadata: {
+          code:
+            "auth/token-project-mismatch",
+          projectId,
+          tokenAudience: projectId,
+          tokenIssuerProjectId:
+            "different-issuer-project",
+        },
+      },
+    ];
+
+    for (const mismatchCase of
+      tokenMismatchCases) {
+      let verifierCalls = 0;
+      const logs: Array<{
+        message: string;
+        metadata: Record<string, string>;
+      }> = [];
+      const response = await route
+        .createFirebaseStaffSessionHandler({
+          verifyIdToken: async () => {
+            verifierCalls += 1;
+            return {
+              email:
+                "staff@chula.ac.th",
+              email_verified: true,
+            };
+          },
+          getProjectConsistency:
+            async () => ({
+              configuredProjectId:
+                projectId,
+              appProjectId: projectId,
+              credentialProjectId:
+                projectId,
+              consistent: true,
+            }),
+          logError: (
+            message,
+            metadata,
+          ) => {
+            logs.push({
+              message,
+              metadata,
+            });
+          },
+        })(request(mismatchCase.token));
+      assert.equal(response.status, 401);
+      assert.equal(verifierCalls, 0);
+      assert.deepEqual(logs, [
+        {
+          message:
+            "Firebase ID token project mismatch",
+          metadata:
+            mismatchCase.expectedMetadata,
+        },
+      ]);
+      assert.doesNotMatch(
+        JSON.stringify(logs),
+        new RegExp(
+          mismatchCase.token.replace(
+            /[.*+?^${}()|[\]\\]/g,
+            "\\$&",
+          ),
+        ),
+      );
+    }
+
+    let verifiedForgedClaims = false;
+    const forgedClaimsToken =
+      diagnosticToken({
+        aud: projectId,
+        iss: matchingIssuer,
+        email: "staff@chula.ac.th",
+        email_verified: true,
+      });
+    const forgedClaimsResponse =
+      await route
+        .createFirebaseStaffSessionHandler({
+          verifyIdToken: async (
+            receivedToken,
+          ) => {
+            verifiedForgedClaims = true;
+            assert.equal(
+              receivedToken,
+              forgedClaimsToken,
+            );
+            return {
+              email:
+                "other@chula.ac.th",
+              email_verified: true,
+            };
+          },
+          getProjectConsistency:
+            async () => ({
+              configuredProjectId:
+                projectId,
+              appProjectId: projectId,
+              credentialProjectId:
+                projectId,
+              consistent: true,
+            }),
+        })(request(forgedClaimsToken));
+    assert.equal(
+      forgedClaimsResponse.status,
+      403,
+    );
+    assert.equal(
+      verifiedForgedClaims,
+      true,
+    );
   } finally {
     if (previousAllowlist === undefined) {
       delete process.env

@@ -26,9 +26,6 @@ const firebaseConfig = {
       .NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-export const FIREBASE_EMAIL_STORAGE_KEY =
-  "ise_staff_email_for_sign_in";
-
 export class FirebaseClientConfigurationError
   extends Error {
   constructor() {

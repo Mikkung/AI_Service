@@ -9,19 +9,21 @@ import {
 } from "react";
 
 import {
-  sendSignInLinkToEmail,
+  signInWithEmailAndPassword,
   signOut as firebaseSignOut,
 } from "firebase/auth";
 
 import {
   FirebaseClientConfigurationError,
-  FIREBASE_EMAIL_STORAGE_KEY,
   getFirebaseClientAuth,
 } from "@/lib/firebase/client-auth";
 
 import {
-  requestStaffEmailLink,
-} from "@/lib/firebase/staff-email-link-request";
+  authenticateStaffWithPassword,
+  exchangeFirebaseStaffSession,
+  retryFirebaseStaffSession,
+  StaffPasswordLoginError,
+} from "@/lib/firebase/staff-password-login";
 
 import {
   editStaffInboxComposer,
@@ -193,7 +195,11 @@ export function StaffInboxClient() {
   const [apiKey, setApiKey] = useState("");
   const [staffEmail, setStaffEmail] =
     useState("");
-  const [requestingLink, setRequestingLink] =
+  const [staffPassword, setStaffPassword] =
+    useState("");
+  const [signingIn, setSigningIn] =
+    useState(false);
+  const [sessionRetryAvailable, setSessionRetryAvailable] =
     useState(false);
   const [conversations, setConversations] =
     useState<InboxConversation[]>([]);
@@ -510,64 +516,144 @@ export function StaffInboxClient() {
     }
   }
 
-  async function requestMagicLink(
+  async function finishFirebaseLogin() {
+    const auth = getFirebaseClientAuth();
+    setStaffPassword("");
+    try {
+      await firebaseSignOut(auth);
+    } catch {
+      // The signed HttpOnly session is now the
+      // authorization source. Browser Firebase state
+      // can be cleared on the next logout attempt.
+    }
+    window.location.replace(
+      "/admin/inbox",
+    );
+  }
+
+  function setFirebaseLoginError(
+    failure: unknown,
+  ) {
+    if (
+      failure instanceof
+        FirebaseClientConfigurationError
+    ) {
+      setError(
+        "Staff sign-in is temporarily unavailable.",
+      );
+      return;
+    }
+    if (
+      failure instanceof
+        StaffPasswordLoginError
+    ) {
+      if (
+        failure.kind ===
+        "invalid_credentials"
+      ) {
+        setError(
+          "Invalid email or password.",
+        );
+      } else if (
+        failure.kind === "unauthorized"
+      ) {
+        setError(
+          "This account is not authorized for the Staff Inbox.",
+        );
+      } else {
+        setError(
+          "Your Firebase account was authenticated, but the Staff Inbox session could not be created.",
+        );
+        setSessionRetryAvailable(true);
+      }
+      return;
+    }
+
+    setError(
+      "Unable to sign in. Please try again.",
+    );
+  }
+
+  async function firebaseLogin(
     event: FormEvent,
   ) {
     event.preventDefault();
     setError("");
     setNotice("");
-    setRequestingLink(true);
+    setSessionRetryAvailable(false);
+    setSigningIn(true);
 
     try {
-      await new Promise<void>(
-        (resolve) =>
-          window.requestAnimationFrame(
-            () => resolve(),
-          ),
-      );
-
-      await requestStaffEmailLink({
+      const auth = getFirebaseClientAuth();
+      await authenticateStaffWithPassword({
+        auth,
         email: staffEmail,
-        origin: window.location.origin,
-        getAuth: getFirebaseClientAuth,
-        sendLink:
-          sendSignInLinkToEmail,
-        persistEmail: (email) =>
-          window.localStorage.setItem(
-            FIREBASE_EMAIL_STORAGE_KEY,
-            email,
+        password: staffPassword,
+        signIn:
+          signInWithEmailAndPassword,
+        exchangeSession: (
+          user,
+          forceRefresh,
+        ) =>
+          exchangeFirebaseStaffSession(
+            user,
+            { forceRefresh },
           ),
       });
-      setNotice(
-        "Sign-in link requested. If this email is authorized, check your inbox and spam folder.",
-      );
+      await finishFirebaseLogin();
     } catch (failure) {
-      setError(
+      if (
         failure instanceof
-          FirebaseClientConfigurationError
-          ? "Staff sign-in is temporarily unavailable because Firebase authentication is not configured."
-          : "Unable to request a sign-in link. Please try again.",
-      );
+          StaffPasswordLoginError &&
+        failure.kind === "unauthorized"
+      ) {
+        try {
+          await firebaseSignOut(
+            getFirebaseClientAuth(),
+          );
+        } catch {
+          // Authorization remains denied server-side.
+        }
+      }
+      setFirebaseLoginError(failure);
     } finally {
-      setRequestingLink(false);
+      setSigningIn(false);
+    }
+  }
+
+  async function retrySessionCreation() {
+    setError("");
+    setSessionRetryAvailable(false);
+    setSigningIn(true);
+
+    try {
+      const auth = getFirebaseClientAuth();
+      await retryFirebaseStaffSession(
+        auth.currentUser,
+        (user, forceRefresh) =>
+          exchangeFirebaseStaffSession(
+            user,
+            { forceRefresh },
+          ),
+      );
+      await finishFirebaseLogin();
+    } catch (failure) {
+      setFirebaseLoginError(failure);
+    } finally {
+      setSigningIn(false);
     }
   }
 
   async function logout() {
     setError("");
-    window.localStorage.removeItem(
-      FIREBASE_EMAIL_STORAGE_KEY,
-    );
 
-    if (authMethod === "firebase") {
-      try {
-        await firebaseSignOut(
-          getFirebaseClientAuth(),
-        );
-      } catch {
-        // The HttpOnly server session remains the
-        // authorization source and is cleared below.
-      }
+    try {
+      await firebaseSignOut(
+        getFirebaseClientAuth(),
+      );
+    } catch {
+      // The HttpOnly server session remains the
+      // authorization source and is cleared below.
     }
 
     try {
@@ -819,15 +905,16 @@ export function StaffInboxClient() {
             Access is restricted to authorized
             ISE staff accounts.
           </p>
-          <form onSubmit={requestMagicLink}>
+          <form onSubmit={firebaseLogin}>
             <label htmlFor="staff-email">
               Email address
             </label>
             <input
               id="staff-email"
+              name="email"
               type="email"
               required
-              autoComplete="email"
+              autoComplete="username"
               value={staffEmail}
               onChange={(event) =>
                 setStaffEmail(
@@ -835,15 +922,42 @@ export function StaffInboxClient() {
                 )
               }
             />
+            <label htmlFor="staff-password">
+              Password
+            </label>
+            <input
+              id="staff-password"
+              name="password"
+              type="password"
+              required
+              autoComplete="current-password"
+              value={staffPassword}
+              onChange={(event) =>
+                setStaffPassword(
+                  event.target.value,
+                )
+              }
+            />
             <button
               type="submit"
-              disabled={requestingLink}
+              disabled={signingIn}
             >
-              {requestingLink
-                ? "Sending..."
-                : "Send sign-in link"}
+              {signingIn
+                ? "Signing in..."
+                : "Sign in"}
             </button>
           </form>
+          {sessionRetryAvailable && (
+            <button
+              type="button"
+              disabled={signingIn}
+              onClick={() =>
+                void retrySessionCreation()
+              }
+            >
+              Retry session creation
+            </button>
+          )}
           {legacyLoginEnabled && (
             <form
               className={styles.legacyLogin}

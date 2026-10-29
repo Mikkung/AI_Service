@@ -447,22 +447,22 @@ Staff access is authenticated independently from external messaging users and fr
 
 ```text
 Firebase Authentication
-    -> verified email ownership
+    -> administrator-provisioned email/password credentials
     -> Firebase Admin ID-token verification
     -> explicit exact STAFF_ALLOWED_EMAILS allowlist
     -> signed eight-hour server Staff Inbox session
     -> Staff Inbox
 ```
 
-Firebase authentication proves control of the email account; it does not prove employment or organizational membership. That distinction is intentional for this application. A verified Firebase email is normalized and must exactly match an entry in the server-side allowlist. A missing or unverified identity and an empty allowlist all deny access.
+Firebase authentication validates the provisioned account credentials; it does not prove employment or organizational membership. That distinction is intentional for this application. The Firebase token email is normalized and must exactly match an entry in the server-side allowlist. A missing identity and an empty allowlist deny access. Email verification is intentionally not an additional authorization requirement because accounts are manually provisioned by an administrator.
 
 The browser exchanges its short-lived Firebase ID token for an application-owned, signed, HttpOnly Staff Inbox session. Inbox APIs authorize only this server session; Firebase browser state alone grants no access. Provider tokens, service-account credentials, the allowlist, and signing secrets are never returned to the browser.
 
 External LINE and Facebook identities are unrelated to staff authentication. F6.0 adds no roles or Firestore staff directory; roles are deferred to F6.1.
 
-The existing admin-key Staff Inbox login remains a temporary migration fallback only when `ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED=true`. Production should change this to `false` after Firebase passwordless sign-in is verified and the Meta review-safe cutover is complete. This switch does not disable `APP_API_KEY` for unrelated administrative endpoints or alter LINE/Facebook webhook authentication.
+The existing admin-key Staff Inbox login remains a temporary migration fallback only when `ADMIN_UI_LEGACY_KEY_LOGIN_ENABLED=true`. Production should change this to `false` after Firebase email/password sign-in is verified and the Meta review-safe cutover is complete. This switch does not disable `APP_API_KEY` for unrelated administrative endpoints or alter LINE/Facebook webhook authentication.
 
-Confirmed human messages derive `senderId` from the authenticated server session: the normalized verified Firebase email or `legacy-admin-ui` for the temporary fallback. The browser cannot supply or override this actor identity.
+Confirmed human messages derive `senderId` from the authenticated server session: the normalized Firebase token email or `legacy-admin-ui` for the temporary fallback. The browser cannot supply or override this actor identity.
 
 ## Public Privacy Policy
 

@@ -206,18 +206,16 @@ import {
 } from "@/lib/auth/staff-inbox-session";
 
 import {
-  requestStaffEmailLink,
-} from "@/lib/firebase/staff-email-link-request";
-
-import {
   createFirebaseClientAuthSingleton,
 } from "@/lib/firebase/client-singleton";
 
 import {
-  completeFirebaseEmailLink,
-  FirebaseStaffSessionExchangeError,
+  authenticateStaffWithPassword,
+  exchangeFirebaseStaffSession,
+  isInvalidFirebaseCredentialError,
   retryFirebaseStaffSession,
-} from "@/lib/firebase/staff-auth-completion";
+  StaffPasswordLoginError,
+} from "@/lib/firebase/staff-password-login";
 
 import {
   ConversationConflictError,
@@ -7898,7 +7896,7 @@ async function testFirebaseStaffSessionExchange() {
       null,
     );
 
-    const unverifiedResponse =
+    const manuallyProvisionedResponse =
       await route
         .createFirebaseStaffSessionHandler(
           async () => ({
@@ -7908,21 +7906,36 @@ async function testFirebaseStaffSessionExchange() {
           }),
         )(request());
     assert.equal(
-      unverifiedResponse.status,
-      403,
+      manuallyProvisionedResponse.status,
+      200,
     );
 
     const missingEmailResponse =
       await route
         .createFirebaseStaffSessionHandler(
-          async () => ({
-            email_verified: true,
-          }),
+          async () => ({}),
         )(request());
     assert.equal(
       missingEmailResponse.status,
       403,
     );
+
+    process.env.STAFF_ALLOWED_EMAILS = "";
+    const emptyAllowlistResponse =
+      await route
+        .createFirebaseStaffSessionHandler(
+          async () => ({
+            email:
+              "staff@chula.ac.th",
+            email_verified: false,
+          }),
+        )(request());
+    assert.equal(
+      emptyAllowlistResponse.status,
+      403,
+    );
+    process.env.STAFF_ALLOWED_EMAILS =
+      "staff@chula.ac.th";
 
     const invalidResponse =
       await route
@@ -8217,192 +8230,175 @@ async function testFirebaseStaffSessionExchange() {
   }
 }
 
-async function testFirebaseEmailLinkCompletionRetry() {
+async function testStaffPasswordLoginFlow() {
   const auth = {
     id: "firebase-auth",
   };
+  const password = "inert-password";
+  const idToken = "inert-id-token";
+  const tokenRefreshes: boolean[] = [];
   const user = {
-    getIdToken: async () =>
-      "inert-id-token",
+    getIdToken: async (
+      forceRefresh = false,
+    ) => {
+      tokenRefreshes.push(forceRefresh);
+      return idToken;
+    },
   };
   let signInCalls = 0;
-  const exchangeForceRefresh: boolean[] = [];
+  const exchangeRequests: Array<{
+    url: string;
+    init?: RequestInit;
+  }> = [];
 
-  const firstResult =
-    await completeFirebaseEmailLink({
+  const signedInUser =
+    await authenticateStaffWithPassword({
       auth,
-      email: " staff@chula.ac.th ",
-      href:
-        "https://example.test/admin/inbox/auth/complete?mode=signIn",
-      isEmailLink: () => true,
+      email: " Staff@Chula.ac.th ",
+      password,
       signIn: async (
         receivedAuth,
         email,
+        receivedPassword,
       ) => {
         signInCalls += 1;
         assert.equal(receivedAuth, auth);
         assert.equal(
           email,
-          "staff@chula.ac.th",
+          "Staff@Chula.ac.th",
+        );
+        assert.equal(
+          receivedPassword,
+          password,
         );
         return { user };
       },
-      exchangeSession: async (
+      exchangeSession: (
         receivedUser,
         forceRefresh,
-      ) => {
-        assert.equal(receivedUser, user);
-        exchangeForceRefresh.push(
-          forceRefresh,
-        );
-        throw new FirebaseStaffSessionExchangeError(
-          "exchange_failed",
-        );
-      },
-    });
-  assert.deepEqual(firstResult, {
-    status: "session_exchange_failed",
-  });
-  assert.equal(signInCalls, 1);
-
-  const retryResult =
-    await retryFirebaseStaffSession({
-      currentUser: user,
-      exchangeSession: async (
-        receivedUser,
-        forceRefresh,
-      ) => {
-        assert.equal(receivedUser, user);
-        exchangeForceRefresh.push(
-          forceRefresh,
-        );
-      },
-    });
-  assert.deepEqual(retryResult, {
-    status: "success",
-  });
-  assert.equal(signInCalls, 1);
-  assert.deepEqual(
-    exchangeForceRefresh,
-    [false, true],
-  );
-
-  assert.deepEqual(
-    await retryFirebaseStaffSession({
-      currentUser: null,
-      exchangeSession: async () => {
-        assert.fail(
-          "Missing users must not trigger session exchange",
-        );
-      },
-    }),
-    { status: "missing_user" },
-  );
-
-  assert.deepEqual(
-    await completeFirebaseEmailLink({
-      auth,
-      email: "staff@chula.ac.th",
-      href:
-        "https://example.test/consumed-link",
-      isEmailLink: () => true,
-      signIn: async () => {
-        throw Object.assign(
-          new Error(
-            "The action code has already been used.",
-          ),
+      ) =>
+        exchangeFirebaseStaffSession(
+          receivedUser,
           {
-            code:
-              "auth/invalid-action-code",
+            forceRefresh,
+            fetchImplementation: async (
+              input,
+              init,
+            ) => {
+              exchangeRequests.push({
+                url: String(input),
+                init,
+              });
+              return new Response(
+                JSON.stringify({ ok: true }),
+                { status: 200 },
+              );
+            },
           },
-        );
-      },
-      exchangeSession: async () => {
-        assert.fail(
-          "Invalid links must not trigger session exchange",
-        );
-      },
-    }),
-    { status: "invalid_link" },
-  );
-
-  assert.deepEqual(
-    await retryFirebaseStaffSession({
-      currentUser: user,
-      exchangeSession: async () => {
-        throw new FirebaseStaffSessionExchangeError(
-          "unauthorized",
-        );
-      },
-    }),
-    { status: "unauthorized" },
-  );
-}
-
-async function testStaffEmailLinkRequestFlow() {
-  const auth = {
-    id: "firebase-auth",
-  };
-  let sendCalls = 0;
-  let persistedEmail:
-    string | undefined;
-
-  await requestStaffEmailLink({
-    email: " Staff@Chula.ac.th ",
-    origin: "https://example.test",
-    getAuth: () => auth,
-    sendLink: async (
-      receivedAuth,
-      email,
-      settings,
-    ) => {
-      sendCalls += 1;
-      assert.equal(receivedAuth, auth);
-      assert.equal(
-        email,
-        "Staff@Chula.ac.th",
-      );
-      assert.deepEqual(settings, {
-        url:
-          "https://example.test/admin/inbox/auth/complete",
-        handleCodeInApp: true,
-      });
-    },
-    persistEmail: (email) => {
-      persistedEmail = email;
-    },
-  });
-
-  assert.equal(sendCalls, 1);
+        ),
+    });
+  assert.equal(signedInUser, user);
+  assert.equal(signInCalls, 1);
+  assert.deepEqual(tokenRefreshes, [false]);
+  assert.equal(exchangeRequests.length, 1);
   assert.equal(
-    persistedEmail,
-    "Staff@Chula.ac.th",
+    exchangeRequests[0].url,
+    "/api/admin/ui/auth/firebase-session",
+  );
+  assert.equal(
+    exchangeRequests[0].init?.method,
+    "POST",
+  );
+  assert.deepEqual(
+    JSON.parse(
+      String(
+        exchangeRequests[0].init?.body,
+      ),
+    ),
+    { idToken },
   );
 
-  let sendReachedAfterConfigFailure =
-    false;
+  let retryExchangeCalls = 0;
+  await retryFirebaseStaffSession(
+    user,
+    async (
+      receivedUser,
+      forceRefresh,
+    ) => {
+      retryExchangeCalls += 1;
+      assert.equal(receivedUser, user);
+      assert.equal(forceRefresh, true);
+    },
+  );
+  assert.equal(retryExchangeCalls, 1);
+  assert.equal(signInCalls, 1);
+
   await assert.rejects(
     () =>
-      requestStaffEmailLink({
-        email: "staff@chula.ac.th",
-        origin:
-          "https://example.test",
-        getAuth: () => {
-          throw new Error(
-            "Firebase config missing",
+      retryFirebaseStaffSession(
+        null,
+        async () => {
+          assert.fail(
+            "Missing user must not exchange a token",
           );
         },
-        sendLink: async () => {
-          sendReachedAfterConfigFailure =
-            true;
-        },
-        persistEmail: () => undefined,
-      }),
-    /Firebase config missing/,
+      ),
+    (error: unknown) =>
+      error instanceof
+        StaffPasswordLoginError &&
+      error.kind ===
+        "session_exchange_failed",
   );
-  assert.equal(
-    sendReachedAfterConfigFailure,
-    false,
+
+  for (const code of [
+    "auth/user-not-found",
+    "auth/wrong-password",
+    "auth/invalid-credential",
+    "auth/invalid-login-credentials",
+  ]) {
+    assert.equal(
+      isInvalidFirebaseCredentialError({
+        code,
+      }),
+      true,
+    );
+    await assert.rejects(
+      () =>
+        authenticateStaffWithPassword({
+          auth,
+          email:
+            "staff@chula.ac.th",
+          password,
+          signIn: async () => {
+            throw { code };
+          },
+          exchangeSession: async () => {
+            assert.fail(
+              "Credential failures must not exchange a token",
+            );
+          },
+        }),
+      (error: unknown) =>
+        error instanceof
+          StaffPasswordLoginError &&
+        error.kind ===
+          "invalid_credentials",
+    );
+  }
+
+  await assert.rejects(
+    () =>
+      exchangeFirebaseStaffSession(user, {
+        fetchImplementation:
+          async () =>
+            new Response(null, {
+              status: 403,
+            }),
+      }),
+    (error: unknown) =>
+      error instanceof
+        StaffPasswordLoginError &&
+      error.kind === "unauthorized",
   );
 
   const clientSource = await readFile(
@@ -8414,19 +8410,47 @@ async function testStaffEmailLinkRequestFlow() {
   );
   assert.match(
     clientSource,
-    /setRequestingLink\(true\)[\s\S]*requestAnimationFrame[\s\S]*requestStaffEmailLink/,
+    /signInWithEmailAndPassword/,
   );
   assert.match(
     clientSource,
-    /Sign-in link requested\. If this email is authorized, check your inbox and spam folder\./,
+    /window\.location\.replace\(\s*"\/admin\/inbox"/,
   );
   assert.match(
     clientSource,
-    /Firebase authentication is not configured/,
+    /Invalid email or password\./,
   );
   assert.match(
     clientSource,
-    /disabled=\{requestingLink\}/,
+    /Staff sign-in is temporarily unavailable\./,
+  );
+  assert.match(
+    clientSource,
+    /This account is not authorized for the Staff Inbox\./,
+  );
+  assert.match(
+    clientSource,
+    /name="email"[\s\S]*autoComplete="username"/,
+  );
+  assert.match(
+    clientSource,
+    /name="password"[\s\S]*autoComplete="current-password"/,
+  );
+  assert.doesNotMatch(
+    clientSource,
+    /localStorage|sessionStorage/,
+  );
+
+  const helperSource = await readFile(
+    path.join(
+      process.cwd(),
+      "src/lib/firebase/staff-password-login.ts",
+    ),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    helperSource,
+    /localStorage|sessionStorage/,
   );
 }
 
@@ -8551,7 +8575,30 @@ async function testFirebaseClientSingletonAndImportPolicy() {
       /(?:from|import\()\s*["']@firebase\//,
       `${sourceFile} must use public firebase/* imports`,
     );
+    if (
+      !sourceFile.includes(
+        `${path.sep}__tests__${path.sep}`,
+      )
+    ) {
+      assert.doesNotMatch(
+        source,
+        /sendSignInLinkToEmail|signInWithEmailLink|isSignInWithEmailLink|createUserWithEmailAndPassword/,
+        `${sourceFile} must not contain passwordless or public sign-up APIs`,
+      );
+    }
   }
+
+  const inboxClientSource = await readFile(
+    path.join(
+      process.cwd(),
+      "src/app/admin/inbox/staff-inbox-client.tsx",
+    ),
+    "utf8",
+  );
+  assert.match(
+    inboxClientSource,
+    /signInWithEmailAndPassword/,
+  );
 
   const packageJson = JSON.parse(
     await readFile(
@@ -16486,8 +16533,7 @@ async function main() {
   await testLineReplyClientContract();
   await testStaffAuthenticationPolicy();
   await testFirebaseStaffSessionExchange();
-  await testFirebaseEmailLinkCompletionRetry();
-  await testStaffEmailLinkRequestFlow();
+  await testStaffPasswordLoginFlow();
   await testFirebaseClientSingletonAndImportPolicy();
   await testStaffInboxAuthRoutesAndActorIdentity();
   await testFirebaseStaffSessionAuthorizesInboxList();

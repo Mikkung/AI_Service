@@ -24,7 +24,6 @@ const bodySchema = z.object({
 
 interface VerifiedFirebaseToken {
   email?: string;
-  email_verified?: boolean;
   name?: string;
 }
 
@@ -476,7 +475,6 @@ export function createFirebaseStaffSessionHandler(
       decoded.email,
     );
     if (
-      decoded.email_verified !== true ||
       !email ||
       !isAllowedStaffEmail(email)
     ) {

@@ -3,7 +3,7 @@
     "@google/genai": "^2.17.0",
     "csv-parse": "^7.0.2",
     "firebase": "^13.1.0",
-    "firebase-admin": "^14.2.0",
+    "firebase-admin": "13.10.0",
     "mammoth": "^1.12.1",
     "next": "^16.3.0",
     "openai": "^6.49.0",

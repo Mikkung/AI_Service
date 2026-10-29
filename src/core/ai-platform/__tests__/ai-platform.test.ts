@@ -8626,6 +8626,76 @@ async function testFirebaseClientSingletonAndImportPolicy() {
     ),
     false,
   );
+  assert.equal(
+    packageJson.dependencies?.firebase,
+    "^13.1.0",
+  );
+  assert.equal(
+    packageJson.dependencies?.[
+      "firebase-admin"
+    ],
+    "13.10.0",
+  );
+}
+
+async function testFirebaseAdminRuntimeCompatibility() {
+  const appModule = await import(
+    "firebase-admin/app"
+  );
+  const authModule = await import(
+    "firebase-admin/auth"
+  );
+  const firestoreModule = await import(
+    "firebase-admin/firestore"
+  );
+
+  assert.equal(
+    typeof appModule.initializeApp,
+    "function",
+  );
+  assert.equal(
+    typeof appModule.getApps,
+    "function",
+  );
+  assert.equal(
+    typeof appModule.cert,
+    "function",
+  );
+  assert.equal(
+    typeof appModule.applicationDefault,
+    "function",
+  );
+  assert.equal(
+    typeof authModule.getAuth,
+    "function",
+  );
+  assert.equal(
+    typeof firestoreModule.getFirestore,
+    "function",
+  );
+
+  const app = appModule.initializeApp(
+    {
+      projectId:
+        "firebase-admin-runtime-smoke",
+    },
+    "firebase-admin-runtime-smoke-test",
+  );
+  try {
+    const auth = authModule.getAuth(app);
+    const firestore =
+      firestoreModule.getFirestore(app);
+    assert.equal(
+      typeof auth.verifyIdToken,
+      "function",
+    );
+    assert.equal(
+      typeof firestore.collection,
+      "function",
+    );
+  } finally {
+    await appModule.deleteApp(app);
+  }
 }
 
 async function testStaffInboxAuthRoutesAndActorIdentity() {
@@ -16535,6 +16605,7 @@ async function main() {
   await testFirebaseStaffSessionExchange();
   await testStaffPasswordLoginFlow();
   await testFirebaseClientSingletonAndImportPolicy();
+  await testFirebaseAdminRuntimeCompatibility();
   await testStaffInboxAuthRoutesAndActorIdentity();
   await testFirebaseStaffSessionAuthorizesInboxList();
   await testLegacyStaffLoginCanBeDisabled();

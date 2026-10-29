@@ -27,25 +27,26 @@ export function createInboxReadHandler(
   serviceFactory: ServiceFactory = () =>
     createProductionStaffInboxEnvironment()
       .service,
+  authorize = requireInboxSession,
 ) {
   return async function POST(
     request: Request,
     context: Context,
   ): Promise<Response> {
     const authorization =
-      await requireInboxSession(request);
+      await authorize(request);
     if (!authorization.authorized) {
       return authorization.response;
     }
 
     try {
       const { id } = await context.params;
-      const conversation =
+      const result =
         await serviceFactory()
           .markRead(id);
       return Response.json({
         ok: true,
-        conversation,
+        ...result,
       });
     } catch (error) {
       return inboxRouteError(error);

@@ -26,6 +26,7 @@ import type {
 
 import type {
   LineReadSyncService,
+  LineReadSyncStatus,
 } from "@/core/ai-platform/integrations/line/line-read-sync";
 
 import type {
@@ -101,6 +102,11 @@ export interface StaffInboxDetail {
   responseMode: ResponseMode;
   draft: SuggestedReplyDraft | null;
   latestInboundMessageId?: string;
+}
+
+export interface StaffInboxMarkReadResult {
+  conversation: StaffInboxConversation;
+  lineReadSync: LineReadSyncStatus;
 }
 
 export type StaffInboxMessage = Pick<
@@ -461,7 +467,7 @@ export class StaffInboxService {
 
   async markRead(
     conversationId: string,
-  ): Promise<StaffInboxConversation> {
+  ): Promise<StaffInboxMarkReadResult> {
     await this.requireSupportedExternalConversation(
       conversationId,
     );
@@ -472,12 +478,27 @@ export class StaffInboxService {
           conversationId,
           this.now(),
         );
-    await this.dependencies
-      .lineReadSyncService
-      ?.markReadBestEffort(conversation);
-    return toInboxConversation(
-      conversation,
-    );
+    const lineReadSync =
+      this.dependencies
+        .lineReadSyncService
+        ? (
+            await this.dependencies
+              .lineReadSyncService
+              .markReadBestEffort(
+                conversation,
+                "staff_open",
+              )
+          ).status
+        : conversation.channel === "line"
+          ? "failed"
+          : "not_line";
+    return {
+      conversation:
+        toInboxConversation(
+          conversation,
+        ),
+      lineReadSync,
+    };
   }
 
   async refreshLineContact(
@@ -732,6 +753,7 @@ export class StaffInboxService {
           .lineReadSyncService
           ?.markReadBestEffort(
             currentConversation,
+            "staff_reply",
           );
       }
     }

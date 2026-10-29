@@ -569,6 +569,7 @@ export class LineMessageService {
         .readSyncService
         ?.markReadBestEffort(
           conversation,
+          "ai_auto_reply",
         );
 
       return {

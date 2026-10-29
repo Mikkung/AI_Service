@@ -6308,30 +6308,150 @@ async function testLineContactAndReadSyncFoundation() {
       createdAt: now,
       updatedAt: now,
     });
+
+  const diagnosticEntries: Array<{
+    level: "info" | "error";
+    message: string;
+    context: Record<string, unknown>;
+  }> = [];
+  const logger = {
+    info: (
+      message: string,
+      context: Record<string, unknown>,
+    ) => {
+      diagnosticEntries.push({
+        level: "info",
+        message,
+        context,
+      });
+    },
+    error: (
+      message: string,
+      context: Record<string, unknown>,
+    ) => {
+      diagnosticEntries.push({
+        level: "error",
+        message,
+        context,
+      });
+    },
+  };
+  const successfulSync =
+    new LineReadSyncService({
+      conversationRepository,
+      readClient: {
+        markAsRead: async () => {},
+      },
+      now: () =>
+        "2027-01-02T00:00:00.000Z",
+      logger,
+    });
+  assert.deepEqual(
+    await successfulSync.markReadBestEffort(
+      (await conversationRepository
+        .getConversation(
+          "read-failure-conversation",
+        ))!,
+      "staff_open",
+    ),
+    { status: "no_token" },
+  );
+
   await conversationRepository
     .setLineMarkAsReadToken(
       "read-failure-conversation",
       "read-failure-token",
     );
-  const failingSync =
-    new LineReadSyncService({
-      conversationRepository,
-      readClient: {
-        markAsRead: async () => {
-          throw new Error(
-            "LINE unavailable",
-          );
-        },
+
+  await conversationRepository
+    .updateConversation({
+      id: "read-failure-conversation",
+      updatedAt:
+        "2027-01-01T00:01:00.000Z",
+      metadata: {
+        laterUpdate: true,
       },
     });
   assert.equal(
+    (
+      await conversationRepository
+        .getConversation(
+          "read-failure-conversation",
+        )
+    )?.lineMarkAsReadToken,
+    "read-failure-token",
+  );
+
+  assert.deepEqual(
+    await successfulSync.markReadBestEffort(
+      (await conversationRepository
+        .getConversation(
+          "read-failure-conversation",
+        ))!,
+      "staff_open",
+    ),
+    { status: "synced" },
+  );
+  const syncedConversation =
+    await conversationRepository
+      .getConversation(
+        "read-failure-conversation",
+      );
+  assert.equal(
+    syncedConversation?.lineMarkedReadAt,
+    "2027-01-02T00:00:00.000Z",
+  );
+  assert.deepEqual(
+    await successfulSync.markReadBestEffort(
+      syncedConversation!,
+      "staff_open",
+    ),
+    { status: "already_synced" },
+  );
+
+  const secretReadToken =
+    "read-token-must-not-be-logged";
+  const secretAccessToken =
+    "access-token-must-not-be-logged";
+  await conversationRepository
+    .setLineMarkAsReadToken(
+      "read-failure-conversation",
+      secretReadToken,
+    );
+  const failingSync =
+    new LineReadSyncService({
+      conversationRepository,
+      readClient:
+        new LineMessagingApiReadClient({
+          channelAccessToken:
+            secretAccessToken,
+          fetchImplementation:
+            async () =>
+              new Response(
+                JSON.stringify({
+                  message:
+                    `Invalid request ${secretReadToken} ${secretAccessToken}`,
+                }),
+                {
+                  status: 400,
+                  headers: {
+                    "content-type":
+                      "application/json",
+                  },
+                },
+              ),
+        }),
+      logger,
+    });
+  assert.deepEqual(
     await failingSync.markReadBestEffort(
       (await conversationRepository
         .getConversation(
           "read-failure-conversation",
         ))!,
+      "staff_open",
     ),
-    false,
+    { status: "failed" },
   );
   assert.equal(
     (
@@ -6340,7 +6460,25 @@ async function testLineContactAndReadSyncFoundation() {
           "read-failure-conversation",
         )
     )?.lineMarkedReadAt,
-    undefined,
+    "2027-01-02T00:00:00.000Z",
+  );
+  const diagnostics =
+    JSON.stringify(diagnosticEntries);
+  assert.doesNotMatch(
+    diagnostics,
+    new RegExp(secretReadToken),
+  );
+  assert.doesNotMatch(
+    diagnostics,
+    new RegExp(secretAccessToken),
+  );
+  assert.match(
+    diagnostics,
+    /"status":400/,
+  );
+  assert.match(
+    diagnostics,
+    /api_failure/,
   );
 }
 
@@ -7504,7 +7642,9 @@ async function testLineResponseModesAndRedelivery() {
                   .lineMarkAsReadToken,
                 "auto-read-token",
               );
-              return true;
+              return {
+                status: "synced",
+              };
             },
         },
       },
@@ -7568,7 +7708,9 @@ async function testLineResponseModesAndRedelivery() {
           markReadBestEffort:
             async () => {
               unsafeReadSyncCalls += 1;
-              return true;
+              return {
+                status: "synced",
+              };
             },
         },
       },
@@ -9061,6 +9203,59 @@ async function testStaffInboxAuthRoutesAndActorIdentity() {
       );
   assert.equal(listResponse.status, 200);
 
+  const readRoute = await import(
+    "@/app/api/admin/ui/inbox/conversations/[id]/read/route"
+  );
+  let readCalls = 0;
+  const readResponse =
+    await readRoute.createInboxReadHandler(
+      () => ({
+        markRead: async () => {
+          readCalls += 1;
+          return {
+            conversation: {
+              id: "conversation-auth-test",
+              channel: "line" as const,
+              channelAccountId:
+                "line-account",
+              channelUserId: "U123456789",
+              mode: "ai_active" as const,
+              updatedAt:
+                "2027-01-01T00:00:00.000Z",
+              unread: false,
+            },
+            lineReadSync:
+              "synced" as const,
+          };
+        },
+      }),
+      firebaseAuthorization,
+    )(
+      new Request(
+        "http://localhost/api/admin/ui/inbox/conversations/conversation-auth-test/read",
+        { method: "POST" },
+      ),
+      {
+        params: Promise.resolve({
+          id: "conversation-auth-test",
+        }),
+      },
+    );
+  assert.equal(readResponse.status, 200);
+  assert.equal(readCalls, 1);
+  const readBody =
+    await readResponse.json() as {
+      lineReadSync: string;
+    };
+  assert.equal(
+    readBody.lineReadSync,
+    "synced",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(readBody),
+    /markAsReadToken|lineMarkAsReadToken|lineMarkedReadToken/,
+  );
+
   const sendRoute = await import(
     "@/app/api/admin/ui/inbox/conversations/[id]/send/route"
   );
@@ -9642,8 +9837,13 @@ async function testStaffInboxMvp() {
       "inbox-line-conversation",
     );
   assert.equal(
-    readConversation.unread,
+    readConversation.conversation
+      .unread,
     false,
+  );
+  assert.equal(
+    readConversation.lineReadSync,
+    "synced",
   );
   assert.deepEqual(
     markedReadTokens,
@@ -10509,6 +10709,35 @@ async function testUnifiedStaffInboxUiSource() {
   assert.match(source, /\? \"LINE\" : \"MESSENGER\"/);
   assert.match(source, /Send to Messenger/);
   assert.match(source, /channel-response-configs\/\$\{detail\.conversation\.channel\}/);
+  const loadDetailStart = source.indexOf(
+    "const loadDetail = useCallback",
+  );
+  const markReadStart = source.indexOf(
+    "const markConversationRead",
+  );
+  const selectionStart = source.indexOf(
+    "void markConversationRead(",
+    markReadStart + 1,
+  );
+  assert.ok(loadDetailStart >= 0);
+  assert.ok(markReadStart > loadDetailStart);
+  assert.ok(selectionStart > markReadStart);
+  assert.doesNotMatch(
+    source.slice(
+      loadDetailStart,
+      markReadStart,
+    ),
+    /\/read/,
+    "detail polling must not invoke the read endpoint",
+  );
+  assert.match(
+    source.slice(
+      markReadStart,
+      selectionStart,
+    ),
+    /\/read/,
+    "explicit staff-open handling must invoke the read endpoint",
+  );
 }
 
 async function testStaffInboxResumeAI() {
@@ -11912,6 +12141,26 @@ async function testFirestoreConversationRepository() {
     updatedAt:
       "2027-01-01T00:00:03.000Z",
   });
+  await repository.setLineMarkAsReadToken(
+    "conversation-firestore-2",
+    "persisted-line-read-token",
+  );
+  await repository.updateConversation({
+    id: "conversation-firestore-2",
+    updatedAt:
+      "2027-01-01T00:00:03.500Z",
+    metadata: {
+      updatedAfterToken: true,
+    },
+  });
+  assert.equal(
+    (
+      await repository.getConversation(
+        "conversation-firestore-2",
+      )
+    )?.lineMarkAsReadToken,
+    "persisted-line-read-token",
+  );
   await repository.createConversation({
     id: "conversation-firestore-3",
     channel: "web",

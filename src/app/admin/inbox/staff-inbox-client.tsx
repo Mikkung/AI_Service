@@ -259,8 +259,6 @@ export function StaffInboxClient() {
     : conversations.filter((conversation) => conversation.channel === channelFilter);
   const pollingRef = useRef(false);
   const detailPollingRef = useRef(false);
-  const explicitSelectionRef =
-    useRef(false);
   const lightboxCloseRef =
     useRef<HTMLButtonElement>(null);
   const lightboxTriggerRef =
@@ -376,7 +374,6 @@ export function StaffInboxClient() {
   const loadDetail = useCallback(
     async (
       conversationId: string,
-      markRead: boolean,
     ) => {
       if (detailPollingRef.current) {
         return;
@@ -384,15 +381,6 @@ export function StaffInboxClient() {
 
       detailPollingRef.current = true;
       try {
-        if (markRead) {
-          await readJson(
-            await fetch(
-              `/api/admin/ui/inbox/conversations/${encodeURIComponent(conversationId)}/read`,
-              { method: "POST" },
-            ),
-          );
-        }
-
         const response = await fetch(
           `/api/admin/ui/inbox/conversations/${encodeURIComponent(conversationId)}`,
           { cache: "no-store" },
@@ -423,6 +411,47 @@ export function StaffInboxClient() {
     [],
   );
 
+  const markConversationRead =
+    useCallback(
+      async (
+        conversationId: string,
+      ) => {
+        try {
+          const body = await readJson<{
+            conversation: InboxConversation;
+            lineReadSync:
+              | "synced"
+              | "already_synced"
+              | "no_token"
+              | "not_line"
+              | "failed";
+          }>(
+            await fetch(
+              `/api/admin/ui/inbox/conversations/${encodeURIComponent(conversationId)}/read`,
+              { method: "POST" },
+            ),
+          );
+          setConversations((current) =>
+            current.map((item) =>
+              item.id === conversationId
+                ? {
+                    ...item,
+                    ...body.conversation,
+                  }
+                : item,
+            ),
+          );
+        } catch (failure) {
+          setError(
+            failure instanceof Error
+              ? failure.message
+              : "Could not mark conversation as read.",
+          );
+        }
+      },
+      [],
+    );
+
   useEffect(() => {
     void checkSession();
   }, [checkSession]);
@@ -441,12 +470,8 @@ export function StaffInboxClient() {
 
   useEffect(() => {
     if (selectedId && authenticated) {
-      const markRead =
-        explicitSelectionRef.current;
-      explicitSelectionRef.current = false;
       void loadDetail(
         selectedId,
-        markRead,
       );
     }
   }, [selectedId, authenticated, loadDetail]);
@@ -460,7 +485,6 @@ export function StaffInboxClient() {
       () =>
         void loadDetail(
           selectedId,
-          false,
         ),
       8000,
     );
@@ -803,7 +827,6 @@ export function StaffInboxClient() {
       setSendRequestId(undefined);
       await loadDetail(
         detail.conversation.id,
-        false,
       );
       await loadList(true);
     } catch (failure) {
@@ -836,7 +859,6 @@ export function StaffInboxClient() {
       setNotice("AI processing resumed.");
       await loadDetail(
         detail.conversation.id,
-        false,
       );
       await loadList(true);
     } catch (failure) {
@@ -1141,19 +1163,19 @@ export function StaffInboxClient() {
                     key={conversation.id}
                     className={`${styles.conversationItem} ${selectedId === conversation.id ? styles.selected : ""}`}
                     onClick={() => {
+                      void markConversationRead(
+                        conversation.id,
+                      );
                       if (
                         selectedId ===
                         conversation.id
                       ) {
                         void loadDetail(
                           conversation.id,
-                          true,
                         );
                         return;
                       }
 
-                      explicitSelectionRef.current =
-                        true;
                       setComposer(
                         emptyStaffInboxComposer(
                           conversation.id,
